@@ -1,2 +1,23 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Files that must keep LF endings on every platform
+*.sh   text eol=lf
+*.wesl text eol=lf
+*.wgsl text eol=lf
+*.ron  text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+
+# Git LFS: large binary content
+*.vox  filter=lfs diff=lfs merge=lfs -text
+*.wvox filter=lfs diff=lfs merge=lfs -text
+*.png  filter=lfs diff=lfs merge=lfs -text
+*.jpg  filter=lfs diff=lfs merge=lfs -text
+*.ogg  filter=lfs diff=lfs merge=lfs -text
+*.wav  filter=lfs diff=lfs merge=lfs -text
+*.flac filter=lfs diff=lfs merge=lfs -text
+*.ttf  filter=lfs diff=lfs merge=lfs -text
+*.otf  filter=lfs diff=lfs merge=lfs -text
+*.dmg  filter=lfs diff=lfs merge=lfs -text
