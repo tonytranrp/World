@@ -26,7 +26,7 @@ The folder depends on coordinates and materials. Its subfolders form a stack: no
 ## Rules
 
 - The tree is canonical: the same voxel content always produces the same structure, so equality, hashing and golden tests are meaningful.
-- Edits cost O(log n) by path copying and never touch unrelated subtrees.
+- Edits cost O(depth), copy only the storage pages a snapshot still shares (decision 0004), and never touch unrelated subtrees.
 - Memory is indices, not pointers, so storage can be mirrored, compacted and serialized.
 - Reading never mutates, and readers see a consistent tree.
 - Layout facts the GPU depends on live in node and are expressed through the shared constants.

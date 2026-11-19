@@ -8,7 +8,7 @@ This module owns the memory behind the tree: arenas of nodes and leaf bricks add
 
 - Arenas for interior nodes and leaf bricks with typed u32 handles.
 - Free lists and reuse of freed slots so long edit sessions do not grow memory without bound.
-- Reclamation of nodes orphaned by path-copying edits, using reference counts or epochs so readers holding an older root stay valid.
+- Copy-on-write storage pages, so snapshots holding an older root stay valid and are freed with their last holder (decision 0004).
 - Compaction passes that renumber handles to reduce fragmentation, with an explicit remap result.
 - A change journal of allocated, freed and rewritten slots, which the render side uses to upload only what changed.
 - Capacity accounting and statistics for budgets and benchmarks.

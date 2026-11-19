@@ -7705,6 +7705,8 @@ dependencies = [
  "proptest",
  "ron",
  "serde",
+ "world_testkit",
+ "xxhash-rust",
 ]
 
 [[package]]
