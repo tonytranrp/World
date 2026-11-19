@@ -8,7 +8,7 @@ This folder holds the game's tunable data, written as RON and loaded as hot-relo
 
 - The material table: per material color, roughness, emission, density, strength, friction, restitution and the keys for break and impact sounds. This one table drives rendering, physics and audio.
 - Worldgen parameters: seeds, noise settings, biome and cave parameters, prop placement rules and material layering by depth and slope.
-- Physics constants: fixed 60 Hz step settings, collision grid size (1/16 m default), debris budgets such as the particle threshold and active-body cap, character controller step height.
+- Physics constants: fixed step settings, debris budgets such as the particle threshold and active-body cap, character controller step height. (The collision grid size is a World_Core constant, not configuration: decision 0003.)
 - Render tier settings: internal resolution, brick pool size, update rates for the GI cache, and the presets for the tiers and the `--mac-floor` mode.
 - Other gameplay tuning that benefits from live editing.
 
