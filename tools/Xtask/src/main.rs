@@ -1,5 +1,5 @@
-//! `cargo xtask`: the single entry point for tests, goldens, benchmarks, checks
-//! and running the game with live reloading.
+//! `cargo xtask`: the single entry point for tests, goldens, benchmarks, checks,
+//! fuzzing, mutation testing and running the game with live reloading.
 
 mod bench;
 mod check;
@@ -44,9 +44,14 @@ enum Command {
         save: Option<String>,
         #[arg(long, value_name = "NAME")]
         check: Option<String>,
-        /// Allowed slowdown in percent before --check fails.
+        /// Allowed slowdown in percent before --check fails: wall time, or
+        /// instruction count with --instructions.
         #[arg(long, default_value_t = 10.0)]
         threshold: f64,
+        /// Count instructions with gungraun under Valgrind instead of timing
+        /// with Criterion (Linux only; needs valgrind and gungraun-runner).
+        #[arg(long)]
+        instructions: bool,
     },
     /// Formatting, clippy with warnings denied, then the fast tests.
     Check,
@@ -54,6 +59,22 @@ enum Command {
     Coverage,
     /// Run the unsafe-capable crates under Miri (needs the nightly toolchain).
     Miri,
+    /// Fuzz World_Core's decoder with cargo-fuzz (nightly): every target, or
+    /// the one named, for --time seconds each. Crashes land in
+    /// crates/Foundation/World_Core/fuzz/artifacts.
+    Fuzz {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(check::fuzz::TARGETS))]
+        target: Option<String>,
+        /// Seconds to fuzz each target.
+        #[arg(long, default_value_t = 300)]
+        time: u64,
+    },
+    /// Mutation testing of World_Core with cargo-mutants (see
+    /// .cargo/mutants.toml). Arguments after `--` go to cargo-mutants.
+    Mutants {
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
     /// Run the game with asset, config and shader hot reload and the developer
     /// panels (F1 inspector, F2 configs, F5 re-run setup). Arguments after `--`
     /// go to the game.
@@ -85,10 +106,13 @@ fn main() -> ExitCode {
             save,
             check,
             threshold,
-        } => bench::run(save, check, threshold),
+            instructions,
+        } => bench::run(save, check, threshold, instructions),
         Command::Check => check::run(),
         Command::Coverage => check::coverage(),
         Command::Miri => check::miri(),
+        Command::Fuzz { target, time } => check::fuzz::run(target.as_deref(), time),
+        Command::Mutants { extra } => check::mutants::run(&extra),
         Command::Dev { args } => hot::dev(&args),
         Command::Hot { smoke, args } => hot::hot(&args, smoke),
     };
