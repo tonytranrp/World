@@ -1,6 +1,9 @@
 # 0005: Voxel core performance and tooling
 
-Status: accepted, 2026-11-19
+Status: accepted, 2026-11-19. Partly superseded: decision 0006 adopts per-chunk
+storage (the rejected top-level grid, for storage only), and decision 0007
+replaces zero-copy page upload with a GPU format and the fixed 256 MiB segments
+with runtime limits.
 
 ## Context
 
