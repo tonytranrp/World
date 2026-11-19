@@ -59,13 +59,14 @@ floor) begins.
   Bevy-free types in World_Core. Anim and Physics produce them as components,
   Render consumes them, and no Engine crate depends on another for them.
 - **The CPU 64-tree is shared through snapshots.** An edit produces a new tree
-  version by path copying. The renderer and brick streaming read an immutable
+  version without disturbing older ones (decision 0004 does this with
+  copy-on-write storage pages, not per-node path copying). The renderer and brick streaming read an immutable
   snapshot taken once per frame, with no locks; old versions are freed when no
   snapshot uses them. The CPU tree stays the single source of truth.
 
 ## Consequences
 
-- The voxel core (the next to-do item) is designed for path-copying snapshots
+- The voxel core (the next to-do item) is designed for immutable snapshots
   from the start.
 - World_Gen gains the `libm` dependency and a cross-platform golden-hash test
   when it is written; the CI macOS job runs that test.
