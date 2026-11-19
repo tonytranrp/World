@@ -84,7 +84,9 @@ pub(super) fn dx_serve(root: &Path, args: &[String], interactive: bool) -> Comma
         command.args(["--windows-subsystem", "CONSOLE"]);
     }
     if !args.is_empty() {
-        command.args(["--args", &args.join(" ")]);
+        // One `--args=` token: as a separate value, `--mac-floor` would be read
+        // by dx itself as an unknown flag. dx splits it on spaces for the game.
+        command.arg(format!("--args={}", args.join(" ")));
     }
     command
 }
@@ -170,8 +172,7 @@ mod tests {
             .collect();
         let has = |a: &str| args.iter().any(|x| x == a);
         assert!(has("--hot-patch") && has("--no-default-features") && has("hotpatch"));
-        let pos = args.iter().position(|a| a == "--args").unwrap();
-        assert_eq!(args[pos + 1], "--mac-floor");
+        assert!(has("--args=--mac-floor"), "{args:?}");
     }
 
     #[test]
