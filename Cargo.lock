@@ -7702,6 +7702,7 @@ dependencies = [
 name = "world_core"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "proptest",
  "ron",
  "serde",

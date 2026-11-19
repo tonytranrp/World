@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# The library's unit tests are not benchmarks, and libtest rejects Criterion's flags.
+[lib]
+bench = false
+
 [dependencies]
 serde.workspace = true
 xxhash-rust.workspace = true
@@ -14,6 +18,11 @@ xxhash-rust.workspace = true
 ron.workspace = true
 proptest.workspace = true
 world_testkit.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "tree"
+harness = false
 
 [lints]
 workspace = true
