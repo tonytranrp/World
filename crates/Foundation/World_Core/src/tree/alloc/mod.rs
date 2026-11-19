@@ -1,0 +1,213 @@
+//! The tree's memory: a node arena and a word arena in copy-on-write pages
+//! (decision 0004).
+//!
+//! [`Storage`] is the shared, readable part: the two page lists. Cloning it is
+//! O(1), which is how a snapshot is taken. [`Store`] is the writer: storage
+//! plus the free lists and live counts. Every write goes through
+//! `Arc::make_mut`, so a page a snapshot still holds is copied before it
+//! changes and the snapshot never sees the write. Freeing writes no page, so a
+//! freed slot or block is invisible to readers until it is reused.
+//!
+//! Allocation depends only on the sequence of calls, never on addresses or
+//! timing, so the same edits always give the same indices.
+
+mod blocks;
+mod nodes;
+mod pages;
+
+use blocks::WordBlocks;
+use nodes::NodeSlots;
+use pages::Pages;
+
+use super::TreeStats;
+use super::node::{Node, NodeKind};
+use crate::consts::TREE_FANOUT;
+
+// Page sizes. Both arenas use 16 KiB pages (four OS pages).
+//
+// After each snapshot (taken once per frame, decision 0003), the first write
+// to a page copies the whole page. One edit rewrites at most one node and one
+// block per level, so it touches at most `2 * TREE_DEPTH` pages: at 16 KiB the
+// worst case is 320 KiB copied, about 20 us, once per page per frame, and
+// edits in one area share pages so the usual cost is a small fraction of that.
+// The first write after a snapshot also clones each page list, one `Arc` per
+// page: 16 KiB pages keep that at 65,536 entries per GiB of storage. Smaller
+// pages would copy less per edit but make that list clone and the per-page
+// overhead grow; larger pages the reverse.
+
+/// Nodes per node page: 1024 x 16 bytes = 16 KiB.
+const NODE_PAGE_LEN: usize = 1024;
+
+/// Words per word page: 4096 x 4 bytes = 16 KiB.
+const WORD_PAGE_LEN: usize = 4096;
+
+/// The longest word block: a branch with all 64 children.
+const MAX_BLOCK_LEN: usize = TREE_FANOUT as usize;
+
+const _: () = assert!(NODE_PAGE_LEN * size_of::<Node>() == 16 * 1024);
+const _: () = assert!(WORD_PAGE_LEN * size_of::<u32>() == 16 * 1024);
+const _: () = assert!(WORD_PAGE_LEN >= MAX_BLOCK_LEN);
+
+/// The readable part of the arenas: two page lists. Cloning is O(1) and the
+/// clone never changes.
+#[derive(Clone, Default)]
+pub(crate) struct Storage {
+    nodes: Pages<Node, NODE_PAGE_LEN>,
+    words: Pages<u32, WORD_PAGE_LEN>,
+}
+
+impl Storage {
+    pub fn node(&self, index: u32) -> Node {
+        self.nodes.get(index)
+    }
+
+    /// The `len` words of the block at `base`.
+    pub fn block(&self, base: u32, len: usize) -> &[u32] {
+        self.words.slice(base, len)
+    }
+
+    /// Whether both hold the very same page lists: nothing was written or
+    /// copied between them.
+    #[cfg(test)]
+    pub fn shares_everything_with(&self, other: &Self) -> bool {
+        self.nodes.shares_list(&other.nodes) && self.words.shares_list(&other.words)
+    }
+}
+
+/// The writer's arenas: storage plus free lists and live counts.
+#[derive(Default)]
+pub(crate) struct Store {
+    storage: Storage,
+    nodes: NodeSlots,
+    blocks: WordBlocks,
+}
+
+impl Store {
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    pub fn node(&self, index: u32) -> Node {
+        self.storage.node(index)
+    }
+
+    pub fn block(&self, base: u32, len: usize) -> &[u32] {
+        self.storage.block(base, len)
+    }
+
+    /// Stores a new node and returns its index.
+    pub fn alloc_node(&mut self, kind: NodeKind, node: Node) -> u32 {
+        let index = self.nodes.alloc(kind, &mut self.storage.nodes);
+        self.set_node(index, node);
+        index
+    }
+
+    /// Overwrites a live node.
+    pub fn set_node(&mut self, index: u32, node: Node) {
+        self.storage.nodes.slice_mut(index, 1)[0] = node;
+    }
+
+    pub fn free_node(&mut self, kind: NodeKind, index: u32) {
+        self.nodes.free(kind, index);
+    }
+
+    /// Stores a new block of 1 to 64 words and returns its base.
+    pub fn alloc_block(&mut self, words: &[u32]) -> u32 {
+        let base = self.blocks.alloc(words.len(), &mut self.storage.words);
+        self.write_block(base, words);
+        base
+    }
+
+    /// Overwrites a live block of exactly `words.len()` words.
+    pub fn write_block(&mut self, base: u32, words: &[u32]) {
+        self.storage
+            .words
+            .slice_mut(base, words.len())
+            .copy_from_slice(words);
+    }
+
+    pub fn free_block(&mut self, base: u32, len: usize) {
+        self.blocks.free(base, len);
+    }
+
+    pub fn stats(&self) -> TreeStats {
+        TreeStats {
+            branches: self.nodes.live(NodeKind::Branch),
+            leaves: self.nodes.live(NodeKind::Leaf),
+            words: self.blocks.live_words(),
+            free_nodes: self.nodes.free_count(),
+            free_words: self.blocks.free_words(),
+            bytes: self.storage.nodes.page_count() * NODE_PAGE_LEN * size_of::<Node>()
+                + self.storage.words.page_count() * WORD_PAGE_LEN * size_of::<u32>(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(mask: u64, base: u32) -> Node {
+        Node {
+            mask,
+            base,
+            info: 0,
+        }
+    }
+
+    #[test]
+    fn nodes_and_blocks_read_back() {
+        let mut store = Store::default();
+        let base = store.alloc_block(&[1, 2, 3]);
+        let index = store.alloc_node(NodeKind::Branch, node(0b111, base));
+        assert_eq!(store.node(index), node(0b111, base));
+        assert_eq!(store.block(base, 3), [1, 2, 3]);
+    }
+
+    #[test]
+    fn stats_count_live_and_free_storage() {
+        let mut store = Store::default();
+        let a = store.alloc_block(&[7; 10]);
+        let leaf = store.alloc_node(NodeKind::Leaf, node(1, a));
+        let b = store.alloc_block(&[8; 2]);
+        let branch = store.alloc_node(NodeKind::Branch, node(3, b));
+        let s = store.stats();
+        assert_eq!((s.branches, s.leaves, s.words), (1, 1, 12));
+        assert_eq!(s.bytes, 2 * 16 * 1024);
+
+        store.free_block(a, 10);
+        store.free_node(NodeKind::Leaf, leaf);
+        store.free_block(b, 2);
+        store.free_node(NodeKind::Branch, branch);
+        let s = store.stats();
+        assert_eq!((s.branches, s.leaves, s.words), (0, 0, 0));
+        assert_eq!((s.free_nodes, s.free_words), (2, 12));
+    }
+
+    #[test]
+    fn a_clone_keeps_its_contents_while_the_store_is_written() {
+        let mut store = Store::default();
+        let base = store.alloc_block(&[1, 2]);
+        let index = store.alloc_node(NodeKind::Branch, node(0b11, base));
+        let snapshot = store.storage().clone();
+        assert!(snapshot.shares_everything_with(store.storage()));
+
+        store.write_block(base, &[5, 6]);
+        store.set_node(index, node(0b101, base));
+        assert_eq!(snapshot.block(base, 2), [1, 2]);
+        assert_eq!(snapshot.node(index), node(0b11, base));
+        assert_eq!(store.block(base, 2), [5, 6]);
+        assert!(!snapshot.shares_everything_with(store.storage()));
+    }
+
+    #[test]
+    fn freeing_writes_no_page() {
+        let mut store = Store::default();
+        let base = store.alloc_block(&[1]);
+        let index = store.alloc_node(NodeKind::Leaf, node(1, base));
+        let snapshot = store.storage().clone();
+        store.free_block(base, 1);
+        store.free_node(NodeKind::Leaf, index);
+        assert!(snapshot.shares_everything_with(store.storage()));
+    }
+}
