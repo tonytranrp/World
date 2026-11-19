@@ -39,6 +39,7 @@ Every folder has a `README.md` that states its permanent purpose, scope and rule
 8. **Each Bevy crate exposes one public `Plugin` and a `prelude`.** Everything else stays crate-private unless another crate needs it.
 9. **Prefer deep module folders inside the existing crates** over creating new crates. New crates are rare because hot-patching works best with few of them.
 10. **Tune with data first.** Materials, physics constants and worldgen parameters go in RON files under `assets/config/`, not in code.
+11. **Hash maps for lookups, ordered containers for output.** Hot-path lookups use `rustc-hash` (World_Core) or `bevy_platform` hash maps (Engine). Anything iterated to produce output, generation or saves uses `BTreeMap`, a sorted `Vec` or `indexmap`, because foldhash and hashbrown iteration order differs across platforms and runs (decision 0003 determinism).
 
 ## Naming
 
@@ -87,7 +88,18 @@ cargo xtask bench --check main --threshold 10   # fail on a >10% slowdown
 cargo xtask check             # fmt, clippy -D warnings, fast tests
 cargo xtask coverage          # HTML coverage in target/llvm-cov/html
 cargo xtask miri              # Miri on the crates that may hold unsafe code
+cargo xtask bench --instructions                       # instruction counts (gungraun, Linux + Valgrind)
+cargo xtask bench --instructions --check main --threshold 5   # fail on >5% more instructions
+cargo xtask fuzz [decode|round_trip] [--time SECS]     # cargo-fuzz on the decoder (nightly), 300 s each
+cargo xtask mutants [-- ARGS]                          # cargo-mutants on World_Core, results in mutants.out/
+cargo bench -p world_core --bench memory               # print tree memory per surface voxel and fragmentation
 ```
+
+- Benchmarks: `World_Core/benches/tree.rs` (microbenchmarks) and `workloads.rs` (dense overwrites, carving, coherent reads, `apply` batches, the first edit after a snapshot of a 500 MiB tree, serialization) are Criterion wall-time benches; `memory.rs` prints `stats()` figures; `instructions.rs` counts instructions with gungraun under Valgrind and is what CI gates on (`quality` workflow, `bench-instructions` job), because instruction counts are stable on shared runners and wall time is not.
+- Reads must not allocate: `World_Core/tests/no_alloc.rs` uses dhat's counting allocator to check `get`, `NodeRef` walks, `same_content`, `content_hash` and snapshots. Keep it to one `#[test]`, since dhat counts every thread.
+- The fuzz project (`World_Core/fuzz`, its own workspace, excluded from the main one) needs `rustup toolchain install nightly --profile minimal --no-self-update` and `cargo install cargo-fuzz --locked`. Crash inputs land in `fuzz/artifacts/<target>/`. CI fuzzes weekly.
+- Mutation testing reads `.cargo/mutants.toml` and needs `cargo install cargo-mutants --locked`. Narrow a run with `cargo xtask mutants -- --file 'crates/Foundation/World_Core/src/coords/**'`. CI runs it weekly in four shards and uploads `mutants.out`.
+- Instruction counts need Linux: `valgrind` and `cargo install gungraun-runner --version <the gungraun version in Cargo.lock> --locked`. On Windows use WSL.
 
 Tools the runner expects: `cargo install cargo-nextest --locked`, `cargo install cargo-llvm-cov --locked` with `rustup component add llvm-tools-preview`, and `rustup toolchain install nightly --component miri` for Miri. Pass `--no-self-update` to `rustup toolchain install`, because a rustup self-update can fail on Windows and leave `rustup.exe` missing.
 
@@ -128,4 +140,4 @@ cargo test --workspace
 
 The default `dev` feature of `app` enables dynamic linking, asset hot reload and the developer panels. The `hotpatch` feature replaces it for `dx`. Release builds use `--no-default-features`. `.cargo/config.toml` points Bevy at the top-level `assets/` folder.
 
-Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` has the test, golden, bench, check, coverage, miri, dev and hot commands; its codegen and packaging commands and the release CI come later. `.github/workflows/test.yml` runs formatting, clippy (including the hotpatch and release feature sets) and every test on Windows; on macOS it runs the non-GPU tests and builds a universal binary for Apple Silicon and Intel. The hot-patch smoke test runs weekly and on manual dispatch.
+Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` has the test, golden, bench, check, coverage, miri, fuzz, mutants, dev and hot commands; its codegen and packaging commands and the release CI come later. `.github/workflows/test.yml` runs formatting, clippy (including the hotpatch and release feature sets) and every test on Windows; on macOS it runs the non-GPU tests and builds a universal binary for Apple Silicon and Intel. The hot-patch smoke test runs weekly and on manual dispatch. `.github/workflows/quality.yml` (not required checks) counts World_Core's instructions on Linux for every core change and compares them with main, and fuzzes the decoder and runs mutation testing weekly.
