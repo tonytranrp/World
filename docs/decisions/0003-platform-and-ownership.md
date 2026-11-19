@@ -24,8 +24,11 @@ floor) begins.
   feature, and the game finds its assets inside the bundle without
   `BEVY_ASSET_ROOT`. Developer ID signing and notarization wait until the game
   is shared publicly.
-- **PR #1 merges after the Mac test passes**, so `main` never carries a known
-  macOS problem. The weekly hot-patch smoke test starts with that merge.
+- **PR #1 merges once CI is green on Windows and macOS.** The test on the 2019
+  MacBook Pro is postponed: CI already builds and tests on macOS, and the
+  hardware run happens later, before the `.app` work. Whatever it finds is
+  fixed on `main` like any other bug. The weekly hot-patch smoke test starts
+  with the merge.
 
 ### Determinism
 

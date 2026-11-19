@@ -26,7 +26,7 @@ git clone https://github.com/tonytranrp/World.git
 ```
 
 ```bash
-cd World && git lfs install && git lfs pull && git switch hot-reload-engine
+cd World && git lfs install && git lfs pull
 ```
 
 ```bash
@@ -98,5 +98,6 @@ and `target/hot-smoke.log`.
 
 ## What happens next
 
-Findings get fixed on the `hot-reload-engine` branch; PR #1 merges once this
-checklist passes (decision 0003). Then the `.app` packaging work starts.
+This test is postponed (decision 0003): PR #1 merged on green CI, and the
+checklist runs later, on `main`, before the `.app` packaging work. Findings are
+fixed like any other bug.
