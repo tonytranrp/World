@@ -43,6 +43,20 @@ impl Writer<'_> {
         }
     }
 
+    /// Overwrites leaf `slot` of a stored level-1 node with `new` where that
+    /// keeps the node canonical without repacking: the slot already holds a
+    /// leaf, `new` is not air, and the node cannot collapse (it can only once
+    /// every slot holds a uniform leaf). Returns whether it wrote.
+    pub(super) fn patch_record(&mut self, node: Node, slot: u32, new: Record) -> bool {
+        let may_collapse = node.mask == u64::MAX && new.uniform().is_some();
+        if new.mask == 0 || node.mask & bit(slot) == 0 || may_collapse {
+            return false;
+        }
+        let at = node.base + (RECORD_WORDS * rank(node.mask, slot)) as u32;
+        self.store.write_block(at, &new.words());
+        true
+    }
+
     /// The 64 voxels of a stored leaf.
     pub(super) fn leaf_voxels(&self, record: Record) -> Voxels {
         match record.palette_base() {

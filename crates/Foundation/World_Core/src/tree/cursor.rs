@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::ROOT_LEVEL;
-use super::alloc::Storage;
+use super::alloc::StorageReader;
 use super::node::{Child, slot_at};
 use super::read::{Step, TreeView, record_voxel, step};
 use crate::consts::TREE_DEPTH;
@@ -20,7 +20,8 @@ use crate::material::MaterialId;
 /// its tree, so the tree cannot change while the cursor lives.
 #[derive(Clone)]
 pub struct TreeCursor<'a> {
-    storage: &'a Storage,
+    /// Remembers the last node and word page across lookups too.
+    storage: StorageReader<'a>,
     root: Child,
     /// World-local coordinate of the last lookup.
     last: [u32; 3],
@@ -39,7 +40,7 @@ impl<'a> TreeCursor<'a> {
             path[ROOT_LEVEL as usize] = index;
         }
         Self {
-            storage: view.storage,
+            storage: view.storage.reader(),
             root: view.root,
             last: [0; 3],
             path,
@@ -66,10 +67,10 @@ impl<'a> TreeCursor<'a> {
         self.last = local;
         let mut level = shared.max(self.bottom);
         if level == 0 {
-            return record_voxel(self.storage, self.path[0], slot_at(local, 0));
+            return record_voxel(&mut self.storage, self.path[0], slot_at(local, 0));
         }
         loop {
-            match step(self.storage, self.path[level as usize], level, local) {
+            match step(&mut self.storage, self.path[level as usize], level, local) {
                 Step::Filled(m) => {
                     self.bottom = level;
                     return m;
@@ -81,7 +82,7 @@ impl<'a> TreeCursor<'a> {
                 Step::Record(at) => {
                     self.path[0] = at;
                     self.bottom = 0;
-                    return record_voxel(self.storage, at, slot_at(local, 0));
+                    return record_voxel(&mut self.storage, at, slot_at(local, 0));
                 }
             }
         }

@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use super::alloc::Storage;
+use super::alloc::{Storage, StorageReader};
 use super::node::leaf::{self, Record};
 use super::node::{Child, RECORD_WORDS, UNIFORM_BIT, bit, rank, slot_at, slots};
 use super::{ROOT_LEVEL, WORLD_ORIGIN};
@@ -511,7 +511,8 @@ impl<'a> TreeView<'a> {
     }
 
     /// The material of one voxel, read straight from storage: one node and
-    /// one word per level, no views.
+    /// one word per level, no views. The reader remembers the last node and
+    /// word page, which the nodes of one path often share.
     pub fn get(self, pos: VoxelPos) -> MaterialId {
         let Some(local) = path::world_local(pos) else {
             return MaterialId::AIR;
@@ -521,15 +522,16 @@ impl<'a> TreeView<'a> {
             Child::Uniform(m) => return m,
             Child::Node(index) => index,
         };
+        let mut storage = self.storage.reader();
         let mut level = ROOT_LEVEL;
         loop {
-            match step(self.storage, index, level, local) {
+            match step(&mut storage, index, level, local) {
                 Step::Filled(m) => return m,
                 Step::Node(child) => {
                     index = child;
                     level -= 1;
                 }
-                Step::Record(at) => return record_voxel(self.storage, at, slot_at(local, 0)),
+                Step::Record(at) => return record_voxel(&mut storage, at, slot_at(local, 0)),
             }
         }
     }
@@ -547,7 +549,12 @@ pub(crate) enum Step {
 
 /// The child of node `index`, at `level`, that holds local coordinate `local`.
 #[inline]
-pub(crate) fn step(storage: &Storage, index: u32, level: u32, local: [u32; 3]) -> Step {
+pub(crate) fn step(
+    storage: &mut StorageReader<'_>,
+    index: u32,
+    level: u32,
+    local: [u32; 3],
+) -> Step {
     let node = storage.node(index);
     let slot = slot_at(local, level);
     if node.mask & bit(slot) == 0 {
@@ -567,7 +574,7 @@ pub(crate) fn step(storage: &Storage, index: u32, level: u32, local: [u32; 3]) -
 
 /// Voxel `slot` of the leaf whose record is at word `at`.
 #[inline]
-pub(crate) fn record_voxel(storage: &Storage, at: u32, slot: u32) -> MaterialId {
+pub(crate) fn record_voxel(storage: &mut StorageReader<'_>, at: u32, slot: u32) -> MaterialId {
     let record = Record::read(storage.block(at, RECORD_WORDS));
     if record.mask & bit(slot) == 0 {
         return MaterialId::AIR;

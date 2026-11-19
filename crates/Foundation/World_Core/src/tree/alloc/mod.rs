@@ -17,7 +17,7 @@ mod pages;
 
 use blocks::WordBlocks;
 use nodes::NodeSlots;
-use pages::Pages;
+use pages::{PageReader, Pages};
 
 use super::TreeStats;
 use super::node::{MAX_BLOCK_LEN, Node};
@@ -70,11 +70,12 @@ impl Storage {
         self.words.slice(base, len)
     }
 
-    /// The words from `start` to the end of its page: a whole block whose
-    /// length is not known until its first word is read.
-    #[inline]
-    pub fn block_from(&self, start: u32) -> &[u32] {
-        self.words.tail(start)
+    /// Reads that remember the last node page and word page they touched.
+    pub fn reader(&self) -> StorageReader<'_> {
+        StorageReader {
+            nodes: self.nodes.reader(),
+            words: self.words.reader(),
+        }
     }
 
     /// Every node page in order; page `i` holds nodes from `i * NODE_PAGE_LEN`.
@@ -92,6 +93,39 @@ impl Storage {
     #[cfg(test)]
     pub fn shares_everything_with(&self, other: &Self) -> bool {
         self.nodes.shares_list(&other.nodes) && self.words.shares_list(&other.words)
+    }
+}
+
+/// Point reads from a [`Storage`] that remember the last node page and word
+/// page, for lookups that walk down the tree.
+#[derive(Clone)]
+pub(crate) struct StorageReader<'a> {
+    nodes: PageReader<'a, Node, NODE_PAGE_LEN>,
+    words: PageReader<'a, u32, WORD_PAGE_LEN>,
+}
+
+impl<'a> StorageReader<'a> {
+    #[inline]
+    pub fn node(&mut self, index: u32) -> Node {
+        self.nodes.get(index)
+    }
+
+    #[inline]
+    pub fn word(&mut self, index: u32) -> u32 {
+        self.words.get(index)
+    }
+
+    /// The `len` words of the block at `base`.
+    #[inline]
+    pub fn block(&mut self, base: u32, len: usize) -> &'a [u32] {
+        self.words.slice(base, len)
+    }
+
+    /// The words from `start` to the end of its page: a whole block whose
+    /// length is not known until its first word is read.
+    #[inline]
+    pub fn block_from(&mut self, start: u32) -> &'a [u32] {
+        self.words.tail(start)
     }
 }
 
@@ -200,8 +234,14 @@ mod tests {
         assert_eq!(store.node(index), node(0b111, base));
         assert_eq!(store.block(base, 3), [1, 2, 3]);
         assert_eq!(store.word(base + 1), 2);
-        assert_eq!(store.storage().block_from(base)[..3], [1, 2, 3]);
-        assert_eq!(store.storage().block_from(base).len(), WORD_PAGE_LEN);
+        let mut reader = store.storage().reader();
+        assert_eq!(reader.node(index), node(0b111, base));
+        assert_eq!(
+            (reader.word(base), reader.block(base + 1, 2)),
+            (1, &[2, 3][..])
+        );
+        assert_eq!(reader.block_from(base)[..3], [1, 2, 3]);
+        assert_eq!(reader.block_from(base).len(), WORD_PAGE_LEN);
     }
 
     #[test]

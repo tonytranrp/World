@@ -32,6 +32,24 @@ impl Writer<'_> {
         }
         Child::from_word(self.store.word(node.base + rank(node.mask, slot) as u32))
     }
+
+    /// Overwrites child `slot` of a stored node at level 2 or higher with
+    /// `new` where that keeps the node canonical without repacking: the slot
+    /// already holds a child, `new` is not air, and the node cannot collapse
+    /// (it can only once every slot holds a uniform child). Returns whether
+    /// it wrote.
+    pub(super) fn patch_child(&mut self, node: Node, slot: u32, new: Child) -> bool {
+        let Some(word) = new.word() else {
+            return false;
+        };
+        let may_collapse = node.mask == u64::MAX && matches!(new, Child::Uniform(_));
+        if node.mask & bit(slot) == 0 || may_collapse {
+            return false;
+        }
+        let at = node.base + rank(node.mask, slot) as u32;
+        self.store.write_block(at, &[word]);
+        true
+    }
 }
 
 /// Packs 64 canonical children into canonical node content: all air or all

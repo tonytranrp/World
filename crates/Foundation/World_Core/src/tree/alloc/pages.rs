@@ -60,13 +60,6 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
         &self.page(start / N)[offset..offset + len]
     }
 
-    /// The items from `start` to the end of its page.
-    #[inline]
-    pub fn tail(&self, start: u32) -> &[T] {
-        let start = start as usize;
-        &self.page(start / N)[start % N..]
-    }
-
     /// Mutable `len` items from `start`, which must lie in one page. Copies
     /// the directory, the chunk and the page first if a clone shares them.
     pub fn slice_mut(&mut self, start: u32, len: usize) -> &mut [T] {
@@ -110,6 +103,15 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
         &self.dir[page / CHUNK_PAGES][page % CHUNK_PAGES]
     }
 
+    /// Reads that remember the last page they touched.
+    pub fn reader(&self) -> PageReader<'_, T, N> {
+        PageReader {
+            pages: self,
+            index: usize::MAX,
+            page: &[],
+        }
+    }
+
     /// Whether page `page` is the same allocation in both. Test support for
     /// checking what copy-on-write copied.
     #[cfg(test)]
@@ -132,9 +134,72 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
     }
 }
 
+/// Reads from a [`Pages`] that remember the last page touched, so a run of
+/// reads in one page goes through the directory and chunk only once. Point
+/// lookups walk down a tree whose nodes and blocks were mostly allocated
+/// together, so consecutive reads often share a page.
+#[derive(Clone)]
+pub(super) struct PageReader<'a, T, const N: usize> {
+    pages: &'a Pages<T, N>,
+    /// The index of `page`; `usize::MAX` before the first read.
+    index: usize,
+    page: &'a [T],
+}
+
+impl<'a, T: Copy + Default, const N: usize> PageReader<'a, T, N> {
+    /// Item `index`. Panics past the last page.
+    #[inline]
+    pub fn get(&mut self, index: u32) -> T {
+        let index = index as usize;
+        self.page(index / N)[index % N]
+    }
+
+    /// `len` items from `start`, which must lie in one page.
+    #[inline]
+    pub fn slice(&mut self, start: u32, len: usize) -> &'a [T] {
+        let start = start as usize;
+        let offset = start % N;
+        &self.page(start / N)[offset..offset + len]
+    }
+
+    /// The items from `start` to the end of its page.
+    #[inline]
+    pub fn tail(&mut self, start: u32) -> &'a [T] {
+        let start = start as usize;
+        &self.page(start / N)[start % N..]
+    }
+
+    #[inline]
+    fn page(&mut self, page: usize) -> &'a [T] {
+        if page != self.index {
+            self.page = self.pages.page(page);
+            self.index = page;
+        }
+        self.page
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_sees_every_page_and_remembers_the_last() {
+        let mut p = pages(CHUNK_PAGES + 2);
+        for page in [0, 1, CHUNK_PAGES + 1] {
+            p.slice_mut((page * 4) as u32, 4)
+                .copy_from_slice(&[page as u32, 1, 2, 3]);
+        }
+        let mut reader = p.reader();
+        assert_eq!(reader.get(4), 1);
+        assert_eq!(reader.index, 1);
+        assert_eq!(reader.slice(5, 3), [1, 2, 3]);
+        assert_eq!(reader.tail(6), [2, 3]);
+        assert_eq!(reader.get(0), 0);
+        let last = (CHUNK_PAGES + 1) * 4;
+        assert_eq!(reader.get(last as u32), (CHUNK_PAGES + 1) as u32);
+        assert_eq!(reader.index, CHUNK_PAGES + 1);
+    }
 
     fn pages(count: usize) -> Pages<u32, 4> {
         let mut p = Pages::default();
@@ -151,7 +216,6 @@ mod tests {
         assert_eq!(p.get(5), 10);
         assert_eq!(p.get(6), 11);
         assert_eq!(p.slice(4, 4), [0, 10, 11, 0]);
-        assert_eq!(p.tail(6), [11, 0]);
         assert_eq!(p.page_count(), 3);
     }
 
