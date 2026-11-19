@@ -6,8 +6,25 @@ xtask = "run --quiet --package xtask --"
 # the many small relinks of an incremental dev build. `cargo xtask hot` replaces
 # it with xtask's own link shim, which still ends in rust-lld; dx 0.7.10 cannot
 # be handed rust-lld directly (Dioxus #4694, see decision 0002).
+#
+# x86-64-v2 (SSE4.2 and POPCNT) on both x86_64 targets: the tree counts mask
+# bits at every level, and on the baseline x86-64 target `u64::count_ones`
+# compiles to about 15 instructions instead of one POPCNT. Windows 11 24H2
+# already requires these instructions, and the Intel Mac performance floor (the
+# 2019 16-inch MacBook Pro) has them. Setting RUSTFLAGS in the environment
+# replaces these flags, so keep the target-cpu there too if you set it.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# Linux is not shipped, but CI measures World_Core's instruction counts there
+# (gungraun under Valgrind); the same target-cpu keeps those counts true to
+# the shipped code.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
 
 # Bevy resolves "assets" relative to CARGO_MANIFEST_DIR (the app crate) by default.
 # Point it at the workspace root so the shared top-level assets/ folder is used.
