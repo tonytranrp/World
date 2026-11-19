@@ -14,13 +14,16 @@
 
 pub(crate) mod leaf;
 
+use bytemuck::{Pod, Zeroable};
+
 use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
 
-/// One tree node, branch or leaf. `#[repr(C)]` so the 16-byte layout is fixed.
+/// One tree node, branch or leaf. `#[repr(C)]` with no padding, so the
+/// 16-byte layout is fixed and node pages cast to bytes for the GPU.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Node {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct Node {
     /// Bit `i` is set when child (branch) or voxel (leaf) `i` is not air.
     pub mask: u64,
     /// First word of the node's block in the word arena.
@@ -32,12 +35,13 @@ pub(crate) struct Node {
 
 const _: () = assert!(size_of::<Node>() == 16);
 const _: () = assert!(align_of::<Node>() == 8);
+const _: () = assert!(size_of::<Node>() == size_of::<u64>() + 2 * size_of::<u32>());
 const _: () = assert!(TREE_FANOUT == u64::BITS);
 
 impl Node {
     /// Words in this node's block: one per child for a branch, palette plus
     /// indices for a leaf. Always between 1 and 64 for a live node.
-    pub fn block_len(self, kind: NodeKind) -> usize {
+    pub(crate) fn block_len(self, kind: NodeKind) -> usize {
         match kind {
             NodeKind::Branch => self.mask.count_ones() as usize,
             NodeKind::Leaf => leaf::block_len(self.mask, self.info),
@@ -59,7 +63,7 @@ impl NodeKind {
 }
 
 /// Set in a child word that holds a uniform material instead of a node index.
-pub(crate) const UNIFORM_BIT: u32 = 1 << 31;
+pub const UNIFORM_BIT: u32 = 1 << 31;
 
 /// Node indices are below this, so they never collide with uniform words.
 pub(crate) const MAX_NODES: u32 = UNIFORM_BIT;

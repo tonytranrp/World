@@ -1,7 +1,7 @@
 //! The tree's memory: a node arena and a word arena in copy-on-write pages
 //! (decision 0004).
 //!
-//! [`Storage`] is the shared, readable part: the two page lists. Cloning it is
+//! [`Storage`] is the shared, readable part: the two paged arrays. Cloning it is
 //! O(1), which is how a snapshot is taken. [`Store`] is the writer: storage
 //! plus the free lists and live counts. Every write goes through
 //! `Arc::make_mut`, so a page a snapshot still holds is copied before it
@@ -30,16 +30,16 @@ use crate::consts::TREE_FANOUT;
 // block per level, so it touches at most `2 * TREE_DEPTH` pages: at 16 KiB the
 // worst case is 320 KiB copied, about 20 us, once per page per frame, and
 // edits in one area share pages so the usual cost is a small fraction of that.
-// The first write after a snapshot also clones each page list, one `Arc` per
-// page: 16 KiB pages keep that at 65,536 entries per GiB of storage. Smaller
-// pages would copy less per edit but make that list clone and the per-page
-// overhead grow; larger pages the reverse.
+// The first write after a snapshot also copies the page directory and each
+// directory chunk it touches (see `pages`), a few hundred `Arc`s per GiB of
+// storage rather than one per page. Smaller pages would copy less per edit but
+// make the directory and the per-page overhead grow; larger pages the reverse.
 
 /// Nodes per node page: 1024 x 16 bytes = 16 KiB.
-const NODE_PAGE_LEN: usize = 1024;
+pub const NODE_PAGE_LEN: usize = 1024;
 
 /// Words per word page: 4096 x 4 bytes = 16 KiB.
-const WORD_PAGE_LEN: usize = 4096;
+pub const WORD_PAGE_LEN: usize = 4096;
 
 /// The longest word block: a branch with all 64 children.
 const MAX_BLOCK_LEN: usize = TREE_FANOUT as usize;
@@ -48,7 +48,7 @@ const _: () = assert!(NODE_PAGE_LEN * size_of::<Node>() == 16 * 1024);
 const _: () = assert!(WORD_PAGE_LEN * size_of::<u32>() == 16 * 1024);
 const _: () = assert!(WORD_PAGE_LEN >= MAX_BLOCK_LEN);
 
-/// The readable part of the arenas: two page lists. Cloning is O(1) and the
+/// The readable part of the arenas: two paged arrays. Cloning is O(1) and the
 /// clone never changes.
 #[derive(Clone, Default)]
 pub(crate) struct Storage {
@@ -64,6 +64,16 @@ impl Storage {
     /// The `len` words of the block at `base`.
     pub fn block(&self, base: u32, len: usize) -> &[u32] {
         self.words.slice(base, len)
+    }
+
+    /// Every node page in order; page `i` holds nodes from `i * NODE_PAGE_LEN`.
+    pub fn node_pages(&self) -> impl Iterator<Item = &[Node]> {
+        self.nodes.pages()
+    }
+
+    /// Every word page in order; page `i` holds words from `i * WORD_PAGE_LEN`.
+    pub fn word_pages(&self) -> impl Iterator<Item = &[u32]> {
+        self.words.pages()
     }
 
     /// Whether both hold the very same page lists: nothing was written or

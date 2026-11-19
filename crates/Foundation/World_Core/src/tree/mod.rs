@@ -11,12 +11,15 @@
 
 mod alloc;
 mod mutate;
-mod node;
+pub mod node;
 
 #[cfg(test)]
 mod tests;
 
 use std::fmt;
+
+pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
+pub use node::{Node, UNIFORM_BIT};
 
 use alloc::{Storage, Store};
 use mutate::LocalBox;
@@ -320,6 +323,29 @@ impl fmt::Debug for VoxelTree {
 pub struct TreeSnapshot {
     storage: Storage,
     root: Child,
+}
+
+impl TreeSnapshot {
+    /// The root as a child word (see [`node`]): `None` when the whole world
+    /// is air, a word with [`UNIFORM_BIT`] when it is one material, else the
+    /// index of the root node.
+    pub fn root_word(&self) -> Option<u32> {
+        self.root.word()
+    }
+
+    /// The node pages with their page index, for uploads that cast them to
+    /// bytes (`bytemuck::cast_slice`) without copying. Page `i` holds nodes
+    /// `i * NODE_PAGE_LEN ..`; slots not reachable from the root are free and
+    /// hold stale data.
+    pub fn node_pages(&self) -> impl Iterator<Item = (usize, &[Node])> {
+        self.storage.node_pages().enumerate()
+    }
+
+    /// The word pages with their page index, like [`node_pages`](Self::node_pages).
+    /// Page `i` holds words `i * WORD_PAGE_LEN ..`.
+    pub fn word_pages(&self) -> impl Iterator<Item = (usize, &[u32])> {
+        self.storage.word_pages().enumerate()
+    }
 }
 
 impl TreeRead for TreeSnapshot {

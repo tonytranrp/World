@@ -585,3 +585,36 @@ proptest! {
         assert_sound(&tree);
     }
 }
+
+#[test]
+fn snapshot_pages_expose_the_raw_layout_without_copying() {
+    let mut tree = VoxelTree::new();
+    assert_eq!(tree.snapshot().root_word(), None);
+    tree.set(pos(1, 2, 3), STONE).unwrap();
+    tree.set(pos(-100, 50, 7), DIRT).unwrap();
+    let snap = tree.snapshot();
+
+    let nodes: Vec<(usize, &[Node])> = snap.node_pages().collect();
+    let words: Vec<(usize, &[u32])> = snap.word_pages().collect();
+    assert_eq!((nodes.len(), words.len()), (1, 1));
+    assert_eq!((nodes[0].0, words[0].0), (0, 0));
+    assert_eq!(nodes[0].1.len(), NODE_PAGE_LEN);
+    assert_eq!(words[0].1.len(), WORD_PAGE_LEN);
+    let bytes: &[u8] = bytemuck::cast_slice(nodes[0].1);
+    assert_eq!(bytes.len(), NODE_PAGE_LEN * 16);
+
+    // The root word leads to the node a reader sees.
+    let root = snap.root_word().unwrap();
+    assert_eq!(root & UNIFORM_BIT, 0);
+    let node = nodes[0].1[root as usize];
+    let NodeRef::Branch(b) = snap.root() else {
+        panic!("two voxels need a root branch");
+    };
+    assert_eq!(node.mask, b.mask());
+    assert_eq!(node.info, 0);
+    let first = words[0].1[node.base as usize];
+    assert_eq!(first & UNIFORM_BIT, 0, "the root's children are nodes");
+
+    tree.fill_box(VoxelBox::WORLD, STONE).unwrap();
+    assert_eq!(tree.snapshot().root_word(), Some(UNIFORM_BIT | 1));
+}

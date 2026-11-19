@@ -36,6 +36,8 @@ bevy_rapier3d = { version = "=0.37.0", default-features = false, features = ["di
 wgpu = { version = "=30.0.2", default-features = false }
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
+# Plain-data casts for GPU uploads; the unsafe stays inside bytemuck.
+bytemuck = { version = "1.25", features = ["derive"] }
 # Must match the ron that Bevy itself uses, so there is one RON parser.
 ron = "0.12"
 
