@@ -2,9 +2,9 @@
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use world_core::{Edit, MaterialId, VoxelPos};
+use world_core::{Edit, MaterialId, VoxelBox, VoxelPos};
 
-use crate::dense::Bounds;
+use crate::dense::{Bounds, EditOp};
 use crate::hits::Ray;
 
 /// A position anywhere inside `bounds`.
@@ -31,6 +31,64 @@ pub fn edits(
     max_len: usize,
 ) -> impl Strategy<Value = Vec<Edit>> {
     vec(edit(bounds, max_material), 0..=max_len)
+}
+
+/// A box inside `bounds`. Each axis picks two cut points in `0..=size`, so
+/// thin, full-width and empty boxes all occur; shrinking leads to the empty
+/// box at the lowest corner.
+pub fn voxel_box(bounds: Bounds) -> impl Strategy<Value = VoxelBox> {
+    let lo = bounds.min.to_array();
+    let cuts = move |axis: usize| {
+        let size = bounds.size[axis];
+        (0..=size, 0..=size).prop_map(move |(a, b)| {
+            let start = lo[axis] as i64;
+            (
+                (start + a.min(b) as i64) as i32,
+                (start + a.max(b) as i64) as i32,
+            )
+        })
+    };
+    (cuts(0), cuts(1), cuts(2)).prop_map(|((x0, x1), (y0, y1), (z0, z1))| {
+        VoxelBox::new(VoxelPos::new(x0, y0, z0), VoxelPos::new(x1, y1, z1))
+    })
+}
+
+/// One step inside `bounds`: seven in eight are single voxels, the rest fill
+/// or carve (with air) a random box.
+pub fn edit_op(bounds: Bounds, max_material: u16) -> impl Strategy<Value = EditOp> {
+    prop_oneof![
+        7 => edit(bounds, max_material).prop_map(EditOp::Set),
+        1 => (voxel_box(bounds), material(max_material))
+            .prop_map(|(region, material)| EditOp::Fill { region, material }),
+    ]
+}
+
+/// Between zero and `max_len` steps inside `bounds`.
+pub fn edit_ops(
+    bounds: Bounds,
+    max_material: u16,
+    max_len: usize,
+) -> impl Strategy<Value = Vec<EditOp>> {
+    vec(edit_op(bounds, max_material), 0..=max_len)
+}
+
+/// A position inside `bounds` that hugs its faces: on each axis independently
+/// it lies within `margin` voxels of the low face, of the high face, or
+/// anywhere, so edges and corners come up often. Panics on a zero margin or
+/// an empty axis.
+pub fn edge_pos(bounds: Bounds, margin: u32) -> impl Strategy<Value = VoxelPos> {
+    assert!(margin > 0, "edge_pos needs a margin of at least one voxel");
+    let axis = move |a: usize| {
+        let size = bounds.size[a];
+        assert!(size > 0, "edge_pos needs bounds with voxels on every axis");
+        let (lo, hi) = (
+            bounds.min.to_array()[a] as i64,
+            bounds.min.to_array()[a] as i64 + size as i64,
+        );
+        let m = margin.min(size) as i64;
+        prop_oneof![lo..lo + m, hi - m..hi, lo..hi].prop_map(|v| v as i32)
+    };
+    (axis(0), axis(1), axis(2)).prop_map(|(x, y, z)| VoxelPos::new(x, y, z))
 }
 
 /// A ray starting near `bounds` (inside or up to three voxels outside) heading
@@ -88,6 +146,58 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn boxes_stay_inside_the_bounds_and_can_be_empty() {
+        let mut runner = TestRunner::new(Config::with_cases(300));
+        let empty = std::cell::Cell::new(0);
+        runner
+            .run(&voxel_box(bounds()), |b| {
+                prop_assert!(bounds().as_box().contains_box(&b));
+                prop_assert!(b.min().x <= b.end().x && b.min().y <= b.end().y);
+                empty.set(empty.get() + usize::from(b.is_empty()));
+                Ok(())
+            })
+            .unwrap();
+        assert!(empty.get() > 0, "no empty box in 300 cases");
+    }
+
+    #[test]
+    fn ops_stay_inside_the_bounds() {
+        let mut runner = TestRunner::new(Config::with_cases(200));
+        runner
+            .run(&edit_ops(bounds(), 3, 12), |ops| {
+                prop_assert!(ops.len() <= 12);
+                for op in ops {
+                    match op {
+                        EditOp::Set(e) => prop_assert!(bounds().contains(e.pos)),
+                        EditOp::Fill { region, material } => {
+                            prop_assert!(bounds().as_box().contains_box(&region));
+                            prop_assert!(material.0 <= 3);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn edge_positions_stay_inside_and_reach_every_corner() {
+        let wide = Bounds::new(VoxelPos::new(-1_000, 0, 500), [2_000, 3_000, 10]);
+        let mut runner = TestRunner::new(Config::with_cases(2_000));
+        let corners = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        runner
+            .run(&edge_pos(wide, 2), |p| {
+                prop_assert!(wide.contains(p));
+                if (p.x == -1_000 || p.x == 999) && (p.y == 0 || p.y == 2_999) {
+                    corners.borrow_mut().insert((p.x, p.y));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(corners.borrow().len(), 4, "{:?}", corners.borrow());
     }
 
     #[test]

@@ -5,8 +5,10 @@
 //!
 //! - [`profile`]: fast and full test scale, from `WORLD_TEST_PROFILE`
 //! - [`policy`]: skip loudly locally, fail in CI when a prerequisite is missing
-//! - [`dense`]: the dense reference voxel model, the oracle for the 64-tree
-//! - [`strategies`]: proptest strategies for positions, edits and rays
+//! - [`dense`]: the dense reference voxel model, the oracle for the 64-tree,
+//!   plus the tree's adapter to it and a canonical-form walk
+//! - [`strategies`]: proptest strategies for positions (including world
+//!   edges), boxes, single edits, mixed edit-or-fill steps and rays
 //! - [`hash`]: xxh3-64 state hashing with a fixed byte order
 //! - [`replay`]: deterministic replay records
 //! - [`golden`]: golden image and text comparison

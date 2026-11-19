@@ -23,5 +23,9 @@ criterion.workspace = true
 name = "dense"
 harness = false
 
+[[bench]]
+name = "tree"
+harness = false
+
 [lints]
 workspace = true

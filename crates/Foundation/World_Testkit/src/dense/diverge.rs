@@ -2,7 +2,7 @@ use std::fmt;
 
 use world_core::{Edit, MaterialId, VoxelPos};
 
-use super::world::{Bounds, VoxelModel};
+use super::world::{Bounds, EditOp, VoxelModel};
 
 /// The first voxel where two models disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,12 +28,22 @@ pub fn assert_models_agree(
     right: &impl VoxelModel,
     bounds: Bounds,
 ) -> Result<(), Divergence> {
+    first_difference(bounds, |p| left.get(p), |p| right.get(p))
+}
+
+/// Scans `bounds` in z, y, x order and reports the first voxel where the two
+/// readers disagree.
+pub(super) fn first_difference(
+    bounds: Bounds,
+    left: impl Fn(VoxelPos) -> MaterialId,
+    right: impl Fn(VoxelPos) -> MaterialId,
+) -> Result<(), Divergence> {
     let lo = bounds.min;
     for z in 0..bounds.size[2] as i32 {
         for y in 0..bounds.size[1] as i32 {
             for x in 0..bounds.size[0] as i32 {
                 let pos = VoxelPos::new(lo.x + x, lo.y + y, lo.z + z);
-                let (l, r) = (left.get(pos), right.get(pos));
+                let (l, r) = (left(pos), right(pos));
                 if l != r {
                     return Err(Divergence {
                         pos,
@@ -62,6 +72,20 @@ pub fn compare_after_edits(
     assert_models_agree(left, right, bounds)
 }
 
+/// [`compare_after_edits`] for sequences that mix single voxels and box fills.
+pub fn compare_after_ops(
+    left: &mut impl VoxelModel,
+    right: &mut impl VoxelModel,
+    ops: &[EditOp],
+    bounds: Bounds,
+) -> Result<(), Divergence> {
+    for &op in ops {
+        left.apply_op(op);
+        right.apply_op(op);
+    }
+    assert_models_agree(left, right, bounds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +103,21 @@ mod tests {
             compare_after_edits(&mut a, &mut b, &edits, bounds()),
             Ok(())
         );
+    }
+
+    #[test]
+    fn ops_reach_both_models() {
+        let (mut a, mut b) = (DenseWorld::new(bounds()), DenseWorld::new(bounds()));
+        let region = world_core::VoxelBox::from_min_size(VoxelPos::new(0, 1, 0), [3, 2, 1]);
+        let ops = [
+            EditOp::Fill {
+                region,
+                material: MaterialId(4),
+            },
+            EditOp::Set(Edit::new(VoxelPos::new(1, 1, 0), MaterialId::AIR)),
+        ];
+        assert_eq!(compare_after_ops(&mut a, &mut b, &ops, bounds()), Ok(()));
+        assert_eq!(a.solid_count(), 5);
     }
 
     #[test]
