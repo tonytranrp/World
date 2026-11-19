@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+# Every bench is declared below; benches/common.rs is a shared module, not a
+# bench target.
+autobenches = false
 
 # The library's unit tests are not benchmarks, and libtest rejects Criterion's flags.
 [lib]
@@ -20,10 +23,38 @@ ron.workspace = true
 proptest.workspace = true
 world_testkit.workspace = true
 criterion.workspace = true
+# Only the no_alloc test binary installs dhat's counting global allocator.
+dhat.workspace = true
+
+# gungraun counts instructions under Valgrind, which only runs on Linux; the
+# bench compiles to an empty `main` elsewhere.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gungraun.workspace = true
 
 [[bench]]
 name = "tree"
 harness = false
+
+# Realistic wall-time workloads (Criterion): dense overwrites, carving,
+# coherent reads, batches, copy-on-write after a snapshot, serialization.
+[[bench]]
+name = "workloads"
+harness = false
+
+# Memory figures for a terrain-like surface and after long churn. Prints
+# numbers rather than timing anything.
+[[bench]]
+name = "memory"
+harness = false
+
+# Instruction counts under Valgrind (gungraun), Linux only:
+# `cargo xtask bench --instructions`. `bench = false` keeps it out of plain
+# `cargo bench --benches`, which runs Criterion and would hand it the wrong
+# flags; it still runs when named with `--bench instructions`.
+[[bench]]
+name = "instructions"
+harness = false
+bench = false
 
 [lints]
 workspace = true
