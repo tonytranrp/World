@@ -70,6 +70,13 @@ impl Storage {
         self.words.slice(base, len)
     }
 
+    /// The words from `start` to the end of its page: a whole block whose
+    /// length is not known until its first word is read.
+    #[inline]
+    pub fn block_from(&self, start: u32) -> &[u32] {
+        self.words.tail(start)
+    }
+
     /// Every node page in order; page `i` holds nodes from `i * NODE_PAGE_LEN`.
     pub fn node_pages(&self) -> impl Iterator<Item = &[Node]> {
         self.nodes.pages()
@@ -193,6 +200,8 @@ mod tests {
         assert_eq!(store.node(index), node(0b111, base));
         assert_eq!(store.block(base, 3), [1, 2, 3]);
         assert_eq!(store.word(base + 1), 2);
+        assert_eq!(store.storage().block_from(base)[..3], [1, 2, 3]);
+        assert_eq!(store.storage().block_from(base).len(), WORD_PAGE_LEN);
     }
 
     #[test]

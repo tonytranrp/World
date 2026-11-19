@@ -1,12 +1,11 @@
-//! The production 64-tree seen through the oracle's eyes: an adapter so it can
+﻿//! The production 64-tree seen through the oracle's eyes: an adapter so it can
 //! be compared with [`DenseWorld`](super::DenseWorld), a comparison for any
-//! reader (live tree or snapshot), and a walk that checks the canonical form
-//! of decision 0004 node by node.
+//! voxel source (live tree, snapshot or dense grid), and a walk that checks
+//! the canonical form of decision 0004 node by node.
 
 use std::collections::BTreeSet;
 
-use world_core::consts::TREE_DEPTH;
-use world_core::tree::{BranchRef, LeafRef, NodeRef, TreeRead, TreeStats};
+use world_core::tree::{NodeKind, NodeView, TreeRead, TreeStats, VoxelSource};
 use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
 
 use super::diverge::{Divergence, first_difference};
@@ -32,10 +31,10 @@ impl VoxelModel for VoxelTree {
     }
 }
 
-/// Compares any tree reader, such as a snapshot, with a model over `bounds`.
-/// `left` in the divergence is the tree.
+/// Compares any voxel source, such as a snapshot, with a model over
+/// `bounds`. `left` in the divergence is the source.
 pub fn assert_tree_agrees(
-    tree: &impl TreeRead,
+    tree: &impl VoxelSource,
     model: &impl VoxelModel,
     bounds: Bounds,
 ) -> Result<(), Divergence> {
@@ -66,17 +65,15 @@ impl From<TreeStats> for NodeCounts {
     }
 }
 
-/// Walks every node and checks the canonical form: levels in order, no empty
-/// or uniform-equivalent node, children listed exactly as the mask says,
-/// leaf palettes sorted, unique, free of air and holding exactly the
-/// materials present. Returns what the walk counted, or the first problem
-/// with the slot path that leads to it.
-pub fn check_canonical(tree: &impl TreeRead) -> Result<NodeCounts, String> {
+/// Walks every node of any voxel source and checks the canonical form: kinds
+/// at the right levels, no empty or uniform-equivalent node, children listed
+/// exactly as the mask says, leaf palettes sorted, unique, free of air and
+/// holding exactly the materials present. Returns what the walk counted, as
+/// the world tree would store that content, or the first problem with the
+/// slot path that leads to it.
+pub fn check_canonical(source: &impl VoxelSource) -> Result<NodeCounts, String> {
     let mut walk = Walk::default();
-    match tree.root() {
-        NodeRef::Leaf(_) => return Err("the root is a leaf".into()),
-        root => walk.child(root, TREE_DEPTH - 1)?,
-    }
+    walk.child(source.root(), source.levels() - 1)?;
     Ok(walk.counts)
 }
 
@@ -92,27 +89,28 @@ impl Walk {
     }
 
     /// One child value. `level` is the level a node in its place would have.
-    fn child(&mut self, node: NodeRef<'_>, level: u32) -> Result<(), String> {
-        match node {
-            NodeRef::Air => Ok(()),
-            NodeRef::Uniform(m) if m.is_air() => Err(self.fail("a uniform child of air")),
-            NodeRef::Uniform(_) => Ok(()),
-            NodeRef::Branch(b) if level == 0 || b.level() != level => Err(self.fail(&format!(
-                "a branch of level {} where level {level} belongs",
-                b.level()
-            ))),
-            NodeRef::Branch(b) => self.branch(b, level),
-            NodeRef::Leaf(_) if level != 0 => Err(self.fail("a leaf above level 0")),
-            NodeRef::Leaf(l) => self.leaf(l),
+    fn child(&mut self, node: impl NodeView, level: u32) -> Result<(), String> {
+        match node.kind() {
+            NodeKind::Air if node.mask() != 0 => Err(self.fail("an air child with a mask")),
+            NodeKind::Air => Ok(()),
+            NodeKind::Uniform(m) if m.is_air() => Err(self.fail("a uniform child of air")),
+            NodeKind::Uniform(_) if node.mask() != u64::MAX => {
+                Err(self.fail("a uniform child without a full mask"))
+            }
+            NodeKind::Uniform(_) => Ok(()),
+            NodeKind::Branch if level == 0 => Err(self.fail("a branch at level 0")),
+            NodeKind::Branch => self.branch(node, level),
+            NodeKind::Leaf if level != 0 => Err(self.fail("a leaf above level 0")),
+            NodeKind::Leaf => self.leaf(node),
         }
     }
 
-    fn branch(&mut self, b: BranchRef<'_>, level: u32) -> Result<(), String> {
+    fn branch<N: NodeView>(&mut self, b: N, level: u32) -> Result<(), String> {
         let mask = b.mask();
         if mask == 0 {
             return Err(self.fail("a branch with no children"));
         }
-        let listed: Vec<(u32, NodeRef<'_>)> = b.children().collect();
+        let listed: Vec<(u32, N)> = b.children().collect();
         if !listed.iter().map(|&(s, _)| s).eq(slots(mask)) {
             return Err(self.fail("children() does not list exactly the mask's slots in order"));
         }
@@ -122,14 +120,14 @@ impl Walk {
             let expected = listed
                 .iter()
                 .find(|&&(s, _)| s == slot)
-                .map_or(summary(NodeRef::Air), |&(_, n)| summary(n));
-            if (child == summary(NodeRef::Air)) == set || child != expected {
+                .map_or(AIR_SUMMARY, |&(_, n)| summary(n));
+            if (child == AIR_SUMMARY) == set || child != expected {
                 return Err(self.fail(&format!("child({slot}) disagrees with the mask")));
             }
         }
         if mask == u64::MAX {
             let first = summary(listed[0].1);
-            if matches!(listed[0].1, NodeRef::Uniform(_))
+            if matches!(listed[0].1.kind(), NodeKind::Uniform(_))
                 && listed.iter().all(|&(_, n)| summary(n) == first)
             {
                 return Err(self.fail("a branch whose children are all one material"));
@@ -139,7 +137,7 @@ impl Walk {
         // A child word per child, or a three-word leaf record at level 1.
         self.counts.words += listed.len() * if level == 1 { 3 } else { 1 };
         for (slot, node) in listed {
-            if matches!(node, NodeRef::Air) {
+            if node.kind() == NodeKind::Air {
                 return Err(self.fail("children() lists an air child"));
             }
             self.path.push(slot);
@@ -149,14 +147,15 @@ impl Walk {
         Ok(())
     }
 
-    fn leaf(&mut self, l: LeafRef<'_>) -> Result<(), String> {
+    fn leaf(&mut self, l: impl NodeView) -> Result<(), String> {
         let mask = l.mask();
         if mask == 0 {
             return Err(self.fail("a leaf with no solid voxels"));
         }
-        let palette: Vec<MaterialId> = l.palette().collect();
-        if palette.is_empty() || palette.len() > 64 {
-            return Err(self.fail(&format!("a palette of {} entries", palette.len())));
+        let palette = l.palette();
+        let palette = palette.as_slice();
+        if palette.is_empty() {
+            return Err(self.fail("an empty palette"));
         }
         if palette.iter().any(|m| m.is_air()) || !palette.windows(2).all(|w| w[0] < w[1]) {
             return Err(self.fail(&format!(
@@ -198,13 +197,16 @@ fn slots(mask: u64) -> impl Iterator<Item = u32> {
     (0..64).filter(move |s| mask >> s & 1 == 1)
 }
 
+/// The summary of an air child.
+const AIR_SUMMARY: (u8, u64) = (0, 0);
+
 /// What a child is, without its identity: the kind plus its id or mask.
-fn summary(node: NodeRef<'_>) -> (u8, u64) {
-    match node {
-        NodeRef::Air => (0, 0),
-        NodeRef::Uniform(m) => (1, m.0.into()),
-        NodeRef::Branch(b) => (2, b.mask()),
-        NodeRef::Leaf(l) => (3, l.mask()),
+fn summary(node: impl NodeView) -> (u8, u64) {
+    match node.kind() {
+        NodeKind::Air => AIR_SUMMARY,
+        NodeKind::Uniform(m) => (1, m.0.into()),
+        NodeKind::Branch => (2, node.mask()),
+        NodeKind::Leaf => (3, node.mask()),
     }
 }
 
@@ -221,6 +223,8 @@ fn index_bits(len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use world_core::tree::NodeRef;
+
     use super::*;
 
     #[test]

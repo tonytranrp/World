@@ -3,15 +3,20 @@
 //! [`VoxelTree`] is the single writer. [`TreeSnapshot`] is an immutable,
 //! thread-safe view taken in O(1); later writes never change what it sees.
 //! Both read through [`TreeRead`], whose [`NodeRef`] walk exposes the canonical
-//! structure to serialization, ray traversal and the GPU mirror.
+//! structure to serialization, ray traversal and the GPU mirror, and through
+//! the generic [`VoxelSource`] interface they share with dense grids.
+//! [`TreeCursor`] makes runs of nearby lookups cheap.
 //!
 //! Modules: `node` is the storage layout (16-byte nodes, inline leaf records
 //! and palette blocks), `alloc` the copy-on-write paged arenas, `mutate` the
-//! write path that keeps the tree canonical.
+//! write path that keeps the tree canonical, `read` the read interfaces and
+//! point lookups, `cursor` the cached lookups.
 
 mod alloc;
+mod cursor;
 mod mutate;
 pub mod node;
+mod read;
 
 #[cfg(test)]
 mod tests;
@@ -19,14 +24,18 @@ mod tests;
 use std::fmt;
 
 pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
-pub use node::{Node, UNIFORM_BIT};
+pub use cursor::TreeCursor;
+pub use node::{Node, RECORD_WORDS, UNIFORM_BIT};
+pub use read::{
+    BranchRef, LeafRef, NodeKind, NodeRef, NodeView, Palette, TreeRead, VoxelSource, same_content,
+};
 
 use alloc::{Storage, Store};
 use mutate::{LocalBox, LocalEdit};
-use node::leaf::{self, Record};
-use node::{Child, RECORD_WORDS, bit, path_key, rank, slots};
+use node::{Child, path_key};
+use read::TreeView;
 
-use crate::consts::{TREE_DEPTH, TREE_FANOUT};
+use crate::consts::{TREE_DEPTH, WORLD_MIN_VOXEL};
 use crate::coords::{VoxelBox, VoxelPos, path};
 use crate::edit::{DirtyBricks, Edit, EditError};
 use crate::material::MaterialId;
@@ -35,227 +44,8 @@ use crate::material::MaterialId;
 /// world per axis.
 const ROOT_LEVEL: u32 = TREE_DEPTH - 1;
 
-/// Read access shared by the live tree and its snapshots.
-pub trait TreeRead {
-    /// The whole world as one child: air, a uniform material, or the level
-    /// `TREE_DEPTH - 1` root branch.
-    fn root(&self) -> NodeRef<'_>;
-
-    /// The material of one voxel; air outside the world.
-    fn get(&self, pos: VoxelPos) -> MaterialId {
-        let Some(local) = path::world_local(pos) else {
-            return MaterialId::AIR;
-        };
-        let mut node = self.root();
-        loop {
-            match node {
-                NodeRef::Air => return MaterialId::AIR,
-                NodeRef::Uniform(m) => return m,
-                NodeRef::Branch(b) => node = b.child(path::child_slot(local, b.level())),
-                NodeRef::Leaf(l) => return l.voxel(path::child_slot(local, 0)),
-            }
-        }
-    }
-}
-
-/// One child in the tree, as seen by a reader.
-#[derive(Clone, Copy, Debug)]
-pub enum NodeRef<'a> {
-    /// Every voxel of the child is air.
-    Air,
-    /// Every voxel of the child is this solid material.
-    Uniform(MaterialId),
-    /// A node of level 1 or higher with mixed children.
-    Branch(BranchRef<'a>),
-    /// A level-0 node holding 4x4x4 voxels, not all the same.
-    Leaf(LeafRef<'a>),
-}
-
-impl<'a> NodeRef<'a> {
-    /// The reader's view of a stored child whose node, if it is one, has
-    /// `level` (1 or higher).
-    fn new(storage: &'a Storage, child: Child, level: u32) -> Self {
-        match child {
-            Child::Air => Self::Air,
-            Child::Uniform(m) => Self::Uniform(m),
-            Child::Node(index) => {
-                let node = storage.node(index);
-                Self::Branch(BranchRef {
-                    storage,
-                    level,
-                    mask: node.mask,
-                    block: storage.block(node.base, node.block_len(level)),
-                })
-            }
-        }
-    }
-
-    /// The reader's view of a stored leaf record.
-    fn leaf(storage: &'a Storage, record: Record) -> Self {
-        if let Some(m) = record.uniform() {
-            return Self::Uniform(m);
-        }
-        let content = match record.palette_base() {
-            Some(base) => {
-                let len = leaf::block_len(record.mask, storage.word(base));
-                LeafContent::Palette(storage.block(base, len))
-            }
-            None => LeafContent::Single(
-                record
-                    .material()
-                    .expect("a record without a palette has one material"),
-            ),
-        };
-        Self::Leaf(LeafRef {
-            mask: record.mask,
-            content,
-        })
-    }
-}
-
-/// A branch node: 64 children, each covering `4^level` voxels per axis.
-#[derive(Clone, Copy)]
-pub struct BranchRef<'a> {
-    storage: &'a Storage,
-    level: u32,
-    mask: u64,
-    /// One child word (level 2 and up) or leaf record (level 1) per non-air
-    /// child, in slot order.
-    block: &'a [u32],
-}
-
-impl<'a> BranchRef<'a> {
-    /// The node's level, from 1 up to `TREE_DEPTH - 1`.
-    pub fn level(&self) -> u32 {
-        self.level
-    }
-
-    /// Bit `i` is set when child slot `i` is not all air.
-    pub fn mask(&self) -> u64 {
-        self.mask
-    }
-
-    /// The child in `slot` (0 to 63). Panics on a slot above 63.
-    pub fn child(&self, slot: u32) -> NodeRef<'a> {
-        assert!(slot < TREE_FANOUT, "child slot {slot} is above 63");
-        if self.mask & bit(slot) == 0 {
-            return NodeRef::Air;
-        }
-        self.child_at(rank(self.mask, slot))
-    }
-
-    /// The children that are not air, in ascending slot order.
-    pub fn children(&self) -> impl Iterator<Item = (u32, NodeRef<'a>)> + 'a + use<'a> {
-        let branch = *self;
-        slots(self.mask)
-            .enumerate()
-            .map(move |(k, slot)| (slot, branch.child_at(k)))
-    }
-
-    /// The `k`-th non-air child.
-    fn child_at(&self, k: usize) -> NodeRef<'a> {
-        if self.level == 1 {
-            let at = k * RECORD_WORDS;
-            NodeRef::leaf(
-                self.storage,
-                Record::read(&self.block[at..at + RECORD_WORDS]),
-            )
-        } else {
-            NodeRef::new(
-                self.storage,
-                Child::from_word(self.block[k]),
-                self.level - 1,
-            )
-        }
-    }
-}
-
-impl fmt::Debug for BranchRef<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BranchRef")
-            .field("level", &self.level)
-            .field("mask", &format_args!("{:#018x}", self.mask))
-            .finish_non_exhaustive()
-    }
-}
-
-/// A leaf: 4x4x4 voxels, not all the same, with the materials present.
-#[derive(Clone, Copy)]
-pub struct LeafRef<'a> {
-    mask: u64,
-    content: LeafContent<'a>,
-}
-
-/// What a leaf's solid voxels are.
-#[derive(Clone, Copy)]
-enum LeafContent<'a> {
-    /// All one material: the record alone.
-    Single(MaterialId),
-    /// The palette block: header, palette, packed indices (see `node`).
-    Palette(&'a [u32]),
-}
-
-impl<'a> LeafRef<'a> {
-    /// Bit `i` is set when voxel slot `i` is solid.
-    pub fn mask(&self) -> u64 {
-        self.mask
-    }
-
-    /// The voxel in `slot` (0 to 63). Panics on a slot above 63.
-    pub fn voxel(&self, slot: u32) -> MaterialId {
-        assert!(slot < TREE_FANOUT, "voxel slot {slot} is above 63");
-        if self.mask & bit(slot) == 0 {
-            return MaterialId::AIR;
-        }
-        match self.content {
-            LeafContent::Single(m) => m,
-            LeafContent::Palette(block) => leaf::solid_voxel(block, rank(self.mask, slot)),
-        }
-    }
-
-    /// The solid materials present, ascending by id, each once.
-    pub fn palette(&self) -> impl Iterator<Item = MaterialId> + 'a + use<'a> {
-        let content = self.content;
-        let len = match content {
-            LeafContent::Single(_) => 1,
-            LeafContent::Palette(block) => leaf::palette_len(block[0]),
-        };
-        (0..len).map(move |i| match content {
-            LeafContent::Single(m) => m,
-            LeafContent::Palette(block) => leaf::palette_entry(block, i),
-        })
-    }
-
-    /// Bits per packed palette index: the smallest of 0, 1, 2, 4 or 8 that
-    /// indexes the palette, so 0 when it has one material.
-    pub fn index_bits(&self) -> u32 {
-        match self.content {
-            LeafContent::Single(_) => 0,
-            LeafContent::Palette(block) => leaf::index_bits(block[0]),
-        }
-    }
-
-    /// The packed palette indices exactly as stored: one per solid voxel in
-    /// slot order, [`index_bits`](Self::index_bits) wide, LSB-first in whole
-    /// words. Empty when the width is 0.
-    pub fn index_words(&self) -> &'a [u32] {
-        match self.content {
-            LeafContent::Single(_) => &[],
-            LeafContent::Palette(block) => {
-                &block[1 + leaf::palette_words(leaf::palette_len(block[0]))..]
-            }
-        }
-    }
-}
-
-impl fmt::Debug for LeafRef<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LeafRef")
-            .field("mask", &format_args!("{:#018x}", self.mask))
-            .field("palette", &self.palette().map(|m| m.0).collect::<Vec<_>>())
-            .finish()
-    }
-}
+/// The lowest voxel of the world.
+const WORLD_ORIGIN: VoxelPos = VoxelPos::new(WORLD_MIN_VOXEL, WORLD_MIN_VOXEL, WORLD_MIN_VOXEL);
 
 /// Storage figures, for budgets, benchmarks and leak tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -371,11 +161,38 @@ impl VoxelTree {
     pub fn stats(&self) -> TreeStats {
         self.store.stats()
     }
+
+    /// The whole world as one child, as [`TreeRead::root`].
+    pub fn root(&self) -> NodeRef<'_> {
+        self.view().root()
+    }
+
+    /// The material of one voxel; air outside the world. Reads node and word
+    /// values straight from storage.
+    pub fn get(&self, pos: VoxelPos) -> MaterialId {
+        self.view().get(pos)
+    }
+
+    /// Cached point lookups for runs of nearby voxels.
+    pub fn cursor(&self) -> TreeCursor<'_> {
+        TreeCursor::new(self.view())
+    }
+
+    fn view(&self) -> TreeView<'_> {
+        TreeView {
+            storage: self.store.storage(),
+            root: self.root,
+        }
+    }
 }
 
 impl TreeRead for VoxelTree {
     fn root(&self) -> NodeRef<'_> {
-        NodeRef::new(self.store.storage(), self.root, ROOT_LEVEL)
+        VoxelTree::root(self)
+    }
+
+    fn get(&self, pos: VoxelPos) -> MaterialId {
+        VoxelTree::get(self, pos)
     }
 }
 
@@ -417,11 +234,38 @@ impl TreeSnapshot {
     pub fn word_pages(&self) -> impl Iterator<Item = (usize, &[u32])> {
         self.storage.word_pages().enumerate()
     }
+
+    /// The whole world as one child, as [`TreeRead::root`].
+    pub fn root(&self) -> NodeRef<'_> {
+        self.view().root()
+    }
+
+    /// The material of one voxel; air outside the world. Reads node and word
+    /// values straight from storage.
+    pub fn get(&self, pos: VoxelPos) -> MaterialId {
+        self.view().get(pos)
+    }
+
+    /// Cached point lookups for runs of nearby voxels.
+    pub fn cursor(&self) -> TreeCursor<'_> {
+        TreeCursor::new(self.view())
+    }
+
+    fn view(&self) -> TreeView<'_> {
+        TreeView {
+            storage: &self.storage,
+            root: self.root,
+        }
+    }
 }
 
 impl TreeRead for TreeSnapshot {
     fn root(&self) -> NodeRef<'_> {
-        NodeRef::new(&self.storage, self.root, ROOT_LEVEL)
+        TreeSnapshot::root(self)
+    }
+
+    fn get(&self, pos: VoxelPos) -> MaterialId {
+        TreeSnapshot::get(self, pos)
     }
 }
 
@@ -430,30 +274,6 @@ impl fmt::Debug for TreeSnapshot {
         f.debug_struct("TreeSnapshot")
             .field("root", &self.root)
             .finish_non_exhaustive()
-    }
-}
-
-/// Whether two trees hold the same voxels. Trees are canonical, so this is a
-/// structural walk that never visits uniform regions voxel by voxel.
-pub fn same_content(a: &impl TreeRead, b: &impl TreeRead) -> bool {
-    same_child(a.root(), b.root())
-}
-
-fn same_child(a: NodeRef<'_>, b: NodeRef<'_>) -> bool {
-    match (a, b) {
-        (NodeRef::Air, NodeRef::Air) => true,
-        (NodeRef::Uniform(x), NodeRef::Uniform(y)) => x == y,
-        (NodeRef::Branch(x), NodeRef::Branch(y)) => {
-            x.level() == y.level()
-                && x.mask() == y.mask()
-                && x.children()
-                    .zip(y.children())
-                    .all(|((_, cx), (_, cy))| same_child(cx, cy))
-        }
-        (NodeRef::Leaf(x), NodeRef::Leaf(y)) => {
-            x.mask() == y.mask() && (0..64).all(|slot| x.voxel(slot) == y.voxel(slot))
-        }
-        _ => false,
     }
 }
 

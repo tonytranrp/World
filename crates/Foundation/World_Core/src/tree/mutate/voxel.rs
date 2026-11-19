@@ -123,7 +123,7 @@ impl Writer<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tree::{NodeRef, TreeRead, VoxelTree};
+    use crate::tree::{NodeRef, VoxelTree};
     use crate::{MaterialId, VoxelPos};
 
     #[test]

@@ -60,6 +60,13 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
         &self.page(start / N)[offset..offset + len]
     }
 
+    /// The items from `start` to the end of its page.
+    #[inline]
+    pub fn tail(&self, start: u32) -> &[T] {
+        let start = start as usize;
+        &self.page(start / N)[start % N..]
+    }
+
     /// Mutable `len` items from `start`, which must lie in one page. Copies
     /// the directory, the chunk and the page first if a clone shares them.
     pub fn slice_mut(&mut self, start: u32, len: usize) -> &mut [T] {
@@ -144,6 +151,7 @@ mod tests {
         assert_eq!(p.get(5), 10);
         assert_eq!(p.get(6), 11);
         assert_eq!(p.slice(4, 4), [0, 10, 11, 0]);
+        assert_eq!(p.tail(6), [11, 0]);
         assert_eq!(p.page_count(), 3);
     }
 
