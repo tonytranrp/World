@@ -24,7 +24,7 @@ use gungraun::prelude::*;
 #[cfg(target_os = "linux")]
 use world_core::serialize::{decode, encode};
 #[cfg(target_os = "linux")]
-use world_core::{Edit, MaterialId, TreeRead, TreeSnapshot, VoxelBox, VoxelPos, VoxelTree};
+use world_core::{Edit, MaterialId, TreeSnapshot, VoxelBox, VoxelPos, VoxelTree};
 
 /// The dense block's edge and material count. Valgrind runs code about 50x
 /// slower, so scenes are smaller than in the Criterion benches.

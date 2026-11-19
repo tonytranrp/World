@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use common::{Lcg, Terrain, dense_block, random_edits, solid_block, sphere, striped_block};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use world_core::serialize::{decode, encode};
-use world_core::{Edit, MaterialId, TreeRead, VoxelBox, VoxelPos, VoxelTree};
+use world_core::{Edit, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 
 /// Edge of the dense random block: 2 Mi voxels, every leaf full and mixed.
 const DENSE_EDGE: u32 = 128;

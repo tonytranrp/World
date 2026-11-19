@@ -1,5 +1,5 @@
 //! Reads never touch the heap: `get`, walking the tree through
-//! `TreeRead::root` and `NodeRef`, `same_content`, `content_hash`, and taking,
+//! `root` and `NodeRef`, `same_content`, `content_hash`, and taking,
 //! cloning and dropping snapshots allocate zero bytes once the tree exists.
 //! The renderer and brick streaming do these every frame (decision 0003), so
 //! an allocation here is a per-frame cost and a source of contention.
@@ -13,7 +13,7 @@ use std::hint::black_box;
 
 use world_core::serialize::content_hash;
 use world_core::tree::{NodeRef, same_content};
-use world_core::{MaterialId, TreeRead, VoxelBox, VoxelPos, VoxelTree};
+use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -120,7 +120,7 @@ fn reads_allocate_nothing() {
             }),
         ),
         (
-            "walk through TreeRead::root and NodeRef",
+            "walk through root and NodeRef",
             Box::new(|| {
                 black_box(walk(black_box(&tree).root()));
                 black_box(walk(black_box(&snapshot).root()));
