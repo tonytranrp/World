@@ -1,3 +1,7 @@
+# `cargo xtask <command>` runs the automation crate in tools/Xtask.
+[alias]
+xtask = "run --quiet --package xtask --"
+
 # Bevy resolves "assets" relative to CARGO_MANIFEST_DIR (the app crate) by default.
 # Point it at the workspace root so the shared top-level assets/ folder is used.
 [env]

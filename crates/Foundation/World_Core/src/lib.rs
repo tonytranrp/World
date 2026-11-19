@@ -4,3 +4,10 @@
 //! module layout; the shared constants live in [`consts`].
 
 pub mod consts;
+pub mod coords;
+pub mod edit;
+pub mod material;
+
+pub use coords::VoxelPos;
+pub use edit::Edit;
+pub use material::MaterialId;

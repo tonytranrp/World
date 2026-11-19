@@ -12,8 +12,8 @@ The full design lives in `docs/plans/engine-plan.md`. Read it before making arch
 
 | Path | Role |
 | --- | --- |
-| `crates/Foundation/` | Bevy-free crates: `World_Core`, `World_Gen`, `World_Cpu_Ref` |
-| `crates/Engine/` | Bevy plugins: `World_Render`, `World_Physics`, `World_Anim`, `World_Sim` |
+| `crates/Foundation/` | Bevy-free crates: `World_Core`, `World_Gen`, `World_Cpu_Ref`, `World_Testkit` |
+| `crates/Engine/` | Bevy plugins: `World_Render`, `World_Physics`, `World_Anim`, `World_Sim`, plus `World_Testkit_Bevy` (test support) |
 | `crates/Game/` | Gameplay: `World_Game` |
 | `app/` | The binary: CLI, settings, startup, plugin assembly |
 | `tools/` | `Xtask`, `Bake_Vox`, `Mesh_To_Voxel` (offline, never shipped) |
@@ -22,6 +22,7 @@ The full design lives in `docs/plans/engine-plan.md`. Read it before making arch
 | `packaging/` | macOS and Windows packaging metadata |
 | `scripts/` | Small developer and CI helpers |
 | `docs/` | Plans, decisions, architecture notes, research, devlog |
+| `.cargo/`, `.config/` | Cargo aliases and environment, nextest configuration |
 
 Every folder has a `README.md` that states its permanent purpose, scope and rules. Read the README of the folder you are about to change.
 
@@ -60,6 +61,35 @@ Binary assets (`.vox`, baked voxel files, images, audio, fonts) are stored with 
 - Rendering is checked against golden images and exact CPU-vs-GPU hit comparisons on small scenes.
 - Run the relevant tests before reporting work as done, and report failures with their output.
 
+### How the testing engine works
+
+Design and reasons: `docs/decisions/0001-testing-engine.md`.
+
+- `World_Testkit` (no Bevy) has the dense reference model, proptest strategies, xxh3 hashing, replay records, golden comparison and the CPU-vs-GPU hit comparator. `World_Testkit_Bevy` has the headless `App`, schedule randomization and offscreen rendering. Use them as dev-dependencies.
+- Unit tests are inline, integration and property tests go in the crate's `tests/`, cross-crate suites go in `tests/suites/` (the `world_tests` crate; register each file as a `[[test]]` in `tests/Cargo.toml`).
+- Any test that needs a GPU adapter is named `gpu_...`. When no adapter exists it calls `skip_or_fail`: it prints `SKIPPED` locally and fails when `WORLD_TEST_REQUIRE_GPU=1`.
+- Render tests use the software adapter by default. `WORLD_TEST_ADAPTER=gpu` uses the real GPU.
+- Property tests size themselves from `world_testkit::profile`: `WORLD_TEST_PROFILE=fast` (default) or `full` (one million random edits).
+- Golden files (`tests/golden`, `tests/replays`, `tests/scenes`) change only through `cargo xtask golden --update`. Review the diff and explain it in the commit. A missing golden file fails the test.
+- Every new voxel structure must be checked against `DenseWorld` by implementing `VoxelModel` and calling `compare_after_edits`. Every new tracer must pass `compare_hits` against the CPU reference.
+- Do not rely on system order. Run ECS tests across seeds with `for_each_seed`.
+
+```bash
+cargo xtask test              # fast profile: everything except GPU tests
+cargo xtask test gpu          # only GPU tests, on the software adapter
+cargo xtask test all          # everything at fast scale
+cargo xtask test full         # everything at the one-million-edit scale
+cargo xtask golden            # check golden files
+cargo xtask golden --update   # rewrite them after reviewing the output
+cargo xtask bench --save main # store a benchmark baseline
+cargo xtask bench --check main --threshold 10   # fail on a >10% slowdown
+cargo xtask check             # fmt, clippy -D warnings, fast tests
+cargo xtask coverage          # HTML coverage in target/llvm-cov/html
+cargo xtask miri              # Miri on the crates that may hold unsafe code
+```
+
+Tools the runner expects: `cargo install cargo-nextest --locked`, `cargo install cargo-llvm-cov --locked` with `rustup component add llvm-tools-preview`, and `rustup toolchain install nightly --component miri` for Miri. Pass `--no-self-update` to `rustup toolchain install`, because a rustup self-update can fail on Windows and leave `rustup.exe` missing.
+
 ## Building and running
 
 The toolchain is pinned in `rust-toolchain.toml` (Bevy 0.20 needs Rust 1.97.1 or newer); rustup installs it on first use. The first build compiles about 380 crates and takes roughly 12 minutes. Later builds are incremental.
@@ -75,4 +105,4 @@ cargo test --workspace
 
 The default `dev` feature of `app` enables dynamic linking and asset hot reload. Release builds use `--no-default-features`. `.cargo/config.toml` points Bevy at the top-level `assets/` folder.
 
-Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` (codegen, benchmarks, packaging) and CI are added after this step.
+Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` has the test, golden, bench, check, coverage and miri commands; its codegen and packaging commands and the release CI come later. `.github/workflows/test.yml` runs formatting, clippy and every test on Windows.

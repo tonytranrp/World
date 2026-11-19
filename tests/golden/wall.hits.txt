@@ -1,0 +1,2 @@
+scene wall.scene 32x24
+hit hash 0f287ea0c4b945bb

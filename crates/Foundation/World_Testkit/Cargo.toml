@@ -1,0 +1,27 @@
+[package]
+name = "world_testkit"
+description = "Test support with no Bevy: reference voxel model, property strategies, hashing, replay, golden files and hit comparison."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The library's unit tests are not benchmarks, and libtest rejects Criterion's flags.
+[lib]
+bench = false
+
+[dependencies]
+world_core.workspace = true
+proptest.workspace = true
+xxhash-rust.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "dense"
+harness = false
+
+[lints]
+workspace = true

@@ -59,8 +59,10 @@ mod tests {
     use wgpu::{DeviceType, DownlevelFlags, Features, Limits};
 
     fn adapter(max_buffer_size: u64) -> AdapterReport {
-        let mut limits = Limits::default();
-        limits.max_buffer_size = max_buffer_size;
+        let limits = Limits {
+            max_buffer_size,
+            ..Limits::default()
+        };
         AdapterReport {
             name: "test".into(),
             backend: Backend::Vulkan,

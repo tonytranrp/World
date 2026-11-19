@@ -1,0 +1,17 @@
+[package]
+name = "world_testkit_bevy"
+description = "Bevy test support: headless App harness, schedule order randomization, offscreen rendering on a chosen adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+world_testkit.workspace = true
+# The `debug` feature is what makes Bevy's schedule shuffling available. It is
+# enabled only here, so release builds of the game never pay for it.
+bevy = { workspace = true, features = ["debug"] }
+wgpu.workspace = true
+
+[lints]
+workspace = true

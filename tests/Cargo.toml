@@ -1,0 +1,40 @@
+[package]
+name = "world_tests"
+description = "Cross-crate integration suites: golden renders, replays, plugin behaviour and CPU-vs-GPU hits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The suites live in suites/ rather than the default tests/ folder, because this
+# package's own folder is already called tests/.
+autotests = false
+
+[dependencies]
+world_core.workspace = true
+world_testkit.workspace = true
+
+[dev-dependencies]
+world_testkit_bevy.workspace = true
+world_render.workspace = true
+bevy.workspace = true
+wgpu.workspace = true
+
+[[test]]
+name = "render_golden"
+path = "suites/render_golden.rs"
+
+[[test]]
+name = "replay_determinism"
+path = "suites/replay_determinism.rs"
+
+[[test]]
+name = "plugin_behavior"
+path = "suites/plugin_behavior.rs"
+
+[[test]]
+name = "hits_cpu_vs_gpu"
+path = "suites/hits_cpu_vs_gpu.rs"
+
+[lints]
+workspace = true

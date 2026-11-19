@@ -1,0 +1,24 @@
+# cargo-nextest configuration. `cargo xtask test` is the usual way in.
+
+[profile.default]
+fail-fast = false
+# A test that runs this long is stuck: warn after 60 s, kill after 5 minutes.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# GPU tests (named gpu_*) share one adapter, so they run one at a time.
+[test-groups]
+gpu = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/(^|::)gpu_/)'
+test-group = 'gpu'
+slow-timeout = { period = "30s", terminate-after = 10 }
+
+# CI: never retry, report every failure at the end, write a JUnit file.
+[profile.ci]
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*/*", "app"]
+members = ["crates/*/*", "app", "tests", "tools/Xtask"]
 default-members = ["app"]
 
 [workspace.package]
@@ -19,6 +19,8 @@ world_physics = { path = "crates/Engine/World_Physics" }
 world_anim = { path = "crates/Engine/World_Anim" }
 world_sim = { path = "crates/Engine/World_Sim" }
 world_game = { path = "crates/Game/World_Game" }
+world_testkit = { path = "crates/Foundation/World_Testkit" }
+world_testkit_bevy = { path = "crates/Engine/World_Testkit_Bevy" }
 
 # External crates. Exact pins: upgrade once per Bevy release.
 bevy = { version = "=0.20.1", default-features = false, features = [
@@ -32,6 +34,13 @@ bevy_rapier3d = { version = "=0.37.0", default-features = false, features = ["di
 # Must resolve to the same wgpu that Bevy renders with.
 wgpu = { version = "=30.0.2", default-features = false }
 clap = { version = "4.6", features = ["derive", "env"] }
+
+# Testing engine
+proptest = "1.12"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
+serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
