@@ -55,11 +55,14 @@ pub fn run(target: Option<&str>, seconds: u64) -> Result<(), String> {
         .args(targets.iter().map(|t| corpus(t)));
     process::run(&mut seeds)?;
 
+    // cargo-fuzz defaults to the target it was itself built for, and the
+    // prebuilt binaries CI installs are musl, where sanitizers cannot link.
+    let host = host_triple()?;
     let mut failed = Vec::new();
     for name in &targets {
         let mut command = nightly_cargo();
         command
-            .args(["fuzz", "run", "--fuzz-dir"])
+            .args(["fuzz", "run", "--target", &host, "--fuzz-dir"])
             .arg(&fuzz_dir)
             // Overflow and other debug assertions in World_Core are bugs too.
             .args(["--debug-assertions", name, "--"])
@@ -99,6 +102,24 @@ fn reproduce_hint(fuzz_dir: &Path, target: &str) -> String {
 /// Cargo through the rustup proxy on the nightly toolchain. The cargo that
 /// runs `cargo xtask` is the pinned toolchain's own binary, which does not
 /// understand `+nightly` (as for Miri).
+/// The nightly compiler's host target, such as `x86_64-unknown-linux-gnu`.
+fn host_triple() -> Result<String, String> {
+    let output = Command::new("rustc")
+        .env("RUSTUP_TOOLCHAIN", "nightly")
+        .arg("-vV")
+        .output()
+        .map_err(|e| format!("running `rustc -vV` on nightly: {e}"))?;
+    parse_host(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "`rustc -vV` printed no `host:` line".into())
+}
+
+fn parse_host(version: &str) -> Option<String> {
+    version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_owned())
+}
+
 fn nightly_cargo() -> Command {
     let mut command = Command::new("cargo");
     command
@@ -117,6 +138,17 @@ mod tests {
             libfuzzer_args(300),
             ["-max_total_time=300", "-max_len=65536"]
         );
+    }
+
+    #[test]
+    fn the_host_comes_from_rustc_version_output() {
+        let version = "rustc 1.99.0-nightly (abc 2026-11-01)\nbinary: rustc\n\
+                       host: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\n";
+        assert_eq!(
+            parse_host(version).as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(parse_host("rustc 1.99.0\n"), None);
     }
 
     #[test]
