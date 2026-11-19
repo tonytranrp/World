@@ -4,16 +4,17 @@
 //! thread-safe view taken in O(1); later writes never change what it sees.
 //! Both read through [`TreeRead`], whose [`NodeRef`] walk exposes the canonical
 //! structure to serialization, ray traversal and the GPU mirror, and through
-//! the generic [`VoxelSource`] interface they share with dense grids.
-//! [`TreeCursor`] makes runs of nearby lookups cheap.
+//! the generic [`VoxelSource`] interface they share with the [`DenseGrid`]s
+//! of dynamic objects. [`TreeCursor`] makes runs of nearby lookups cheap.
 //!
 //! Modules: `node` is the storage layout (16-byte nodes, inline leaf records
 //! and palette blocks), `alloc` the copy-on-write paged arenas, `mutate` the
 //! write path that keeps the tree canonical, `read` the read interfaces and
-//! point lookups, `cursor` the cached lookups.
+//! point lookups, `cursor` the cached lookups, `grid` the dense grids.
 
 mod alloc;
 mod cursor;
+mod grid;
 mod mutate;
 pub mod node;
 mod read;
@@ -25,6 +26,7 @@ use std::fmt;
 
 pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
 pub use cursor::TreeCursor;
+pub use grid::{DenseGrid, GridNode, MAX_GRID_LEVELS};
 pub use node::{Node, RECORD_WORDS, UNIFORM_BIT};
 pub use read::{
     BranchRef, LeafRef, NodeKind, NodeRef, NodeView, Palette, TreeRead, VoxelSource, same_content,

@@ -861,6 +861,57 @@ fn views_are_canonical_voxel_sources() {
     );
 }
 
+/// The child of `tree` that stands at `level` (where a level-`level` node
+/// would) and holds `p`.
+fn child_at_level(tree: &VoxelTree, p: VoxelPos, level: u32) -> NodeRef<'_> {
+    let local = path::world_local(p).unwrap();
+    let mut node = tree.root();
+    for parent in (level + 1..TREE_DEPTH).rev() {
+        node = node.child(path::child_slot(local, parent));
+    }
+    node
+}
+
+proptest! {
+    #![proptest_config(world_testkit::profile::proptest_config())]
+
+    /// A grid and the node-aligned region of the world tree with the same
+    /// voxels have identical canonical views: same kinds, masks and voxels
+    /// all the way down.
+    #[test]
+    fn a_grid_reads_like_the_matching_subtree(
+        levels in 1u32..=3,
+        corner in [-2i32..2, -2i32..2, -2i32..2],
+        writes in vec(([0u32..64, 0u32..64, 0u32..64], material()), 0..300),
+        filled in material(),
+    ) {
+        let size = 1u32 << (2 * levels);
+        let origin = VoxelPos::from(corner.map(|c| c * size as i32));
+        let mut grid = DenseGrid::new(levels, origin);
+        let mut tree = VoxelTree::new();
+        // Start from a filled half sometimes, so uniform regions split.
+        let half = VoxelBox::from_min_size(origin, [size, size, size / 2]);
+        tree.fill_box(half, filled).unwrap();
+        for p in positions(half) {
+            grid.set(p, filled);
+        }
+        for &(offset, m) in &writes {
+            let [x, y, z] = offset.map(|v| (v % size) as i32);
+            let p = pos(origin.x + x, origin.y + y, origin.z + z);
+            prop_assert_eq!(grid.set(p, m), tree.set(p, m).unwrap());
+        }
+        let subtree = child_at_level(&tree, origin, levels - 1);
+        prop_assert!(read::same_node(grid.root(), subtree));
+        prop_assert!(read::same_node(subtree, grid.root()));
+        for p in positions(grid.bounds()).step_by(7) {
+            prop_assert_eq!(grid.get(p), tree.get(p));
+        }
+        // Equal content at different places or sizes is not the same source.
+        prop_assert!(!same_content(&grid, &tree));
+        prop_assert!(same_content(&grid, &grid.clone()));
+    }
+}
+
 #[test]
 fn snapshot_pages_expose_the_raw_layout_without_copying() {
     let mut tree = VoxelTree::new();

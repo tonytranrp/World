@@ -1,12 +1,12 @@
-﻿//! The production 64-tree seen through the oracle's eyes: an adapter so it can
-//! be compared with [`DenseWorld`](super::DenseWorld), a comparison for any
-//! voxel source (live tree, snapshot or dense grid), and a walk that checks
-//! the canonical form of decision 0004 node by node.
+﻿//! The production 64-tree and dense object grids seen through the oracle's
+//! eyes: adapters so they can be compared with [`DenseWorld`](super::DenseWorld),
+//! a comparison for any voxel source (live tree, snapshot or dense grid), and
+//! a walk that checks the canonical form of decision 0004 node by node.
 
 use std::collections::BTreeSet;
 
 use world_core::tree::{NodeKind, NodeView, TreeRead, TreeStats, VoxelSource};
-use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
+use world_core::{DenseGrid, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 
 use super::diverge::{Divergence, first_difference};
 use super::world::{Bounds, VoxelModel};
@@ -28,6 +28,18 @@ impl VoxelModel for VoxelTree {
         if let Err(e) = VoxelTree::fill_box(self, region, material) {
             panic!("{e}");
         }
+    }
+}
+
+/// A dense object grid is a model too. Reads outside it return air and
+/// writes outside it panic, the dense model's own policy.
+impl VoxelModel for DenseGrid {
+    fn get(&self, pos: VoxelPos) -> MaterialId {
+        DenseGrid::get(self, pos)
+    }
+
+    fn set(&mut self, pos: VoxelPos, material: MaterialId) {
+        DenseGrid::set(self, pos, material);
     }
 }
 
