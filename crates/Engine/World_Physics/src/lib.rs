@@ -6,5 +6,6 @@
 mod plugin;
 pub mod prelude;
 mod rapier;
+mod tuning;
 
 pub use plugin::WorldPhysicsPlugin;

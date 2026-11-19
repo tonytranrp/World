@@ -12,6 +12,13 @@ pub struct StepsExhausted {
     pub steps: usize,
 }
 
+/// The condition given to [`HeadlessApp::run_for`] did not become true in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedOut {
+    pub frames: usize,
+    pub timeout: std::time::Duration,
+}
+
 /// An `App` with `MinimalPlugins` and no window, runner or GPU.
 ///
 /// The app is finished lazily on the first step, so plugins and schedule
@@ -75,6 +82,30 @@ impl HeadlessApp {
             self.app.update();
         }
         self
+    }
+
+    /// Steps until `done` returns true or `timeout` of wall time passes,
+    /// sleeping a millisecond between frames so background asset loading and
+    /// file watchers get real time to work. Returns the frames it took.
+    pub fn run_for(
+        &mut self,
+        timeout: std::time::Duration,
+        mut done: impl FnMut(&World) -> bool,
+    ) -> Result<usize, TimedOut> {
+        self.ensure_ready();
+        let start = std::time::Instant::now();
+        let mut frames = 0;
+        loop {
+            if done(self.app.world()) {
+                return Ok(frames);
+            }
+            if start.elapsed() > timeout {
+                return Err(TimedOut { frames, timeout });
+            }
+            self.app.update();
+            frames += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Steps one frame at a time until `done` returns true. Returns the number

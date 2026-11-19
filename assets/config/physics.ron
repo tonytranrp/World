@@ -1,0 +1,24 @@
+// Physics tuning. Hot-reloads on save; a bad value is rejected and the last
+// good tuning stays live (the reason is logged and shown in the F2 panel).
+(
+    // Fixed physics steps per second. 30.0..=240.0
+    step_hz: 60.0,
+    // Gravity in metres per second squared (x, y, z). Magnitude at most 100.0.
+    gravity_m_s2: (0.0, -9.81, 0.0),
+    // Not used yet: read by destruction and the character controller once
+    // they exist. Editing them is validated but has no effect today.
+    debris: (
+        // Islands with at most this many voxels become particles. 1..=4096
+        particle_max_voxels: 64,
+        // Hard cap on awake rigid bodies. 1..=10000
+        max_active_bodies: 500,
+    ),
+    character: (
+        // Highest ledge climbed without jumping, metres. 0.0..=1.0
+        step_up_m: 0.3,
+        // Snap-down distance that keeps the controller grounded, metres. 0.0..=1.0
+        snap_to_ground_m: 0.2,
+        // Steepest walkable slope, degrees. 0.0..=89.0
+        max_slope_deg: 50.0,
+    ),
+)

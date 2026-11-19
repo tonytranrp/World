@@ -13,7 +13,7 @@ The full design lives in `docs/plans/engine-plan.md`. Read it before making arch
 | Path | Role |
 | --- | --- |
 | `crates/Foundation/` | Bevy-free crates: `World_Core`, `World_Gen`, `World_Cpu_Ref`, `World_Testkit` |
-| `crates/Engine/` | Bevy plugins: `World_Render`, `World_Physics`, `World_Anim`, `World_Sim`, plus `World_Testkit_Bevy` (test support) |
+| `crates/Engine/` | Bevy plugins: `World_Render`, `World_Physics`, `World_Anim`, `World_Sim`, `World_Reload` (live reloading), plus `World_Testkit_Bevy` (test support) |
 | `crates/Game/` | Gameplay: `World_Game` |
 | `app/` | The binary: CLI, settings, startup, plugin assembly |
 | `tools/` | `Xtask`, `Bake_Vox`, `Mesh_To_Voxel` (offline, never shipped) |
@@ -90,6 +90,27 @@ cargo xtask miri              # Miri on the crates that may hold unsafe code
 
 Tools the runner expects: `cargo install cargo-nextest --locked`, `cargo install cargo-llvm-cov --locked` with `rustup component add llvm-tools-preview`, and `rustup toolchain install nightly --component miri` for Miri. Pass `--no-self-update` to `rustup toolchain install`, because a rustup self-update can fail on Windows and leave `rustup.exe` missing.
 
+## Hot reloading
+
+Design and reasons: `docs/decisions/0002-hot-reload-engine.md`.
+
+- **Tuning is a config.** A tunable type implements `world_core::ConfigAsset` (`NAME`, `PATH` and `validate`, which lists every problem), lives in the crate that owns it, and is registered with `app.add_config::<T>()` (the type's `PATH`, such as `"config/x.ron"`, says which file). Systems read `Res<Config<T>>` and use change detection. Saves reload live; a file that fails to parse or validate is rejected, logged and shown in the F2 panel, and the last good value stays. `Default` must be safe and valid. Every file in `assets/config/` must be registered by some plugin (a test checks this).
+- **Setup that should follow code edits is reloadable.** Register it with `app.add_reloadable_systems(|| my_setup)` and tag what it spawns with `ReloadScoped`. It runs at startup and again after every `CodeReloaded` (written for each hot-patch, by F5, or by tests), after the tagged entities are despawned.
+- **Never combine `dynamic_linking` with hot-patching.** `cargo xtask hot` builds with `--no-default-features --features hotpatch`. Always start dx through xtask: on Windows it works around dx 0.7.10 linking bugs (a linker shim, the Visual Studio environment, stale fat archives), all in `tools/Xtask/src/hot/windows.rs` and `link_shim.rs` (see decision 0002). `.cargo/config.toml` selects `rust-lld` for ordinary builds.
+- **Shaders hot-reload** through the asset server, including WESL imports (`import package::shaders::...`).
+- Hot-patching cannot change struct layouts or system signatures; those need a restart. Only systems (and observers) pick up patched code: a config's `validate`, its asset loader and other code reached through stored function pointers keep the old code until restart.
+- Reloadable setup despawns and respawns its `ReloadScoped` entities, so their `Entity` ids change on every reload (F5 or a patch). Never keep one across frames; query for a marker component instead. Resources that setup inserts are not reset.
+- Fields of a config that nothing reads yet are marked "not used yet" in the RON file, so editing them is not mistaken for a live change.
+
+```bash
+cargo xtask dev            # cargo run with dev feature: asset, shader and config reload, panels
+cargo xtask hot            # dx serve --hot-patch: also patches Rust systems live
+cargo xtask hot --smoke    # automated end-to-end hot-patch check (edits and restores a probe)
+cargo xtask test reload    # every hot-reload test, GPU shader reload and the hotpatch bridge
+```
+
+`dx` must match the `subsecond` version in `Cargo.lock` (0.7.10): `cargo install dioxus-cli --version 0.7.10 --locked`.
+
 ## Building and running
 
 The toolchain is pinned in `rust-toolchain.toml` (Bevy 0.20 needs Rust 1.97.1 or newer); rustup installs it on first use. The first build compiles about 380 crates and takes roughly 12 minutes. Later builds are incremental.
@@ -100,9 +121,10 @@ cargo run -- --list-adapters       # print every GPU found with its tier verdict
 cargo run -- --backend vulkan      # force dx12, vulkan or metal (also reads WGPU_BACKEND)
 cargo run -- --mac-floor           # tier B, 720p internal, 1 GiB brick pool, 4 worker threads
 cargo run -- --exit-after-frames N # quit cleanly after N frames, for automated runs
+cargo xtask dev                    # cargo run with the developer panels (F1 inspector, F2 configs, F5 re-run setup)
 cargo test --workspace
 ```
 
-The default `dev` feature of `app` enables dynamic linking and asset hot reload. Release builds use `--no-default-features`. `.cargo/config.toml` points Bevy at the top-level `assets/` folder.
+The default `dev` feature of `app` enables dynamic linking, asset hot reload and the developer panels. The `hotpatch` feature replaces it for `dx`. Release builds use `--no-default-features`. `.cargo/config.toml` points Bevy at the top-level `assets/` folder.
 
-Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` has the test, golden, bench, check, coverage and miri commands; its codegen and packaging commands and the release CI come later. `.github/workflows/test.yml` runs formatting, clippy and every test on Windows.
+Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` has the test, golden, bench, check, coverage, miri, dev and hot commands; its codegen and packaging commands and the release CI come later. `.github/workflows/test.yml` runs formatting, clippy (including the hotpatch and release feature sets) and every test on Windows; on macOS it runs the non-GPU tests and builds a universal binary for Apple Silicon and Intel. The hot-patch smoke test runs weekly and on manual dispatch.

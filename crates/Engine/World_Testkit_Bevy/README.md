@@ -28,6 +28,6 @@ An Engine-layer crate. It depends on Bevy and on World_Testkit, and on no other 
 
 - Dev-dependency only, never imported by shipping code.
 - The adapter is chosen before Bevy creates the GPU device, the same order the app itself uses at startup.
-- Runs are deterministic: a fixed time step, fixed resolutions and fixed seeds. The wall clock never drives a test.
-- Anything that waits for a condition has a frame cap and fails with a description of the world instead of hanging.
+- Runs are deterministic: a fixed time step, fixed resolutions and fixed seeds. The wall clock never decides a result; it only bounds how long a test waits for background work such as asset loading or file watching (decision 0002).
+- Anything that waits for a condition has a frame or time cap and fails with a description of the world instead of hanging.
 - A small prelude is the public surface. Where the harness must register something in an App, it does so through a single test-only plugin.

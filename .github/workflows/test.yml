@@ -4,10 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so the slow hot-patch smoke test runs without blocking pushes.
+    - cron: "17 4 * * 1"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Per event: a push must never cancel a scheduled or manual smoke-test run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
+
+# Bash everywhere: on Windows the default PowerShell only checks the exit code
+# of a step's last command, so a failing first command would go unnoticed.
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +28,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,7 +50,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Everything, including GPU tests on the Windows software adapter (WARP).
+      # The feature sets the workspace build never combines: the hot-patch
+      # bridge, the dx build of the game, and a release build without dev tools.
+      - name: Clippy, hot-patch and release feature sets
+        run: |
+          cargo clippy --package world_reload --features hotpatch --all-targets -- -D warnings
+          cargo clippy --package world --no-default-features --features hotpatch -- -D warnings
+          cargo clippy --package world --no-default-features -- -D warnings
+
+      # Everything, including GPU and shader hot-reload tests on the Windows
+      # software adapter (WARP), and the hot-patch bridge test.
       - name: Tests
         run: cargo xtask test all -- --profile ci
 
@@ -47,6 +67,103 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit
+          name: junit-windows
           path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  macos:
+    # Apple Silicon. Builds both Mac targets and runs the tests natively.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install the pinned toolchain and the Intel target
+        run: |
+          rustup show
+          rustup target add x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Metal has no software adapter, and the runner's GPU is virtual, so
+      # golden images are checked on Windows only. Everything else runs here.
+      - name: Tests (no GPU)
+        run: cargo xtask test fast -- --profile ci
+
+      - name: Build the game for Apple Silicon and Intel
+        run: |
+          cargo build --release --no-default-features --package world --target aarch64-apple-darwin
+          cargo build --release --no-default-features --package world --target x86_64-apple-darwin
+
+      - name: Merge into a universal binary
+        run: |
+          mkdir -p target/universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/world \
+            target/x86_64-apple-darwin/release/world \
+            -output target/universal/world
+          lipo -info target/universal/world
+
+      - name: Upload the universal binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: world-macos-universal
+          path: target/universal/world
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-macos
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  hot-patch-smoke:
+    # Starts the game under `dx serve --hot-patch`, edits code, and waits for
+    # the running game to log the patched value. Slow, so weekly or on demand.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hot-patch
+          # A cold build can outlast the smoke test's first-build timeout; keep
+          # what was compiled so the next run gets further.
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      # dx must match the subsecond version in Cargo.lock; read it from there
+      # so a Bevy upgrade never leaves CI installing a stale dx.
+      - name: Install dx
+        run: |
+          version=$(grep -A1 '^name = "subsecond"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "subsecond $version"
+          cargo binstall "dioxus-cli@$version" --no-confirm --force
+
+      - name: Hot-patch smoke test
+        run: cargo xtask hot --smoke -- --exit-after-frames 100000
+
+      - name: Upload the dx log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hot-smoke-log
+          path: target/hot-smoke.log
           if-no-files-found: ignore

@@ -9,6 +9,8 @@
 //!
 //! The device and tier are decided once; changing them needs a restart.
 
+#[cfg(feature = "hotpatch")]
+mod hot_probe;
 mod select;
 
 use std::process::ExitCode;
@@ -21,6 +23,7 @@ use clap::Parser;
 use world_anim::prelude::WorldAnimPlugin;
 use world_game::prelude::WorldGamePlugin;
 use world_physics::prelude::WorldPhysicsPlugin;
+use world_reload::prelude::WorldReloadPlugin;
 use world_render::prelude::{
     AdapterReport, Budgets, RenderTier, Tier, WorldRenderPlugin, classify, probe_adapters,
 };
@@ -88,6 +91,7 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
+            .set(asset_plugin())
             .set(RenderPlugin {
                 render_creation: wgpu_settings.into(),
                 ..default()
@@ -104,6 +108,7 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
             }),
     )
     .add_plugins((
+        WorldReloadPlugin,
         WorldRenderPlugin::new(tier),
         WorldPhysicsPlugin,
         WorldAnimPlugin,
@@ -111,11 +116,35 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
         WorldGamePlugin,
     ));
 
+    #[cfg(feature = "hotpatch")]
+    hot_probe::build(&mut app);
+
     if let Some(frames) = config.exit_after_frames {
         app.insert_resource(ExitAfter(frames))
             .add_systems(Update, exit_after_frames);
     }
     app
+}
+
+/// Assets from the top-level `assets/` folder. On macOS and Linux the folder
+/// is given by its resolved path: if any part of it is a symlink (macOS's
+/// `/var`, for one), Bevy 0.20.1's file watcher would see event paths that do
+/// not start with the root it was given, and panic.
+fn asset_plugin() -> AssetPlugin {
+    let plugin = AssetPlugin::default();
+    #[cfg(unix)]
+    let plugin = {
+        let folder =
+            bevy::asset::io::file::FileAssetReader::get_base_path().join(&plugin.file_path);
+        match folder.canonicalize() {
+            Ok(resolved) => AssetPlugin {
+                file_path: resolved.to_string_lossy().into_owned(),
+                ..plugin
+            },
+            Err(_) => plugin,
+        }
+    };
+    plugin
 }
 
 #[derive(Resource)]

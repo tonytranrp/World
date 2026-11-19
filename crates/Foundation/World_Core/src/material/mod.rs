@@ -1,25 +1,13 @@
-//! Material identifiers.
+//! Materials: the id stored in every voxel and the table that gives it meaning.
+//!
+//! The table is filled from `assets/config/materials.ron` by the Engine layer.
+//! Parsing goes through [`MaterialTable::new`], so a table that exists is a
+//! table that passed validation.
 
-/// Index into the material table. `0` is air: an empty voxel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MaterialId(pub u16);
+mod def;
+mod id;
+mod table;
 
-impl MaterialId {
-    pub const AIR: Self = Self(0);
-
-    pub const fn is_air(self) -> bool {
-        self.0 == 0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_is_air() {
-        assert_eq!(MaterialId::default(), MaterialId::AIR);
-        assert!(MaterialId::AIR.is_air());
-        assert!(!MaterialId(5).is_air());
-    }
-}
+pub use def::{MaterialDef, Rgb};
+pub use id::MaterialId;
+pub use table::{MaterialError, MaterialErrors, MaterialTable};

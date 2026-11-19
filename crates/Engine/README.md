@@ -6,12 +6,14 @@ This folder holds the Bevy-facing engine crates of the workspace: the crates tha
 
 ## Scope
 
-Four sibling crates live here, each in a Pascal_Case folder with a snake_case package name:
+These sibling crates live here, each in a Pascal_Case folder with a snake_case package name (decisions 0001 and 0002 added the last two):
 
 - **World_Render** (`world_render`): the ray-traced voxel renderer. Compute traversal of the 64-tree into a G-buffer, the ray-guided GPU brick cache, the box-march pass for dynamic objects, lighting, reflections, and capability-tier selection. It mirrors the CPU tree to the GPU.
 - **World_Physics** (`world_physics`): the bridge between World_Core voxel data and the physics engine. Fixed 60 Hz stepping, voxel colliders at 1/16 m, rigid bodies for dynamic objects, destruction and island detection, debris, and the character controller.
 - **World_Anim** (`world_anim`): voxel rigs, bone-driven rigid parts, procedural IK, and the ragdoll mapping onto physics bodies.
 - **World_Sim** (`world_sim`): extra voxel simulations beyond rigid bodies: structural stress, sand, fire, and fluids, all time-sliced under one shared budget.
+- **World_Reload** (`world_reload`): live reloading shared by every crate: typed, validated config assets and re-runnable setup after a code hot-patch.
+- **World_Testkit_Bevy** (`world_testkit_bevy`): test support only, never shipped: the headless app, schedule randomization, test asset sources and offscreen rendering.
 
 ## Out of scope
 

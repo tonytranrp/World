@@ -6,11 +6,12 @@ Foundation is the lowest layer of the workspace. It holds the crates that define
 
 ## Scope
 
-Foundation contains exactly three crates, each in its own Pascal_Case folder with a snake_case package name:
+Foundation contains these crates, each in its own Pascal_Case folder with a snake_case package name (decision 0001 added World_Testkit):
 
 - World_Core: voxel types, coordinate math, the sparse 64-tree, palette-compressed materials, edits and the edit overlay, serialization, and CPU ray traversal. It also owns the shared constants (voxel size of 1/64 m, collision scale of 1/16 m, brick dimension) in one place.
 - World_Gen: the deterministic, CPU-authoritative procedural pipeline addressed by seed and chunk coordinate.
 - World_Cpu_Ref: the slow, exact reference ray tracer that is ground truth for the GPU renderer.
+- World_Testkit: test support only, never shipped: the dense reference model, property-test strategies, hashing, replay records and golden comparison.
 
 Any new crate placed here must satisfy the same test: it is pure data and algorithms, usable without a window, a GPU, an ECS or a physics engine.
 

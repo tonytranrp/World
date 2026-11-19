@@ -38,6 +38,7 @@ fn the_render_plugin_publishes_the_tier_it_was_given() {
     for_each_seed(|seed| {
         let tier = render_tier(&adapter(RT), Profile::Full);
         let mut app = HeadlessApp::new().randomized(seed);
+        app.add_plugins(bevy::asset::AssetPlugin::default());
         app.add_plugins(WorldRenderPlugin::new(tier));
         app.step(2);
         let published = app.world().resource::<RenderTier>();
@@ -50,6 +51,7 @@ fn the_render_plugin_publishes_the_tier_it_was_given() {
 fn mac_floor_publishes_tier_b_with_the_small_budgets_on_a_tier_a_adapter() {
     let tier = render_tier(&adapter(RT), Profile::MacFloor);
     let mut app = HeadlessApp::new();
+    app.add_plugins(bevy::asset::AssetPlugin::default());
     app.add_plugins(WorldRenderPlugin::new(tier));
     app.step(1);
     let published = app.world().resource::<RenderTier>();
@@ -63,6 +65,7 @@ fn mac_floor_publishes_tier_b_with_the_small_budgets_on_a_tier_a_adapter() {
 fn the_plugin_runs_without_a_gpu_present() {
     // No RenderPlugin, no device: the startup system must cope and not panic.
     let mut app = HeadlessApp::new();
+    app.add_plugins(bevy::asset::AssetPlugin::default());
     app.add_plugins(WorldRenderPlugin::new(render_tier(
         &adapter(Features::empty()),
         Profile::Full,

@@ -1,0 +1,24 @@
+[package]
+name = "world_reload"
+description = "Live reloading: typed RON config assets with validation and last-good fallback, and the bridge from Rust hot-patching to re-runnable setup systems."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Forward Bevy's `HotPatched` message (from `dx serve --hot-patch`) as `CodeReloaded`.
+hotpatch = ["bevy/hotpatching"]
+
+[dependencies]
+world_core.workspace = true
+bevy.workspace = true
+serde.workspace = true
+ron.workspace = true
+
+[dev-dependencies]
+world_testkit_bevy.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

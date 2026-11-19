@@ -17,7 +17,14 @@ pub enum TestProfile {
     Full,
     /// Everything, at fast scale.
     All,
+    /// Only the hot-reload engine: configs, code reload, shader reload (GPU),
+    /// the developer panels, and the `hotpatch` feature's bridge.
+    Reload,
 }
+
+/// Every test that exercises live reloading.
+const RELOAD_TESTS: &str = "package(world_reload) | binary(hot_reload) | test(/ui::dev::/) \
+                            | test(/rapier::tests::/) | binary(materials)";
 
 impl TestProfile {
     fn scale(self) -> &'static str {
@@ -32,25 +39,32 @@ impl TestProfile {
         match self {
             Self::Fast => Some(format!("not {GPU_TESTS}")),
             Self::Gpu => Some(GPU_TESTS.to_owned()),
+            Self::Reload => Some(RELOAD_TESTS.to_owned()),
             Self::Full | Self::All => None,
         }
     }
 
     /// GPU tests may not skip when they are meant to run.
     fn requires_gpu(self) -> bool {
+        // Other profiles leave the variable as the caller set it: `Reload` is a
+        // local loop, and on a Mac (no software adapter) its GPU tests skip loudly.
         matches!(self, Self::Gpu | Self::Full | Self::All)
+    }
+
+    /// Whether to also build `world_reload` with its `hotpatch` feature, which
+    /// the workspace build leaves off, and test the `HotPatched` bridge.
+    fn tests_hotpatch_bridge(self) -> bool {
+        matches!(self, Self::Full | Self::All | Self::Reload)
     }
 }
 
 pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
-    let require_gpu = if profile.requires_gpu() { "1" } else { "0" };
-
     if cargo_tool_installed("nextest") {
         let mut command = cargo();
         command
             .args(["nextest", "run", "--workspace", "--no-fail-fast"])
-            .env("WORLD_TEST_PROFILE", profile.scale())
-            .env("WORLD_TEST_REQUIRE_GPU", require_gpu);
+            .env("WORLD_TEST_PROFILE", profile.scale());
+        require_gpu_if_needed(&mut command, profile);
         if let Some(filter) = profile.filter() {
             command.args(["-E", &filter]);
         }
@@ -62,8 +76,8 @@ pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
         let mut command = cargo();
         command
             .args(["test", "--workspace", "--no-fail-fast"])
-            .env("WORLD_TEST_PROFILE", profile.scale())
-            .env("WORLD_TEST_REQUIRE_GPU", require_gpu);
+            .env("WORLD_TEST_PROFILE", profile.scale());
+        require_gpu_if_needed(&mut command, profile);
         if profile == TestProfile::Fast {
             // The fallback runner has no filter language; skipping by name is the closest match.
             command.args(["--", "--skip", "gpu_"]);
@@ -72,9 +86,29 @@ pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    if profile.tests_hotpatch_bridge() {
+        process::run(cargo().args([
+            "test",
+            "--package",
+            "world_reload",
+            "--features",
+            "hotpatch",
+            "--test",
+            "code_reload",
+        ]))?;
+    }
+
     // nextest does not run doctests.
-    if profile != TestProfile::Gpu {
+    if !matches!(profile, TestProfile::Gpu | TestProfile::Reload) {
         process::run(cargo().args(["test", "--doc", "--workspace"]))?;
     }
     Ok(())
+}
+
+/// Profiles that must run their GPU tests make a missing adapter a failure.
+/// The rest leave `WORLD_TEST_REQUIRE_GPU` as the caller set it.
+fn require_gpu_if_needed(command: &mut std::process::Command, profile: TestProfile) {
+    if profile.requires_gpu() {
+        command.env("WORLD_TEST_REQUIRE_GPU", "1");
+    }
 }

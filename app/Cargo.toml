@@ -11,12 +11,18 @@ name = "world"
 path = "src/main.rs"
 
 [features]
-# Dev iteration: dynamic linking and asset hot reload. Disable for release builds
-# with `--no-default-features`.
+# Dev iteration: dynamic linking, asset and config hot reload, developer panels.
+# Disable for release builds with `--no-default-features`.
 default = ["dev"]
-dev = ["bevy/dynamic_linking", "bevy/file_watcher"]
-# Rust hot-patching, used with `dx serve --hot-patch`.
-hotpatch = ["bevy/hotpatching"]
+dev = ["bevy/dynamic_linking", "bevy/file_watcher", "world_game/dev_tools"]
+# Rust hot-patching through `cargo xtask hot` (`dx serve --hot-patch`). Used
+# instead of `dev`, never with it: dynamic linking breaks patching on Windows.
+hotpatch = [
+    "bevy/hotpatching",
+    "bevy/file_watcher",
+    "world_reload/hotpatch",
+    "world_game/dev_tools",
+]
 
 [dependencies]
 world_core.workspace = true
@@ -25,6 +31,7 @@ world_physics.workspace = true
 world_anim.workspace = true
 world_sim.workspace = true
 world_game.workspace = true
+world_reload.workspace = true
 bevy.workspace = true
 wgpu.workspace = true
 clap.workspace = true

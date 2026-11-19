@@ -17,6 +17,9 @@ world_testkit.workspace = true
 [dev-dependencies]
 world_testkit_bevy.workspace = true
 world_render.workspace = true
+world_reload.workspace = true
+world_physics.workspace = true
+world_game.workspace = true
 bevy.workspace = true
 wgpu.workspace = true
 
@@ -35,6 +38,10 @@ path = "suites/plugin_behavior.rs"
 [[test]]
 name = "hits_cpu_vs_gpu"
 path = "suites/hits_cpu_vs_gpu.rs"
+
+[[test]]
+name = "hot_reload"
+path = "suites/hot_reload.rs"
 
 [lints]
 workspace = true
