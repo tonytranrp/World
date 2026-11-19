@@ -70,6 +70,43 @@ fn the_shipped_material_table_is_valid() {
     assert!(!table.is_empty());
 }
 
+/// Material ids are stored in every voxel and every save. Once shipped, an id
+/// must keep its meaning forever: add new materials with new ids, never
+/// renumber or reuse one. Append to this list when a material is added.
+const STABLE_MATERIAL_IDS: &[(u16, &str)] = &[
+    (1, "stone"),
+    (2, "dirt"),
+    (3, "grass"),
+    (4, "wood"),
+    (5, "glass"),
+    (6, "lava"),
+];
+
+#[test]
+fn shipped_material_ids_never_change_meaning() {
+    let table: MaterialTable =
+        parse_config(&shipped(MaterialTable::PATH)).unwrap_or_else(|e| panic!("{e}"));
+    for &(id, name) in STABLE_MATERIAL_IDS {
+        let found = table
+            .get(world_core::MaterialId(id))
+            .map(|m| m.name.as_str());
+        assert_eq!(
+            found,
+            Some(name),
+            "material id {id} was {name:?}; ids in saves must keep their meaning"
+        );
+    }
+    let pinned: Vec<u16> = STABLE_MATERIAL_IDS.iter().map(|&(id, _)| id).collect();
+    for m in table.iter() {
+        assert!(
+            pinned.contains(&m.id.0),
+            "material {} ({:?}) is new: add it to STABLE_MATERIAL_IDS",
+            m.id.0,
+            m.name
+        );
+    }
+}
+
 /// Every file in `assets/config/` is registered by some plugin and loads
 /// cleanly from the real asset folder. An orphan file is a forgotten
 /// registration; a failed load is a broken shipped file.

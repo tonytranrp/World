@@ -98,7 +98,9 @@ Design and reasons: `docs/decisions/0002-hot-reload-engine.md`.
 - **Setup that should follow code edits is reloadable.** Register it with `app.add_reloadable_systems(|| my_setup)` and tag what it spawns with `ReloadScoped`. It runs at startup and again after every `CodeReloaded` (written for each hot-patch, by F5, or by tests), after the tagged entities are despawned.
 - **Never combine `dynamic_linking` with hot-patching.** `cargo xtask hot` builds with `--no-default-features --features hotpatch`. Always start dx through xtask: on Windows it works around dx 0.7.10 linking bugs (a linker shim, the Visual Studio environment, stale fat archives), all in `tools/Xtask/src/hot/windows.rs` and `link_shim.rs` (see decision 0002). `.cargo/config.toml` selects `rust-lld` for ordinary builds.
 - **Shaders hot-reload** through the asset server, including WESL imports (`import package::shaders::...`).
-- Hot-patching cannot change struct layouts or system signatures; those need a restart.
+- Hot-patching cannot change struct layouts or system signatures; those need a restart. Only systems (and observers) pick up patched code: a config's `validate`, its asset loader and other code reached through stored function pointers keep the old code until restart.
+- Reloadable setup despawns and respawns its `ReloadScoped` entities, so their `Entity` ids change on every reload (F5 or a patch). Never keep one across frames; query for a marker component instead. Resources that setup inserts are not reset.
+- Fields of a config that nothing reads yet are marked "not used yet" in the RON file, so editing them is not mistaken for a live change.
 
 ```bash
 cargo xtask dev            # cargo run with dev feature: asset, shader and config reload, panels

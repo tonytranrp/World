@@ -19,7 +19,11 @@ pub(super) fn config_panel(
     if !panel.open {
         return Ok(());
     }
-    let ctx = contexts.ctx_mut()?;
+    // No context this frame (the window is closing, or none yet): skip, since
+    // a returned error would go to Bevy's default handler, which panics.
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return Ok(());
+    };
     let mut open = true;
     egui::Window::new("Configs (F2)")
         .open(&mut open)

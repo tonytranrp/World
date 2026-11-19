@@ -5,6 +5,8 @@
     step_hz: 60.0,
     // Gravity in metres per second squared (x, y, z). Magnitude at most 100.0.
     gravity_m_s2: (0.0, -9.81, 0.0),
+    // Not used yet: read by destruction and the character controller once
+    // they exist. Editing them is validated but has no effect today.
     debris: (
         // Islands with at most this many voxels become particles. 1..=4096
         particle_max_voxels: 64,

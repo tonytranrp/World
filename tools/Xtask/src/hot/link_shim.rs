@@ -42,11 +42,18 @@ pub fn run(linker: &Path) -> ExitCode {
 }
 
 fn forward(linker: &Path, args: Vec<OsString>) -> Result<ExitCode, String> {
+    let forwarded = linker_args(linker, args)?;
     // Output passes straight through, so dx sees the linker's own messages.
-    let status = Command::new(linker)
-        .args(linker_args(linker, args)?)
-        .status()
-        .map_err(|e| format!("could not run {}: {e}", linker.display()))?;
+    let status = Command::new(linker).args(&forwarded).status();
+    // The quoted copies are only needed while the linker runs.
+    for arg in &forwarded {
+        if let Some(copy) = arg.to_str().and_then(|a| a.strip_prefix('@'))
+            && copy.ends_with(".quoted")
+        {
+            let _ = std::fs::remove_file(copy);
+        }
+    }
+    let status = status.map_err(|e| format!("could not run {}: {e}", linker.display()))?;
     Ok(match status.code() {
         Some(0) => ExitCode::SUCCESS,
         Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),

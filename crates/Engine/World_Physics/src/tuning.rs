@@ -12,7 +12,10 @@ pub struct PhysicsTuning {
     pub step_hz: f64,
     /// Gravity in metres per second squared. Magnitude at most `100.0`.
     pub gravity_m_s2: (f32, f32, f32),
+    /// Not read yet: destruction does not exist. Validated so the file is
+    /// ready when it does.
     pub debris: DebrisTuning,
+    /// Not read yet: the character controller does not exist.
     pub character: CharacterTuning,
 }
 
