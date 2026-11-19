@@ -22,3 +22,7 @@ tests/golden/*.diff.png
 # Test and coverage output
 junit.xml
 proptest-regressions/
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/
