@@ -10,8 +10,10 @@ publish.workspace = true
 world_testkit.workspace = true
 # The `debug` feature is what makes Bevy's schedule shuffling available. It is
 # enabled only here, so release builds of the game never pay for it.
-bevy = { workspace = true, features = ["debug"] }
+# `file_watcher` lets hot-reload tests use a real watched folder (`assets::DiskAssets`).
+bevy = { workspace = true, features = ["debug", "file_watcher"] }
 wgpu.workspace = true
+async-channel = "2.5"
 
 [lints]
 workspace = true

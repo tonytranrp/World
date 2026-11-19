@@ -9,6 +9,8 @@
 //!
 //! The device and tier are decided once; changing them needs a restart.
 
+#[cfg(feature = "hotpatch")]
+mod hot_probe;
 mod select;
 
 use std::process::ExitCode;
@@ -21,6 +23,7 @@ use clap::Parser;
 use world_anim::prelude::WorldAnimPlugin;
 use world_game::prelude::WorldGamePlugin;
 use world_physics::prelude::WorldPhysicsPlugin;
+use world_reload::prelude::WorldReloadPlugin;
 use world_render::prelude::{
     AdapterReport, Budgets, RenderTier, Tier, WorldRenderPlugin, classify, probe_adapters,
 };
@@ -104,12 +107,16 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
             }),
     )
     .add_plugins((
+        WorldReloadPlugin,
         WorldRenderPlugin::new(tier),
         WorldPhysicsPlugin,
         WorldAnimPlugin,
         WorldSimPlugin,
         WorldGamePlugin,
     ));
+
+    #[cfg(feature = "hotpatch")]
+    hot_probe::build(&mut app);
 
     if let Some(frames) = config.exit_after_frames {
         app.insert_resource(ExitAfter(frames))

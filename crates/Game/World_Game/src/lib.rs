@@ -6,5 +6,6 @@
 mod player;
 mod plugin;
 pub mod prelude;
+mod ui;
 
 pub use plugin::WorldGamePlugin;

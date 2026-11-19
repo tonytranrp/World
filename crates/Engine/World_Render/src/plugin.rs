@@ -1,6 +1,10 @@
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
 
+use world_core::material::{MATERIALS_CONFIG_PATH, MaterialTable};
+use world_reload::AppConfigExt;
+
+use crate::passes;
 use crate::tier::RenderTier;
 
 /// Registers everything the renderer needs. The tier is decided before the GPU
@@ -18,7 +22,9 @@ impl WorldRenderPlugin {
 impl Plugin for WorldRenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.tier.clone())
+            .add_config::<MaterialTable>(MATERIALS_CONFIG_PATH)
             .add_systems(Startup, log_active_adapter);
+        passes::build(app);
     }
 }
 

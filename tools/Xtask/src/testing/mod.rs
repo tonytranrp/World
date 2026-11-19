@@ -17,7 +17,14 @@ pub enum TestProfile {
     Full,
     /// Everything, at fast scale.
     All,
+    /// Only the hot-reload engine: configs, code reload, shader reload (GPU),
+    /// the developer panels, and the `hotpatch` feature's bridge.
+    Reload,
 }
+
+/// Every test that exercises live reloading.
+const RELOAD_TESTS: &str = "package(world_reload) | binary(hot_reload) | test(/ui::dev::/) \
+                            | test(/rapier::tests::/) | binary(materials)";
 
 impl TestProfile {
     fn scale(self) -> &'static str {
@@ -32,13 +39,20 @@ impl TestProfile {
         match self {
             Self::Fast => Some(format!("not {GPU_TESTS}")),
             Self::Gpu => Some(GPU_TESTS.to_owned()),
+            Self::Reload => Some(RELOAD_TESTS.to_owned()),
             Self::Full | Self::All => None,
         }
     }
 
     /// GPU tests may not skip when they are meant to run.
     fn requires_gpu(self) -> bool {
-        matches!(self, Self::Gpu | Self::Full | Self::All)
+        matches!(self, Self::Gpu | Self::Full | Self::All | Self::Reload)
+    }
+
+    /// Whether to also build `world_reload` with its `hotpatch` feature, which
+    /// the workspace build leaves off, and test the `HotPatched` bridge.
+    fn tests_hotpatch_bridge(self) -> bool {
+        matches!(self, Self::Full | Self::All | Self::Reload)
     }
 }
 
@@ -72,8 +86,20 @@ pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    if profile.tests_hotpatch_bridge() {
+        process::run(cargo().args([
+            "test",
+            "--package",
+            "world_reload",
+            "--features",
+            "hotpatch",
+            "--test",
+            "code_reload",
+        ]))?;
+    }
+
     // nextest does not run doctests.
-    if profile != TestProfile::Gpu {
+    if !matches!(profile, TestProfile::Gpu | TestProfile::Reload) {
         process::run(cargo().args(["test", "--doc", "--workspace"]))?;
     }
     Ok(())

@@ -10,6 +10,11 @@ publish.workspace = true
 world_core.workspace = true
 bevy.workspace = true
 bevy_rapier3d.workspace = true
+world_reload.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+world_testkit_bevy.workspace = true
 
 [lints]
 workspace = true

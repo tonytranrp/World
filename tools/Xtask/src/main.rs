@@ -1,8 +1,10 @@
-//! `cargo xtask`: the single entry point for tests, goldens, benchmarks and checks.
+//! `cargo xtask`: the single entry point for tests, goldens, benchmarks, checks
+//! and running the game with live reloading.
 
 mod bench;
 mod check;
 mod golden;
+mod hot;
 mod process;
 mod testing;
 
@@ -52,9 +54,29 @@ enum Command {
     Coverage,
     /// Run the unsafe-capable crates under Miri (needs the nightly toolchain).
     Miri,
+    /// Run the game with asset, config and shader hot reload and the developer
+    /// panels (F1 inspector, F2 configs, F5 re-run setup). Arguments after `--`
+    /// go to the game.
+    Dev {
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Run the game under `dx serve --hot-patch`: everything `dev` reloads,
+    /// plus Rust edits to systems while the game runs. --smoke runs the
+    /// automated end-to-end hot-patch test instead.
+    Hot {
+        #[arg(long)]
+        smoke: bool,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
+    // Started by dx as the linker during `xtask hot`: act as the link shim.
+    if let Some(linker) = hot::link_shim::invoked_as_shim() {
+        return hot::link_shim::run(&linker);
+    }
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Test { profile, extra } => testing::run(profile, &extra),
@@ -67,6 +89,8 @@ fn main() -> ExitCode {
         Command::Check => check::run(),
         Command::Coverage => check::coverage(),
         Command::Miri => check::miri(),
+        Command::Dev { args } => hot::dev(&args),
+        Command::Hot { smoke, args } => hot::hot(&args, smoke),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

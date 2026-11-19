@@ -19,6 +19,7 @@ world_physics = { path = "crates/Engine/World_Physics" }
 world_anim = { path = "crates/Engine/World_Anim" }
 world_sim = { path = "crates/Engine/World_Sim" }
 world_game = { path = "crates/Game/World_Game" }
+world_reload = { path = "crates/Engine/World_Reload" }
 world_testkit = { path = "crates/Foundation/World_Testkit" }
 world_testkit_bevy = { path = "crates/Engine/World_Testkit_Bevy" }
 
@@ -34,6 +35,13 @@ bevy_rapier3d = { version = "=0.37.0", default-features = false, features = ["di
 # Must resolve to the same wgpu that Bevy renders with.
 wgpu = { version = "=30.0.2", default-features = false }
 clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+# Must match the ron that Bevy itself uses, so there is one RON parser.
+ron = "0.12"
+
+# Developer tools, only in dev builds
+bevy_egui = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
+bevy-inspector-egui = { version = "0.38.0", default-features = false, features = ["bevy_render"] }
 
 # Testing engine
 proptest = "1.12"

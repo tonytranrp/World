@@ -118,6 +118,18 @@ impl OffscreenApp {
         height: u32,
         configure: impl FnOnce(&mut App),
     ) -> Result<Self, RenderError> {
+        Self::with_asset_plugin(adapter, width, height, AssetPlugin::default(), configure)
+    }
+
+    /// Like [`OffscreenApp::new`], reading assets through `assets`; for
+    /// example a watched temporary folder from `assets::DiskAssets`.
+    pub fn with_asset_plugin(
+        adapter: TestAdapter,
+        width: u32,
+        height: u32,
+        assets: AssetPlugin,
+        configure: impl FnOnce(&mut App),
+    ) -> Result<Self, RenderError> {
         if !adapter.is_available() {
             return Err(RenderError::NoAdapter(adapter));
         }
@@ -130,6 +142,7 @@ impl OffscreenApp {
                     synchronous_pipeline_compilation: true,
                     ..default()
                 })
+                .set(assets)
                 .set(WindowPlugin {
                     primary_window: None,
                     exit_condition: ExitCondition::DontExit,
