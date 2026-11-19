@@ -42,9 +42,12 @@ pub fn assert_tree_agrees(
     first_difference(bounds, |p| tree.get(p), |p| model.get(p))
 }
 
-/// Node and word totals of a tree, as decision 0004 lays it out: a branch
-/// holds one word per non-air child; a leaf holds its palette, two ids per
-/// word, then its packed indices in whole words.
+/// Node and word totals of a tree, as `world_core::tree::node` lays it out:
+/// a branch of level 2 or higher holds one word per non-air child, a level-1
+/// branch one three-word record per non-air leaf, and a leaf with two or more
+/// materials a palette block (a header, two ids per word, then its packed
+/// indices in whole words). Leaves count those mixed children; they are not
+/// nodes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeCounts {
     pub branches: usize,
@@ -133,7 +136,8 @@ impl Walk {
             }
         }
         self.counts.branches += 1;
-        self.counts.words += listed.len();
+        // A child word per child, or a three-word leaf record at level 1.
+        self.counts.words += listed.len() * if level == 1 { 3 } else { 1 };
         for (slot, node) in listed {
             if matches!(node, NodeRef::Air) {
                 return Err(self.fail("children() lists an air child"));
@@ -179,8 +183,12 @@ impl Walk {
         }
         let solids = mask.count_ones() as usize;
         self.counts.leaves += 1;
-        self.counts.words +=
-            palette.len().div_ceil(2) + (solids * index_bits(palette.len())).div_ceil(32);
+        // One material fits in the record; more need a palette block: a
+        // header, two ids per word, then the packed indices.
+        if palette.len() > 1 {
+            self.counts.words +=
+                1 + palette.len().div_ceil(2) + (solids * index_bits(palette.len())).div_ceil(32);
+        }
         Ok(())
     }
 }

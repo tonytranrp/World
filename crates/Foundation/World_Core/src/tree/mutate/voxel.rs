@@ -1,50 +1,123 @@
-//! Single-voxel writes.
+//! Voxel writes, applied as one batch in tree order.
 
-use super::{Writer, branch};
-use crate::coords::path;
+use super::brick::{self, Records};
+use super::{Writer, branch::Children};
 use crate::material::MaterialId;
-use crate::tree::node::{Child, NodeKind, leaf};
+use crate::tree::node::leaf::{self, Record};
+use crate::tree::node::{Child, slot_at};
+
+/// One voxel write, in world-local coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalEdit {
+    pub local: [u32; 3],
+    pub material: MaterialId,
+}
 
 impl Writer<'_> {
-    /// Sets the voxel at world-local `local` inside `child`, a child at
-    /// `level`. Returns the child that replaces it, or `None` if the voxel
-    /// already holds `material`.
-    pub(super) fn set_voxel(
+    /// Applies `edits` (in tree order, one per voxel, all inside the child's
+    /// region) to `child`, a child at `level`. Returns the child that
+    /// replaces it, or `None` if no voxel changed.
+    pub(super) fn set_voxels(
         &mut self,
         child: Child,
         level: u32,
-        local: [u32; 3],
-        material: MaterialId,
+        edits: &[LocalEdit],
+        changed: &mut impl FnMut(LocalEdit, MaterialId),
     ) -> Option<Child> {
-        if child == Child::filled(material) {
+        if let Child::Air | Child::Uniform(_) = child
+            && edits.iter().all(|e| Child::filled(e.material) == child)
+        {
             return None;
         }
-        let slot = path::child_slot(local, level);
+        if level == 1 {
+            return self.set_leaves(child, edits, changed);
+        }
         let existing = self.existing(child);
-
-        if level == 0 {
-            let mut voxels = self.leaf_voxels(child);
-            if voxels[slot as usize] == material {
-                return None;
+        // Decoded only once some child is replaced by a different one.
+        let mut children: Option<Children> = None;
+        let mut any = false;
+        for run in edits.chunk_by(|a, b| slot_at(a.local, level) == slot_at(b.local, level)) {
+            let slot = slot_at(run[0].local, level);
+            let old = match (&children, existing) {
+                (Some(children), _) => children[slot as usize],
+                (None, Some((_, node))) => self.child(node, slot),
+                // Air or uniform: every child is the same fill.
+                (None, None) => child,
+            };
+            let Some(new) = self.set_voxels(old, level - 1, run, changed) else {
+                continue;
+            };
+            any = true;
+            if new != old {
+                children.get_or_insert_with(|| self.children(child))[slot as usize] = new;
             }
-            voxels[slot as usize] = material;
-            return Some(self.write(existing, NodeKind::Leaf, leaf::encode(&voxels)));
         }
-
-        // Air or uniform: the target child is the same fill, which the
-        // recursion splits in turn.
-        let old = match existing {
-            Some((_, node)) => self.child(node, slot),
+        if !any {
+            return None;
+        }
+        Some(match children {
+            // Every changed child was rebuilt in place: this node's words stand.
             None => child,
-        };
-        let new = self.set_voxel(old, level - 1, local, material)?;
-        if new == old {
-            // The child node was rebuilt in place: this node's words stand.
-            return Some(child);
+            Some(children) => self.write(existing, level, super::branch::pack(&children)),
+        })
+    }
+
+    /// [`set_voxels`](Self::set_voxels) for a level-1 child, whose children
+    /// are leaf records.
+    fn set_leaves(
+        &mut self,
+        child: Child,
+        edits: &[LocalEdit],
+        changed: &mut impl FnMut(LocalEdit, MaterialId),
+    ) -> Option<Child> {
+        let existing = self.existing(child);
+        let node = existing.map(|(_, node)| node);
+        // Decoded only once some leaf's record changes.
+        let mut records: Option<Records> = None;
+        let mut any = false;
+        for run in edits.chunk_by(|a, b| slot_at(a.local, 1) == slot_at(b.local, 1)) {
+            let slot = slot_at(run[0].local, 1) as usize;
+            let old = match &records {
+                Some(records) => records[slot],
+                None => self.record(child, node, slot as u32),
+            };
+            let Some(new) = self.edit_leaf(old, run, changed) else {
+                continue;
+            };
+            any = true;
+            if new != old {
+                records.get_or_insert_with(|| self.records(child))[slot] = new;
+            }
         }
-        let mut children = self.children(child);
-        children[slot as usize] = new;
-        Some(self.write(existing, NodeKind::Branch, branch::pack(&children)))
+        if !any {
+            return None;
+        }
+        Some(match records {
+            // Every changed leaf kept its record: only palettes were rewritten.
+            None => child,
+            Some(records) => self.write(existing, 1, brick::pack(&records)),
+        })
+    }
+
+    /// Applies one leaf's edits. Returns its new record, or `None` if no
+    /// voxel changed.
+    fn edit_leaf(
+        &mut self,
+        old: Record,
+        edits: &[LocalEdit],
+        changed: &mut impl FnMut(LocalEdit, MaterialId),
+    ) -> Option<Record> {
+        let mut voxels = self.leaf_voxels(old);
+        let mut any = false;
+        for &edit in edits {
+            let voxel = &mut voxels[slot_at(edit.local, 0) as usize];
+            if *voxel != edit.material {
+                changed(edit, *voxel);
+                *voxel = edit.material;
+                any = true;
+            }
+        }
+        any.then(|| self.store_leaf(old, leaf::encode(&voxels)))
     }
 }
 
@@ -86,6 +159,7 @@ mod tests {
         let s = tree.stats();
         assert_eq!(s.leaves, 0, "a full leaf of one material is not a leaf");
         assert_eq!(s.branches, 9);
-        assert_eq!(s.words, 9);
+        // Eight child words, then one three-word record for the uniform leaf.
+        assert_eq!(s.words, 8 + 3);
     }
 }

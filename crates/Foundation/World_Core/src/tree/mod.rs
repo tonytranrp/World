@@ -5,9 +5,9 @@
 //! Both read through [`TreeRead`], whose [`NodeRef`] walk exposes the canonical
 //! structure to serialization, ray traversal and the GPU mirror.
 //!
-//! Modules: `node` is the 16-byte node layout and leaf packing, `alloc` the
-//! copy-on-write paged arenas, `mutate` the write path that keeps the tree
-//! canonical.
+//! Modules: `node` is the storage layout (16-byte nodes, inline leaf records
+//! and palette blocks), `alloc` the copy-on-write paged arenas, `mutate` the
+//! write path that keeps the tree canonical.
 
 mod alloc;
 mod mutate;
@@ -22,8 +22,9 @@ pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
 pub use node::{Node, UNIFORM_BIT};
 
 use alloc::{Storage, Store};
-use mutate::LocalBox;
-use node::{Child, NodeKind, bit, leaf, rank, slots};
+use mutate::{LocalBox, LocalEdit};
+use node::leaf::{self, Record};
+use node::{Child, RECORD_WORDS, bit, path_key, rank, slots};
 
 use crate::consts::{TREE_DEPTH, TREE_FANOUT};
 use crate::coords::{VoxelBox, VoxelPos, path};
@@ -72,29 +73,43 @@ pub enum NodeRef<'a> {
 
 impl<'a> NodeRef<'a> {
     /// The reader's view of a stored child whose node, if it is one, has
-    /// `level`.
+    /// `level` (1 or higher).
     fn new(storage: &'a Storage, child: Child, level: u32) -> Self {
-        let index = match child {
-            Child::Air => return Self::Air,
-            Child::Uniform(m) => return Self::Uniform(m),
-            Child::Node(index) => index,
-        };
-        let node = storage.node(index);
-        let kind = NodeKind::at_level(level);
-        let block = storage.block(node.base, node.block_len(kind));
-        match kind {
-            NodeKind::Leaf => Self::Leaf(LeafRef {
-                mask: node.mask,
-                info: node.info,
-                block,
-            }),
-            NodeKind::Branch => Self::Branch(BranchRef {
-                storage,
-                level,
-                mask: node.mask,
-                children: block,
-            }),
+        match child {
+            Child::Air => Self::Air,
+            Child::Uniform(m) => Self::Uniform(m),
+            Child::Node(index) => {
+                let node = storage.node(index);
+                Self::Branch(BranchRef {
+                    storage,
+                    level,
+                    mask: node.mask,
+                    block: storage.block(node.base, node.block_len(level)),
+                })
+            }
         }
+    }
+
+    /// The reader's view of a stored leaf record.
+    fn leaf(storage: &'a Storage, record: Record) -> Self {
+        if let Some(m) = record.uniform() {
+            return Self::Uniform(m);
+        }
+        let content = match record.palette_base() {
+            Some(base) => {
+                let len = leaf::block_len(record.mask, storage.word(base));
+                LeafContent::Palette(storage.block(base, len))
+            }
+            None => LeafContent::Single(
+                record
+                    .material()
+                    .expect("a record without a palette has one material"),
+            ),
+        };
+        Self::Leaf(LeafRef {
+            mask: record.mask,
+            content,
+        })
     }
 }
 
@@ -104,8 +119,9 @@ pub struct BranchRef<'a> {
     storage: &'a Storage,
     level: u32,
     mask: u64,
-    /// One word per non-air child, in slot order.
-    children: &'a [u32],
+    /// One child word (level 2 and up) or leaf record (level 1) per non-air
+    /// child, in slot order.
+    block: &'a [u32],
 }
 
 impl<'a> BranchRef<'a> {
@@ -125,16 +141,32 @@ impl<'a> BranchRef<'a> {
         if self.mask & bit(slot) == 0 {
             return NodeRef::Air;
         }
-        let word = self.children[rank(self.mask, slot)];
-        NodeRef::new(self.storage, Child::from_word(word), self.level - 1)
+        self.child_at(rank(self.mask, slot))
     }
 
     /// The children that are not air, in ascending slot order.
     pub fn children(&self) -> impl Iterator<Item = (u32, NodeRef<'a>)> + 'a + use<'a> {
-        let (storage, level) = (self.storage, self.level - 1);
+        let branch = *self;
         slots(self.mask)
-            .zip(self.children)
-            .map(move |(slot, &word)| (slot, NodeRef::new(storage, Child::from_word(word), level)))
+            .enumerate()
+            .map(move |(k, slot)| (slot, branch.child_at(k)))
+    }
+
+    /// The `k`-th non-air child.
+    fn child_at(&self, k: usize) -> NodeRef<'a> {
+        if self.level == 1 {
+            let at = k * RECORD_WORDS;
+            NodeRef::leaf(
+                self.storage,
+                Record::read(&self.block[at..at + RECORD_WORDS]),
+            )
+        } else {
+            NodeRef::new(
+                self.storage,
+                Child::from_word(self.block[k]),
+                self.level - 1,
+            )
+        }
     }
 }
 
@@ -147,13 +179,20 @@ impl fmt::Debug for BranchRef<'_> {
     }
 }
 
-/// A leaf node: 4x4x4 voxels with a palette of the materials present.
+/// A leaf: 4x4x4 voxels, not all the same, with the materials present.
 #[derive(Clone, Copy)]
 pub struct LeafRef<'a> {
     mask: u64,
-    info: u32,
-    /// The palette, then the packed indices (see `node::leaf`).
-    block: &'a [u32],
+    content: LeafContent<'a>,
+}
+
+/// What a leaf's solid voxels are.
+#[derive(Clone, Copy)]
+enum LeafContent<'a> {
+    /// All one material: the record alone.
+    Single(MaterialId),
+    /// The palette block: header, palette, packed indices (see `node`).
+    Palette(&'a [u32]),
 }
 
 impl<'a> LeafRef<'a> {
@@ -168,27 +207,44 @@ impl<'a> LeafRef<'a> {
         if self.mask & bit(slot) == 0 {
             return MaterialId::AIR;
         }
-        let index = leaf::packed_index(self.block, self.info, rank(self.mask, slot));
-        leaf::palette_entry(self.block, index)
+        match self.content {
+            LeafContent::Single(m) => m,
+            LeafContent::Palette(block) => leaf::solid_voxel(block, rank(self.mask, slot)),
+        }
     }
 
     /// The solid materials present, ascending by id, each once.
     pub fn palette(&self) -> impl Iterator<Item = MaterialId> + 'a + use<'a> {
-        let block = self.block;
-        (0..leaf::palette_len(self.info)).map(move |i| leaf::palette_entry(block, i))
+        let content = self.content;
+        let len = match content {
+            LeafContent::Single(_) => 1,
+            LeafContent::Palette(block) => leaf::palette_len(block[0]),
+        };
+        (0..len).map(move |i| match content {
+            LeafContent::Single(m) => m,
+            LeafContent::Palette(block) => leaf::palette_entry(block, i),
+        })
     }
 
     /// Bits per packed palette index: the smallest of 0, 1, 2, 4 or 8 that
     /// indexes the palette, so 0 when it has one material.
     pub fn index_bits(&self) -> u32 {
-        leaf::index_bits(self.info)
+        match self.content {
+            LeafContent::Single(_) => 0,
+            LeafContent::Palette(block) => leaf::index_bits(block[0]),
+        }
     }
 
     /// The packed palette indices exactly as stored: one per solid voxel in
     /// slot order, [`index_bits`](Self::index_bits) wide, LSB-first in whole
     /// words. Empty when the width is 0.
     pub fn index_words(&self) -> &'a [u32] {
-        &self.block[leaf::palette_words(leaf::palette_len(self.info))..]
+        match self.content {
+            LeafContent::Single(_) => &[],
+            LeafContent::Palette(block) => {
+                &block[1 + leaf::palette_words(leaf::palette_len(block[0]))..]
+            }
+        }
     }
 }
 
@@ -204,11 +260,12 @@ impl fmt::Debug for LeafRef<'_> {
 /// Storage figures, for budgets, benchmarks and leak tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TreeStats {
-    /// Live branch nodes.
+    /// Live nodes, all branches of level 1 and up.
     pub branches: usize,
-    /// Live leaf nodes.
+    /// Live leaves: 4x4x4 children of level-1 nodes that are neither air
+    /// nor uniform. They are records inside their parent's block, not nodes.
     pub leaves: usize,
-    /// Live words: packed children, palettes and indices.
+    /// Live words: child words, leaf records and palette blocks.
     pub words: usize,
     /// Node slots on the free list.
     pub free_nodes: usize,
@@ -237,12 +294,12 @@ impl VoxelTree {
     /// Sets one voxel. Returns whether its material changed.
     pub fn set(&mut self, pos: VoxelPos, material: MaterialId) -> Result<bool, EditError> {
         let local = path::world_local(pos).ok_or(EditError::OutOfWorld { pos })?;
-        Ok(mutate::set_voxel(
-            &mut self.store,
-            &mut self.root,
-            local,
-            material,
-        ))
+        let mut changed = false;
+        let edit = LocalEdit { local, material };
+        mutate::set_voxels(&mut self.store, &mut self.root, &[edit], &mut |_, _| {
+            changed = true;
+        });
+        Ok(changed)
     }
 
     /// Sets every voxel of `region`. Returns whether anything changed. Fails,
@@ -264,28 +321,42 @@ impl VoxelTree {
     ///
     /// The report compares each brick before and after the whole batch, so a
     /// voxel changed and then restored within the batch reports nothing.
+    /// Later edits of the same voxel win. The batch is written in tree order,
+    /// so every node on its paths is rebuilt once, however many edits fall
+    /// under it.
     pub fn apply(&mut self, edits: &[Edit]) -> Result<DirtyBricks, EditError> {
-        if let Some(outside) = edits.iter().find(|e| !e.pos.in_world()) {
-            return Err(EditError::OutOfWorld { pos: outside.pos });
-        }
-        // The material of every voxel the batch changed, as it was before.
-        let mut before = Vec::new();
+        let mut sorted = Vec::with_capacity(edits.len());
         for edit in edits {
-            let old = self.get(edit.pos);
-            let local = path::world_local(edit.pos).expect("every edit was checked above");
-            if mutate::set_voxel(&mut self.store, &mut self.root, local, edit.material) {
-                before.push((edit.pos, old));
-            }
+            let pos = edit.pos;
+            let local = path::world_local(pos).ok_or(EditError::OutOfWorld { pos })?;
+            let edit = LocalEdit {
+                local,
+                material: edit.material,
+            };
+            sorted.push((path_key(local, TREE_DEPTH), edit));
         }
-        // A stable sort keeps each voxel's first change, the true original.
-        before.sort_by_key(|&(pos, _)| pos);
-        before.dedup_by_key(|&mut (pos, _)| pos);
-        let changed = before
-            .into_iter()
-            .filter(|&(pos, old)| self.get(pos) != old)
-            .map(|(pos, _)| pos.brick())
-            .collect();
-        Ok(DirtyBricks::from_unsorted(changed))
+        // A stable sort keeps the batch order among edits of one voxel; only
+        // the last of them decides the voxel's final material.
+        sorted.sort_by_key(|&(key, _)| key);
+        sorted.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            if same {
+                kept.1 = later.1;
+            }
+            same
+        });
+        let edits: Vec<LocalEdit> = sorted.into_iter().map(|(_, edit)| edit).collect();
+
+        // Each voxel is written once with its final material, so a change is
+        // a net change of the batch.
+        let mut bricks = Vec::new();
+        mutate::set_voxels(&mut self.store, &mut self.root, &edits, &mut |edit, _| {
+            let brick = path::from_world_local(edit.local).brick();
+            if bricks.last() != Some(&brick) {
+                bricks.push(brick);
+            }
+        });
+        Ok(DirtyBricks::from_unsorted(bricks))
     }
 
     /// An immutable view of the tree as it is now. O(1).

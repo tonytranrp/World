@@ -1,16 +1,92 @@
-//! The 16-byte node and the child-word encoding (decision 0004).
+//! The tree's storage layout: nodes, child words, leaf records and palette
+//! blocks (decision 0004, with leaves stored inline in their parent).
 //!
-//! This layout is a format: serialization and the GPU mirror read it bit for
-//! bit, so every fact here is asserted at compile time or covered by tests.
+//! This layout is a format. Serialization reads it through the read API and
+//! the GPU mirrors it word for word, so every fact below is asserted at
+//! compile time or covered by tests, and changing it means matching WESL
+//! changes.
 //!
-//! - A node is `mask: u64, base: u32, info: u32`. Its level, known during
-//!   traversal, decides whether it is a branch (level 1 and up) or a leaf
-//!   (level 0).
-//! - A branch's non-air children are packed at `words[base..]` in slot order,
-//!   one word each, found by popcount ([`rank`]). A word with [`UNIFORM_BIT`]
-//!   set is a uniform child with the material id in its low 16 bits; any other
-//!   word is a node index. Branch `info` is zero.
-//! - A leaf's palette and packed indices are described in [`leaf`].
+//! # Arenas
+//!
+//! A tree is a root child value plus two arenas addressed by `u32` index: an
+//! array of [`Node`]s and an array of `u32` words. Snapshots expose both as
+//! pages ([`NODE_PAGE_LEN`](super::NODE_PAGE_LEN) nodes and
+//! [`WORD_PAGE_LEN`](super::WORD_PAGE_LEN) words each); a block of words
+//! never straddles a page.
+//!
+//! # Slots
+//!
+//! A node at level `L` has 4x4x4 children, each `4^L` voxels per axis. For a
+//! world-local coordinate (`pos - WORLD_MIN_VOXEL`), the child slot at level
+//! `L` is `x + 4y + 16z`, where `x`, `y`, `z` are the two bits of each axis at
+//! bit `2L`. Bit `i` of a 64-bit mask belongs to slot `i`, and the packed
+//! entry of a set slot is found by its *rank*: the number of set mask bits
+//! below it, `popcount(mask & ((1 << i) - 1))`.
+//!
+//! # Node: 16 bytes
+//!
+//! | Field  | Type  | Meaning                                              |
+//! | ------ | ----- | ---------------------------------------------------- |
+//! | `mask` | `u64` | bit `i` is set when child slot `i` is not all air    |
+//! | `base` | `u32` | first word of the node's block                       |
+//! | `info` | `u32` | reserved, always 0                                   |
+//!
+//! Every node is a branch of level 1 to `TREE_DEPTH - 1`; the root is level
+//! `TREE_DEPTH - 1`. There are no leaf nodes: the 4x4x4-voxel leaves live in
+//! the block of their level-1 parent. The level, known during traversal,
+//! decides how the block is read. Live nodes have a non-zero mask.
+//!
+//! # Child words, level 2 and up: block of `n = popcount(mask)` words
+//!
+//! `words[base + rank(i)]` is the child in slot `i`:
+//!
+//! - bit 31 ([`UNIFORM_BIT`]) set: every voxel of the child is the material
+//!   in the low 16 bits (never air); bits 16 to 30 are zero.
+//! - bit 31 clear: the index of the child node, one level lower.
+//!
+//! The root is a child word too, or air when the world is empty.
+//!
+//! # Leaf records, level 1: block of `3n` words
+//!
+//! A level-1 node covers one brick (16x16x16 voxels). Child slot `i` is the
+//! leaf record at `words[base + 3 * rank(i)]`, [`RECORD_WORDS`] words:
+//!
+//! | Word | Meaning                                                    |
+//! | ---- | ---------------------------------------------------------- |
+//! | 0    | leaf mask, low 32 bits                                     |
+//! | 1    | leaf mask, high 32 bits                                    |
+//! | 2    | payload                                                    |
+//!
+//! Leaf mask bit `j` is set when voxel slot `j` of the leaf is solid; it is
+//! never zero. The payload says what the solid voxels are:
+//!
+//! - bit 31 set: all of them are the material in the low 16 bits (bits 16 to
+//!   30 zero). With a full mask the leaf is *uniform*: readers see it as a
+//!   uniform child, exactly like a uniform child word.
+//! - bit 31 clear: the word offset of the leaf's palette block; the leaf has
+//!   two or more materials.
+//!
+//! # Palette block: `1 + ceil(p / 2) + ceil(s * b / 32)` words
+//!
+//! For a palette of `p` materials (2 to 64), `s = popcount(leaf mask)` solid
+//! voxels and an index width of `b` bits:
+//!
+//! 1. Header: `p | b << 8`. `b` is the smallest of 1, 2, 4 or 8 that indexes
+//!    `p` entries.
+//! 2. Palette: the materials present, strictly ascending, two `u16` ids per
+//!    word, low half first; an odd palette leaves the last high half zero.
+//! 3. Indices: one per solid voxel in slot order, each the voxel's position
+//!    in the palette, packed LSB-first into whole words. `b` divides 32, so
+//!    an index never straddles a word; bits past the last index are zero.
+//!
+//! # Canonical form
+//!
+//! An all-air child is a clear mask bit with no word or record. A child whose
+//! voxels are all one material is a uniform child word or a full-mask record
+//! with that material, never a node or a palette. A palette holds exactly the
+//! materials present, sorted, at the minimal width. So equal content has equal
+//! masks, records, palettes and child words everywhere; only node indices and
+//! word offsets may differ.
 
 pub(crate) mod leaf;
 
@@ -19,17 +95,16 @@ use bytemuck::{Pod, Zeroable};
 use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
 
-/// One tree node, branch or leaf. `#[repr(C)]` with no padding, so the
-/// 16-byte layout is fixed and node pages cast to bytes for the GPU.
+/// One branch node. `#[repr(C)]` with no padding, so the 16-byte layout is
+/// fixed and node pages cast to bytes for the GPU.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct Node {
-    /// Bit `i` is set when child (branch) or voxel (leaf) `i` is not air.
+    /// Bit `i` is set when child slot `i` is not all air.
     pub mask: u64,
     /// First word of the node's block in the word arena.
     pub base: u32,
-    /// Leaf: palette length (low byte) and index bit width (second byte).
-    /// Branch: zero.
+    /// Reserved, always 0. It keeps the node padding-free at 16 bytes.
     pub info: u32,
 }
 
@@ -38,37 +113,38 @@ const _: () = assert!(align_of::<Node>() == 8);
 const _: () = assert!(size_of::<Node>() == size_of::<u64>() + 2 * size_of::<u32>());
 const _: () = assert!(TREE_FANOUT == u64::BITS);
 
-impl Node {
-    /// Words in this node's block: one per child for a branch, palette plus
-    /// indices for a leaf. Always between 1 and 64 for a live node.
-    pub(crate) fn block_len(self, kind: NodeKind) -> usize {
-        match kind {
-            NodeKind::Branch => self.mask.count_ones() as usize,
-            NodeKind::Leaf => leaf::block_len(self.mask, self.info),
-        }
-    }
-}
-
-/// How a node is read, decided by its level.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NodeKind {
-    Branch,
-    Leaf,
-}
-
-impl NodeKind {
-    pub const fn at_level(level: u32) -> Self {
-        if level == 0 { Self::Leaf } else { Self::Branch }
-    }
-}
-
-/// Set in a child word that holds a uniform material instead of a node index.
+/// Set in a child word or leaf payload that holds a material, not an index.
 pub const UNIFORM_BIT: u32 = 1 << 31;
+
+/// Words in one leaf record of a level-1 node's block.
+pub const RECORD_WORDS: usize = 3;
 
 /// Node indices are below this, so they never collide with uniform words.
 pub(crate) const MAX_NODES: u32 = UNIFORM_BIT;
 
-/// One child as the tree stores it. Air children have no word.
+/// The longest node block: a level-1 node with 64 leaf records.
+pub(crate) const MAX_BLOCK_LEN: usize = RECORD_WORDS * TREE_FANOUT as usize;
+
+impl Node {
+    /// Words in the block of this node at `level`: one per child at level 2
+    /// and up, one record per child at level 1.
+    pub(crate) const fn block_len(self, level: u32) -> usize {
+        block_len(self.mask, level)
+    }
+}
+
+/// Words in the block of a node with this mask at `level`.
+pub(crate) const fn block_len(mask: u64, level: u32) -> usize {
+    let children = mask.count_ones() as usize;
+    if level == 1 {
+        RECORD_WORDS * children
+    } else {
+        children
+    }
+}
+
+/// One child of a level-2-or-higher node as the tree stores it. Air children
+/// have no word.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Child {
     /// Every voxel is air: a clear mask bit.
@@ -124,7 +200,7 @@ pub(crate) const fn bit(slot: u32) -> u64 {
 }
 
 /// The position of slot `slot` among the set bits of `mask`: the number of
-/// set bits below it. This is the index of the slot's word in a packed block.
+/// set bits below it. This is the index of the slot's entry in a packed block.
 pub(crate) const fn rank(mask: u64, slot: u32) -> usize {
     (mask & (bit(slot) - 1)).count_ones() as usize
 }
@@ -141,28 +217,44 @@ pub(crate) fn slots(mask: u64) -> impl Iterator<Item = u32> + Clone {
     })
 }
 
-/// A node's content ready to store: its mask, info and block of words.
+/// The child slot (0 to 63) that local coordinate `local` falls in at `level`.
+/// Same as `coords::path::child_slot`, kept here so traversal inlines it.
+#[inline]
+pub(crate) const fn slot_at(local: [u32; 3], level: u32) -> u32 {
+    let shift = 2 * level;
+    ((local[0] >> shift) & 3) | (((local[1] >> shift) & 3) << 2) | (((local[2] >> shift) & 3) << 4)
+}
+
+/// The tree-order key of local coordinate `local` in a tree of `levels`
+/// levels: the slots from the root down, six bits each, most significant
+/// first. Sorting by it visits voxels in depth-first slot order, so voxels
+/// that share a node are adjacent.
+pub(crate) fn path_key(local: [u32; 3], levels: u32) -> u64 {
+    (0..levels).fold(0, |key, level| {
+        key | u64::from(slot_at(local, level)) << (6 * level)
+    })
+}
+
+/// A node's content ready to store: its mask and a block of up to `N` words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PackedNode {
+pub(crate) struct PackedNode<const N: usize> {
     pub mask: u64,
-    pub info: u32,
-    words: [u32; TREE_FANOUT as usize],
+    words: [u32; N],
     len: usize,
 }
 
-impl PackedNode {
-    /// Panics if `words` is empty or longer than 64.
-    pub fn new(mask: u64, info: u32, words: &[u32]) -> Self {
+impl<const N: usize> PackedNode<N> {
+    /// Panics if `words` is empty or longer than `N`.
+    pub fn new(mask: u64, words: &[u32]) -> Self {
         assert!(
-            (1..=TREE_FANOUT as usize).contains(&words.len()),
-            "a node block holds 1 to 64 words, not {}",
+            (1..=N).contains(&words.len()),
+            "a node block holds 1 to {N} words, not {}",
             words.len()
         );
-        let mut block = [0; TREE_FANOUT as usize];
+        let mut block = [0; N];
         block[..words.len()].copy_from_slice(words);
         Self {
             mask,
-            info,
             words: block,
             len: words.len(),
         }
@@ -179,16 +271,17 @@ impl PackedNode {
     clippy::large_enum_variant,
     reason = "a short-lived stack value; boxing would allocate on every write"
 )]
-pub(crate) enum Packed {
+pub(crate) enum Packed<const N: usize> {
     /// Every voxel is this material (air included): no node is needed.
     Filled(MaterialId),
     /// Mixed content that needs a node.
-    Node(PackedNode),
+    Node(PackedNode<N>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coords::path;
 
     #[test]
     fn child_words_round_trip() {
@@ -240,20 +333,50 @@ mod tests {
     }
 
     #[test]
-    fn block_len_follows_the_kind() {
-        let branch = Node {
+    fn block_len_follows_the_level() {
+        let node = Node {
             mask: bit(1) | bit(9) | bit(40),
             base: 0,
             info: 0,
         };
-        assert_eq!(branch.block_len(NodeKind::Branch), 3);
-        assert_eq!(NodeKind::at_level(0), NodeKind::Leaf);
-        assert_eq!(NodeKind::at_level(1), NodeKind::Branch);
+        assert_eq!(node.block_len(2), 3);
+        assert_eq!(node.block_len(9), 3);
+        assert_eq!(node.block_len(1), 9, "three words per leaf record");
+        assert_eq!(block_len(u64::MAX, 1), MAX_BLOCK_LEN);
+    }
+
+    #[test]
+    fn slot_at_matches_the_coordinate_path() {
+        for local in [[0, 0, 0], [5, 900, 77_777], [1 << 19, (1 << 20) - 1, 3]] {
+            for level in 0..10 {
+                assert_eq!(slot_at(local, level), path::child_slot(local, level));
+            }
+        }
+    }
+
+    #[test]
+    fn path_keys_order_voxels_depth_first() {
+        // The key's top six bits are the root slot, the lowest the voxel slot.
+        assert_eq!(path_key([1, 0, 0], 2), 1);
+        assert_eq!(path_key([4, 0, 0], 2), 1 << 6);
+        assert_eq!(path_key([0, 0, 4 * 3 + 3], 2), (48 << 6) | 48);
+        // Every voxel of one leaf sorts before any voxel of the next leaf.
+        let leaf_last = path_key([3, 3, 3], 3);
+        let next_leaf_first = path_key([4, 0, 0], 3);
+        assert!(leaf_last < next_leaf_first);
+        // Keys are a bijection on a small cube.
+        let mut keys: Vec<u64> = (0..16 * 16 * 16)
+            .map(|i| path_key([i % 16, i / 16 % 16, i / 256], 2))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 4096);
+        assert_eq!(keys.last(), Some(&4095));
     }
 
     #[test]
     #[should_panic(expected = "1 to 64 words")]
     fn packed_nodes_are_never_empty() {
-        PackedNode::new(0, 0, &[]);
+        PackedNode::<64>::new(0, &[]);
     }
 }
