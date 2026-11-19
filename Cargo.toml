@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*/*", "app", "tests", "tools/Xtask"]
+# The fuzz project is its own workspace: it needs nightly and cargo-fuzz.
+exclude = ["crates/Foundation/World_Core/fuzz"]
 default-members = ["app"]
 
 [workspace.package]

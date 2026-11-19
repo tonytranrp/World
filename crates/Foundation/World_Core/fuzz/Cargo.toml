@@ -1,0 +1,51 @@
+# Fuzz targets for World_Core's decoder, run with cargo-fuzz (libFuzzer) on a
+# nightly toolchain: `cargo xtask fuzz [target] [--time SECS]`.
+#
+# This is its own workspace (the root Cargo.toml excludes it), so the main
+# build never needs nightly or libFuzzer.
+
+[package]
+name = "world_core_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+world_core = { path = ".." }
+# Reseals mutated bodies with a valid checksum (fuzz_targets/common.rs).
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[workspace]
+members = ["."]
+
+# `decode` must never panic and never allocate more than its input justifies.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+# Whatever decodes must encode back to exactly the input bytes.
+[[bin]]
+name = "round_trip"
+path = "fuzz_targets/round_trip.rs"
+test = false
+doc = false
+bench = false
+
+# Writes valid encodings of representative trees as the starting corpus.
+[[bin]]
+name = "make_seeds"
+path = "make_seeds.rs"
+test = false
+doc = false
+bench = false
+
+# Line tables make libFuzzer's stack traces point at source lines.
+[profile.release]
+debug = 1
