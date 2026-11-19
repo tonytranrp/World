@@ -22,6 +22,7 @@ The full design lives in `docs/plans/engine-plan.md`. Read it before making arch
 | `packaging/` | macOS and Windows packaging metadata |
 | `scripts/` | Small developer and CI helpers |
 | `docs/` | Plans, decisions, architecture notes, research, devlog |
+| `Design/` | Concept images of the intended look, and the script that generates them (never shipped) |
 | `.cargo/`, `.config/` | Cargo aliases and environment, nextest configuration |
 
 Every folder has a `README.md` that states its permanent purpose, scope and rules. Read the README of the folder you are about to change.
