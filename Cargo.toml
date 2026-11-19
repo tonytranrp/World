@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*/*", "app"]
+default-members = ["app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+world_core = { path = "crates/Foundation/World_Core" }
+world_gen = { path = "crates/Foundation/World_Gen" }
+world_cpu_ref = { path = "crates/Foundation/World_Cpu_Ref" }
+world_render = { path = "crates/Engine/World_Render" }
+world_physics = { path = "crates/Engine/World_Physics" }
+world_anim = { path = "crates/Engine/World_Anim" }
+world_sim = { path = "crates/Engine/World_Sim" }
+world_game = { path = "crates/Game/World_Game" }
+
+# External crates. Exact pins: upgrade once per Bevy release.
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "default_app",
+    "default_platform",
+    "common_api",
+    "bevy_render",
+    "bevy_core_pipeline",
+] }
+bevy_rapier3d = { version = "=0.37.0", default-features = false, features = ["dim3"] }
+# Must resolve to the same wgpu that Bevy renders with.
+wgpu = { version = "=30.0.2", default-features = false }
+clap = { version = "4.6", features = ["derive", "env"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+
+# Our crates are lightly optimized, dependencies fully, so Bevy stays fast in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

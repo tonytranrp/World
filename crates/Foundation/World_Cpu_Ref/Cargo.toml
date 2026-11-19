@@ -1,0 +1,13 @@
+[package]
+name = "world_cpu_ref"
+description = "Slow, exact CPU reference ray tracer used as ground truth for the GPU tracer. No Bevy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+world_core.workspace = true
+
+[lints]
+workspace = true

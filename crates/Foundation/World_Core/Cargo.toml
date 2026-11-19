@@ -1,0 +1,12 @@
+[package]
+name = "world_core"
+description = "Voxel types, the sparse 64-tree, materials, edits and serialization. No Bevy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

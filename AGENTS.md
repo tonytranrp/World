@@ -62,4 +62,17 @@ Binary assets (`.vox`, baked voxel files, images, audio, fonts) are stored with 
 
 ## Building and running
 
-Cargo manifests, CI and packaging scripts are added after the skeleton. Until they exist there is nothing to build. Once they do, `Xtask` is the entry point for codegen, benchmarks and packaging, and the app accepts `--backend` and `--mac-floor`.
+The toolchain is pinned in `rust-toolchain.toml` (Bevy 0.20 needs Rust 1.97.1 or newer); rustup installs it on first use. The first build compiles about 380 crates and takes roughly 12 minutes. Later builds are incremental.
+
+```bash
+cargo run                          # opens the window; backend and tier are chosen automatically
+cargo run -- --list-adapters       # print every GPU found with its tier verdict, then exit
+cargo run -- --backend vulkan      # force dx12, vulkan or metal (also reads WGPU_BACKEND)
+cargo run -- --mac-floor           # tier B, 720p internal, 1 GiB brick pool, 4 worker threads
+cargo run -- --exit-after-frames N # quit cleanly after N frames, for automated runs
+cargo test --workspace
+```
+
+The default `dev` feature of `app` enables dynamic linking and asset hot reload. Release builds use `--no-default-features`. `.cargo/config.toml` points Bevy at the top-level `assets/` folder.
+
+Backend and tier are decided before Bevy creates the GPU device: `World_Render::tier` probes adapters, `app/src/startup` picks one and tells Bevy exactly which adapter to use. `Xtask` (codegen, benchmarks, packaging) and CI are added after this step.

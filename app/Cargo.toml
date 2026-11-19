@@ -1,0 +1,33 @@
+[package]
+name = "world"
+description = "The World game executable: CLI, settings, startup and plugin assembly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "world"
+path = "src/main.rs"
+
+[features]
+# Dev iteration: dynamic linking and asset hot reload. Disable for release builds
+# with `--no-default-features`.
+default = ["dev"]
+dev = ["bevy/dynamic_linking", "bevy/file_watcher"]
+# Rust hot-patching, used with `dx serve --hot-patch`.
+hotpatch = ["bevy/hotpatching"]
+
+[dependencies]
+world_core.workspace = true
+world_render.workspace = true
+world_physics.workspace = true
+world_anim.workspace = true
+world_sim.workspace = true
+world_game.workspace = true
+bevy.workspace = true
+wgpu.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
