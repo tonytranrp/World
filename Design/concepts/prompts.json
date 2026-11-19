@@ -1,0 +1,55 @@
+{
+  "style": "Painterly stylized game art, rendered in a real-time voxel engine. Every surface is built from tiny cubic voxels only 1.56 cm across (64 voxels per metre), so up close you can see individual crisp little cubes, each with its own saturated colour, while from a few metres away they blend into smooth, naturally lit forms. Soft bounce light, warm sun, ambient occlusion in crevices, gentle atmospheric fog and a procedural blue sky. Not photoreal, not blocky like a 1-metre block game: fine, sculpted, hand-painted feeling voxel detail.",
+  "scenes": {
+    "01_first_person_valley": "First-person view from a player standing on a grassy hillside above a river valley. The player's own chunky cartoon voxel hands hold a small voxel sledgehammer in the lower right of the frame. Foreground grass blades, pebbles and wildflowers are made of visible tiny voxels; mid-distance pine trees, rocks and a wooden cabin; distant mountains fading into blue haze. Wide 16:9 game screenshot, no HUD text.",
+    "02_voxel_scale_closeup": "Macro close-up at arm's length of a mossy boulder and a tree trunk with bark. A cartoon voxel player hand rests on the rock for scale. Each voxel is the size of a small sugar cube, 1.56 cm: a fingertip covers about one voxel and the palm is about six voxels across. Individual cubes are clearly visible with crisp edges and varied per-voxel colour in the moss, lichen, stone grain and bark grooves.",
+    "03_scale_comparison_chart": "A clean infographic poster comparing voxel sizes, on an off-white background. Three identical standing human figures 1.8 metres tall, side by side, each built from cubes of a different size: left built from huge 1 metre cubes (2 cubes tall), labelled '1 m cubes - 2 tall'; middle built from 10 cm cubes (18 cubes tall), labelled '10 cm voxels - 18 tall'; right built from tiny 1.56 cm voxels (115 tiny cubes tall, looking almost smooth but with visible fine cubes up close), labelled 'World: 1.56 cm voxels - 115 tall'. Title at top: 'How small are World's voxels?'. A 1 metre ruler next to the figures. Crisp legible text, flat vector-like style but the right figure in the painterly voxel style.",
+    "04_destruction": "First-person view of a stone and brick wall being smashed by the player's voxel sledgehammer. The wall breaks into irregular chunks along voxel boundaries, chunks of every size tumbling through the air, tiny single-voxel debris scattering, soft dust particles lit by the sun. The broken faces show the fine voxel interior of the stone and mortar. Dynamic action game screenshot.",
+    "05_landscape_horizon": "Wide establishing shot from a cliff edge at golden hour over a huge fixed open world: forested valleys, a winding river, a small village of wooden houses, rocky cliffs and far mountains. Near detail shows fine voxels, the distance dissolves into painterly atmospheric fog and soft god rays. Breathtaking sense of scale.",
+    "06_lake_reflection": "A calm lake at dusk reflecting the scene. On the shore stands the player character: a cartoon-proportioned figure with a big head and big hands, built entirely from fine voxels, holding a voxel lantern. The full body appears in the mirror-like water reflection along with pine trees and a pink and orange sky. Glossy wet stones in front.",
+    "07_player_character_sheet": "Character turnaround sheet of the player character for a voxel game: front, side and back views on a neutral grey background. Cartoon proportions, slightly oversized head and hands, explorer outfit with a backpack, boots and a tool belt, built from fine 1.56 cm voxels with visible little cubes and saturated per-voxel colours. Clean presentation, small caption 'Player - 1.8 m, about 115 voxels tall'.",
+    "08_cave_lava_glow": "Inside a large cave lit only by a glowing lava river and a few hanging voxel lanterns. Warm orange emissive light bounces off the voxel rock walls, crystals catch the light, deep soft shadows and ambient occlusion, a little drifting smoke. First-person view with the player's voxel hand holding a pickaxe at the bottom edge."
+  },
+  "jobs": [
+    [
+      "01_first_person_valley",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "02_voxel_scale_closeup",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "03_scale_comparison_chart",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "04_destruction",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "05_landscape_horizon",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "06_lake_reflection",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "07_player_character_sheet",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "08_cave_lava_glow",
+      "venice-gpt-image-2-6-sunburst"
+    ],
+    [
+      "01_first_person_valley",
+      "venice-nano-banana-2-1"
+    ],
+    [
+      "02_voxel_scale_closeup",
+      "venice-nano-banana-2-1"
+    ]
+  ]
+}

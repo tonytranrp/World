@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use crate::process::{self, cargo};
 
 /// The crates that carry benchmarks.
-const BENCH_PACKAGES: &[&str] = &["world_testkit"];
+const BENCH_PACKAGES: &[&str] = &["world_testkit", "world_core"];
 
 pub fn run(
     save: Option<String>,

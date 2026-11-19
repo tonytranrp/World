@@ -28,6 +28,6 @@ It depends on node for layouts and on alloc for storage. The edit module is its 
 
 - After every write the tree is canonical: uniform subtrees are collapsed and equal content has equal structure.
 - A write that changes nothing reports nothing.
-- Writes never mutate nodes visible to existing readers; they build new nodes and swap the root.
+- Writes never change what an existing snapshot sees: a page a snapshot shares is copied before it is written (decision 0004).
 - Behavior is checked against a dense reference array with a large number of random edits, with no divergence allowed.
 - Time per edit is bounded by depth, never by world size.

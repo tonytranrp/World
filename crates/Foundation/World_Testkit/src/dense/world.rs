@@ -1,4 +1,4 @@
-use world_core::{Edit, MaterialId, VoxelPos};
+use world_core::{Edit, MaterialId, VoxelBox, VoxelPos};
 
 use crate::hash::{HashState, StateHasher};
 
@@ -23,10 +23,25 @@ impl Bounds {
     pub fn volume(&self) -> usize {
         self.size.iter().map(|&s| s as usize).product()
     }
+
+    /// The same voxels as a World_Core box.
+    pub const fn as_box(&self) -> VoxelBox {
+        VoxelBox::from_min_size(self.min, self.size)
+    }
 }
 
-/// What the dense model and the 64-tree both promise. The tree implements this
-/// in its own tests, so the same comparison code checks both.
+/// One step of a random edit sequence: a single voxel or a whole box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditOp {
+    Set(Edit),
+    Fill {
+        region: VoxelBox,
+        material: MaterialId,
+    },
+}
+
+/// What the dense model and the 64-tree both promise, so the same comparison
+/// code checks both.
 pub trait VoxelModel {
     /// The material at `pos`; air anywhere nothing has been set.
     fn get(&self, pos: VoxelPos) -> MaterialId;
@@ -36,6 +51,25 @@ pub trait VoxelModel {
 
     fn apply(&mut self, edit: Edit) {
         self.set(edit.pos, edit.material);
+    }
+
+    /// Sets every voxel of `region`, one at a time. An empty box does nothing.
+    fn fill_box(&mut self, region: VoxelBox, material: MaterialId) {
+        let (lo, end) = (region.min(), region.end());
+        for z in lo.z..end.z {
+            for y in lo.y..end.y {
+                for x in lo.x..end.x {
+                    self.set(VoxelPos::new(x, y, z), material);
+                }
+            }
+        }
+    }
+
+    fn apply_op(&mut self, op: EditOp) {
+        match op {
+            EditOp::Set(edit) => self.apply(edit),
+            EditOp::Fill { region, material } => self.fill_box(region, material),
+        }
     }
 }
 
@@ -192,6 +226,29 @@ mod tests {
         for (pos, material) in solids {
             assert_eq!(w.get(pos), material);
         }
+    }
+
+    #[test]
+    fn fill_box_sets_exactly_the_box() {
+        let mut w = world();
+        let region = VoxelBox::new(VoxelPos::new(-1, 1, 5), VoxelPos::new(1, 3, 6));
+        w.fill_box(region, MaterialId(2));
+        assert_eq!(w.solid_count(), 4);
+        for (pos, material) in w.solids() {
+            assert!(region.contains(pos));
+            assert_eq!(material, MaterialId(2));
+        }
+    }
+
+    #[test]
+    fn empty_fill_does_nothing() {
+        let mut w = world();
+        let far = VoxelPos::new(1_000, 0, 0);
+        w.apply_op(EditOp::Fill {
+            region: VoxelBox::new(far, far),
+            material: MaterialId(1),
+        });
+        assert_eq!(w.solid_count(), 0);
     }
 
     #[test]

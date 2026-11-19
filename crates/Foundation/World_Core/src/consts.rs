@@ -24,8 +24,29 @@ pub const TREE_BRANCH_DIM: u32 = 4;
 /// Children per 64-tree node; also the width of the child occupancy mask in bits.
 pub const TREE_FANOUT: u32 = TREE_BRANCH_DIM * TREE_BRANCH_DIM * TREE_BRANCH_DIM;
 
+/// Node levels in the world tree. A level-`L` node's children each cover
+/// `4^L` voxels per axis: level 0 holds single voxels (a leaf), and the root is
+/// level `TREE_DEPTH - 1`.
+pub const TREE_DEPTH: u32 = 10;
+
+/// Voxels along one edge of the world: `4^TREE_DEPTH`, 16.384 km.
+pub const WORLD_SIZE_VOXELS: u32 = TREE_BRANCH_DIM.pow(TREE_DEPTH);
+
+/// The lowest voxel coordinate inside the world, on every axis.
+pub const WORLD_MIN_VOXEL: i32 = -(WORLD_SIZE_VOXELS as i32 / 2);
+
+/// One past the highest voxel coordinate inside the world, on every axis.
+pub const WORLD_END_VOXEL: i32 = WORLD_SIZE_VOXELS as i32 / 2;
+
+/// Voxels along one edge of a brick: the region of one level-1 node, and the
+/// unit of change reports and GPU streaming.
+pub const BRICK_DIM: u32 = TREE_BRANCH_DIM * TREE_BRANCH_DIM;
+
 const _: () = assert!(VOXELS_PER_METER.is_multiple_of(COLLISION_VOXELS_PER_METER));
 const _: () = assert!(TREE_FANOUT == 64);
+const _: () = assert!(WORLD_SIZE_VOXELS == 1 << 20);
+const _: () = assert!(WORLD_END_VOXEL - WORLD_MIN_VOXEL == WORLD_SIZE_VOXELS as i32);
+const _: () = assert!(BRICK_DIM == 16);
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +64,12 @@ mod tests {
             COLLISION_VOXEL_SIZE_M,
             VOXEL_SIZE_M * COLLISION_SCALE as f32
         );
+    }
+
+    #[test]
+    fn world_is_about_sixteen_kilometres_wide() {
+        let metres = WORLD_SIZE_VOXELS as f32 * VOXEL_SIZE_M;
+        assert_eq!(metres, 16_384.0);
     }
 
     #[test]

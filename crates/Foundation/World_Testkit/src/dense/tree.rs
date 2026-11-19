@@ -1,0 +1,271 @@
+//! The production 64-tree seen through the oracle's eyes: an adapter so it can
+//! be compared with [`DenseWorld`](super::DenseWorld), a comparison for any
+//! reader (live tree or snapshot), and a walk that checks the canonical form
+//! of decision 0004 node by node.
+
+use std::collections::BTreeSet;
+
+use world_core::consts::TREE_DEPTH;
+use world_core::tree::{BranchRef, LeafRef, NodeRef, TreeRead, TreeStats};
+use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
+
+use super::diverge::{Divergence, first_difference};
+use super::world::{Bounds, VoxelModel};
+
+/// The tree follows the dense model's policy: a write the store refuses is a
+/// bug in the test, so it panics with the tree's own error message.
+impl VoxelModel for VoxelTree {
+    fn get(&self, pos: VoxelPos) -> MaterialId {
+        TreeRead::get(self, pos)
+    }
+
+    fn set(&mut self, pos: VoxelPos, material: MaterialId) {
+        if let Err(e) = VoxelTree::set(self, pos, material) {
+            panic!("{e}");
+        }
+    }
+
+    fn fill_box(&mut self, region: VoxelBox, material: MaterialId) {
+        if let Err(e) = VoxelTree::fill_box(self, region, material) {
+            panic!("{e}");
+        }
+    }
+}
+
+/// Compares any tree reader, such as a snapshot, with a model over `bounds`.
+/// `left` in the divergence is the tree.
+pub fn assert_tree_agrees(
+    tree: &impl TreeRead,
+    model: &impl VoxelModel,
+    bounds: Bounds,
+) -> Result<(), Divergence> {
+    first_difference(bounds, |p| tree.get(p), |p| model.get(p))
+}
+
+/// Node and word totals of a tree, as decision 0004 lays it out: a branch
+/// holds one word per non-air child; a leaf holds its palette, two ids per
+/// word, then its packed indices in whole words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCounts {
+    pub branches: usize,
+    pub leaves: usize,
+    pub words: usize,
+}
+
+impl From<TreeStats> for NodeCounts {
+    /// The live part of the store's own figures.
+    fn from(stats: TreeStats) -> Self {
+        Self {
+            branches: stats.branches,
+            leaves: stats.leaves,
+            words: stats.words,
+        }
+    }
+}
+
+/// Walks every node and checks the canonical form: levels in order, no empty
+/// or uniform-equivalent node, children listed exactly as the mask says,
+/// leaf palettes sorted, unique, free of air and holding exactly the
+/// materials present. Returns what the walk counted, or the first problem
+/// with the slot path that leads to it.
+pub fn check_canonical(tree: &impl TreeRead) -> Result<NodeCounts, String> {
+    let mut walk = Walk::default();
+    match tree.root() {
+        NodeRef::Leaf(_) => return Err("the root is a leaf".into()),
+        root => walk.child(root, TREE_DEPTH - 1)?,
+    }
+    Ok(walk.counts)
+}
+
+#[derive(Default)]
+struct Walk {
+    path: Vec<u32>,
+    counts: NodeCounts,
+}
+
+impl Walk {
+    fn fail(&self, what: &str) -> String {
+        format!("at slot path {:?}: {what}", self.path)
+    }
+
+    /// One child value. `level` is the level a node in its place would have.
+    fn child(&mut self, node: NodeRef<'_>, level: u32) -> Result<(), String> {
+        match node {
+            NodeRef::Air => Ok(()),
+            NodeRef::Uniform(m) if m.is_air() => Err(self.fail("a uniform child of air")),
+            NodeRef::Uniform(_) => Ok(()),
+            NodeRef::Branch(b) if level == 0 || b.level() != level => Err(self.fail(&format!(
+                "a branch of level {} where level {level} belongs",
+                b.level()
+            ))),
+            NodeRef::Branch(b) => self.branch(b, level),
+            NodeRef::Leaf(_) if level != 0 => Err(self.fail("a leaf above level 0")),
+            NodeRef::Leaf(l) => self.leaf(l),
+        }
+    }
+
+    fn branch(&mut self, b: BranchRef<'_>, level: u32) -> Result<(), String> {
+        let mask = b.mask();
+        if mask == 0 {
+            return Err(self.fail("a branch with no children"));
+        }
+        let listed: Vec<(u32, NodeRef<'_>)> = b.children().collect();
+        if !listed.iter().map(|&(s, _)| s).eq(slots(mask)) {
+            return Err(self.fail("children() does not list exactly the mask's slots in order"));
+        }
+        for slot in 0..64 {
+            let set = mask >> slot & 1 == 1;
+            let child = summary(b.child(slot));
+            let expected = listed
+                .iter()
+                .find(|&&(s, _)| s == slot)
+                .map_or(summary(NodeRef::Air), |&(_, n)| summary(n));
+            if (child == summary(NodeRef::Air)) == set || child != expected {
+                return Err(self.fail(&format!("child({slot}) disagrees with the mask")));
+            }
+        }
+        if mask == u64::MAX {
+            let first = summary(listed[0].1);
+            if matches!(listed[0].1, NodeRef::Uniform(_))
+                && listed.iter().all(|&(_, n)| summary(n) == first)
+            {
+                return Err(self.fail("a branch whose children are all one material"));
+            }
+        }
+        self.counts.branches += 1;
+        self.counts.words += listed.len();
+        for (slot, node) in listed {
+            if matches!(node, NodeRef::Air) {
+                return Err(self.fail("children() lists an air child"));
+            }
+            self.path.push(slot);
+            self.child(node, level - 1)?;
+            self.path.pop();
+        }
+        Ok(())
+    }
+
+    fn leaf(&mut self, l: LeafRef<'_>) -> Result<(), String> {
+        let mask = l.mask();
+        if mask == 0 {
+            return Err(self.fail("a leaf with no solid voxels"));
+        }
+        let palette: Vec<MaterialId> = l.palette().collect();
+        if palette.is_empty() || palette.len() > 64 {
+            return Err(self.fail(&format!("a palette of {} entries", palette.len())));
+        }
+        if palette.iter().any(|m| m.is_air()) || !palette.windows(2).all(|w| w[0] < w[1]) {
+            return Err(self.fail(&format!(
+                "a palette that is not sorted, unique and solid: {palette:?}"
+            )));
+        }
+        let mut present = BTreeSet::new();
+        for slot in 0..64 {
+            let v = l.voxel(slot);
+            if v.is_air() == (mask >> slot & 1 == 1) {
+                return Err(self.fail(&format!("voxel {slot} disagrees with the mask")));
+            }
+            if !v.is_air() {
+                present.insert(v);
+            }
+        }
+        if !present.iter().eq(palette.iter()) {
+            return Err(self.fail(&format!(
+                "palette {palette:?} is not the materials present {present:?}"
+            )));
+        }
+        if mask == u64::MAX && palette.len() == 1 {
+            return Err(self.fail("a leaf that is all one material"));
+        }
+        let solids = mask.count_ones() as usize;
+        self.counts.leaves += 1;
+        self.counts.words +=
+            palette.len().div_ceil(2) + (solids * index_bits(palette.len())).div_ceil(32);
+        Ok(())
+    }
+}
+
+/// The set bits of a mask, ascending.
+fn slots(mask: u64) -> impl Iterator<Item = u32> {
+    (0..64).filter(move |s| mask >> s & 1 == 1)
+}
+
+/// What a child is, without its identity: the kind plus its id or mask.
+fn summary(node: NodeRef<'_>) -> (u8, u64) {
+    match node {
+        NodeRef::Air => (0, 0),
+        NodeRef::Uniform(m) => (1, m.0.into()),
+        NodeRef::Branch(b) => (2, b.mask()),
+        NodeRef::Leaf(l) => (3, l.mask()),
+    }
+}
+
+/// The smallest of 0, 1, 2, 4 or 8 bits that can index `len` palette entries.
+fn index_bits(len: usize) -> usize {
+    match len {
+        0 | 1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=16 => 4,
+        _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_width_is_the_smallest_power_of_two_that_fits() {
+        let widths: Vec<usize> = [1, 2, 3, 4, 5, 16, 17, 64].map(index_bits).to_vec();
+        assert_eq!(widths, [0, 1, 2, 2, 4, 4, 8, 8]);
+    }
+
+    #[test]
+    fn slots_lists_set_bits_ascending() {
+        assert!(slots(0b1010_0001).eq([0, 5, 7]));
+        assert_eq!(slots(u64::MAX).count(), 64);
+    }
+
+    /// A tree that is one child value, which needs no store to build.
+    struct Whole(NodeRef<'static>);
+
+    impl TreeRead for Whole {
+        fn root(&self) -> NodeRef<'_> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn air_and_uniform_roots_are_canonical_and_hold_no_nodes() {
+        for root in [NodeRef::Air, NodeRef::Uniform(MaterialId(9))] {
+            assert_eq!(check_canonical(&Whole(root)), Ok(NodeCounts::default()));
+        }
+    }
+
+    #[test]
+    fn uniform_air_is_rejected() {
+        let err = check_canonical(&Whole(NodeRef::Uniform(MaterialId::AIR))).unwrap_err();
+        assert!(err.contains("uniform child of air"), "{err}");
+    }
+
+    #[test]
+    fn counts_convert_from_live_stats() {
+        let stats = TreeStats {
+            branches: 3,
+            leaves: 2,
+            words: 9,
+            free_nodes: 4,
+            free_words: 5,
+            bytes: 6,
+        };
+        assert_eq!(
+            NodeCounts::from(stats),
+            NodeCounts {
+                branches: 3,
+                leaves: 2,
+                words: 9
+            }
+        );
+    }
+}
