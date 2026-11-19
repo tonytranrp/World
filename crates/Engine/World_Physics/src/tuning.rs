@@ -5,9 +5,6 @@
 use serde::{Deserialize, Serialize};
 use world_core::ConfigAsset;
 
-/// Asset path of the physics tuning file.
-pub const PHYSICS_CONFIG_PATH: &str = "config/physics.ron";
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicsTuning {
@@ -59,6 +56,7 @@ impl Default for PhysicsTuning {
 
 impl ConfigAsset for PhysicsTuning {
     const NAME: &'static str = "physics";
+    const PATH: &'static str = "config/physics.ron";
 
     fn validate(&self) -> Result<(), Vec<String>> {
         let mut problems = Vec::new();

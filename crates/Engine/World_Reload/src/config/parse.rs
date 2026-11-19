@@ -17,6 +17,10 @@ pub enum ConfigError {
     },
     /// The text parsed but [`ConfigAsset::validate`] rejected the values.
     Invalid(Vec<String>),
+    /// The file could not be read.
+    Io(String),
+    /// No config with this name is registered.
+    UnknownConfig(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -29,14 +33,18 @@ impl fmt::Display for ConfigError {
                 message,
             } => write!(f, "line {line}, column {column}: {message}"),
             Self::Invalid(problems) => write!(f, "invalid values: {}", problems.join("; ")),
+            Self::Io(e) => write!(f, "could not read the file: {e}"),
+            Self::UnknownConfig(name) => write!(f, "no config is named {name:?}"),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
-/// Parses and validates. The only way text becomes a live config.
+/// Parses and validates. The only way text becomes a live config. A leading
+/// byte-order mark, which some Windows editors save, is ignored.
 pub fn parse_config<T: ConfigAsset>(text: &str) -> Result<T, ConfigError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let value: T = ron::Options::default()
         .from_str(text)
         .map_err(|e| ConfigError::Parse {
@@ -50,9 +58,7 @@ pub fn parse_config<T: ConfigAsset>(text: &str) -> Result<T, ConfigError> {
 
 /// Parses raw bytes, as the asset loader receives them.
 pub fn parse_config_bytes<T: ConfigAsset>(bytes: &[u8]) -> Result<T, ConfigError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| ConfigError::NotUtf8)?;
-    // Editors on Windows may save a byte-order mark; RON does not expect one.
-    parse_config(text.strip_prefix('\u{feff}').unwrap_or(text))
+    parse_config(std::str::from_utf8(bytes).map_err(|_| ConfigError::NotUtf8)?)
 }
 
 /// Pretty RON for display and saving. Field order follows the type.
@@ -78,6 +84,7 @@ mod tests {
 
     impl ConfigAsset for Speed {
         const NAME: &'static str = "speed";
+        const PATH: &'static str = "config/speed.ron";
         fn validate(&self) -> Result<(), Vec<String>> {
             if self.metres_per_second < 0.0 {
                 Err(vec!["metres_per_second must not be negative".into()])
@@ -130,6 +137,12 @@ mod tests {
                 metres_per_second: 2.0
             }
         );
+    }
+
+    #[test]
+    fn text_with_a_bom_parses_too() {
+        let s: Speed = parse_config("\u{feff}(metres_per_second: 3.0)").unwrap();
+        assert_eq!(s.metres_per_second, 3.0);
     }
 
     #[test]

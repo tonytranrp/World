@@ -13,6 +13,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Bash everywhere: on Windows the default PowerShell only checks the exit code
+# of a step's last command, so a failing first command would go unnoticed.
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   # A GPU test that cannot find its adapter must fail here, never skip.
@@ -134,6 +140,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: hot-patch
+          # A cold build can outlast the smoke test's first-build timeout; keep
+          # what was compiled so the next run gets further.
+          cache-on-failure: true
 
       - uses: taiki-e/install-action@v2
         with:

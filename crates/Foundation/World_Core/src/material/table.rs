@@ -154,13 +154,11 @@ impl Default for MaterialTable {
     }
 }
 
-/// Asset path of the material table.
-pub const MATERIALS_CONFIG_PATH: &str = "config/materials.ron";
-
 /// Validation happens while parsing ([`MaterialTable::new`]), so a parsed
 /// table needs no further checks.
 impl crate::config::ConfigAsset for MaterialTable {
     const NAME: &'static str = "materials";
+    const PATH: &'static str = "config/materials.ron";
 }
 
 impl TryFrom<MaterialTableSpec> for MaterialTable {

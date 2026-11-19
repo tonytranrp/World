@@ -1,6 +1,8 @@
 //! Every registered config, its status, and type-erased access by name, so the
 //! developer panel can list, edit and save configs without knowing their types.
 
+use std::any::TypeId;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
@@ -32,6 +34,7 @@ pub struct ConfigEntry {
     pub failures: u32,
     /// Why the most recent rejection happened. Cleared by the next success.
     pub last_error: Option<String>,
+    type_id: TypeId,
     ops: ConfigOps,
 }
 
@@ -80,10 +83,6 @@ impl ConfigRegistry {
         self.entries.iter().find(|e| e.name == name)
     }
 
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
-    }
-
     pub fn set_root(&mut self, root: impl Into<PathBuf>) {
         self.root = Some(root.into());
     }
@@ -93,23 +92,36 @@ impl ConfigRegistry {
         Some(self.root.as_ref()?.join(&self.get(name)?.path))
     }
 
-    pub(super) fn register<T: ConfigAsset>(&mut self, path: &str) -> bool {
-        if let Some(existing) = self.get(T::NAME) {
-            assert_eq!(
-                existing.path,
-                path,
-                "config {:?} is registered from two paths",
-                T::NAME
-            );
+    /// Adds `T`. Returns `false` when `T` is already registered.
+    ///
+    /// # Panics
+    /// When a different type already uses the same name or the same file.
+    pub(super) fn register<T: ConfigAsset>(&mut self) -> bool {
+        let type_id = TypeId::of::<T>();
+        if self.entries.iter().any(|e| e.type_id == type_id) {
             return false;
+        }
+        if let Some(clash) = self
+            .entries
+            .iter()
+            .find(|e| e.name == T::NAME || e.path == T::PATH)
+        {
+            panic!(
+                "config {:?} ({}) clashes with config {:?} ({}): names and files must be unique",
+                T::NAME,
+                T::PATH,
+                clash.name,
+                clash.path
+            );
         }
         self.entries.push(ConfigEntry {
             name: T::NAME,
-            path: path.to_owned(),
+            path: T::PATH.to_owned(),
             origin: ConfigOrigin::Defaults,
             applied: 0,
             failures: 0,
             last_error: None,
+            type_id,
             ops: ConfigOps {
                 current_text: current_text::<T>,
                 apply_text: apply_text::<T>,
@@ -150,7 +162,7 @@ impl ConfigRegistry {
         let ops = world
             .resource::<Self>()
             .get(name)
-            .ok_or_else(|| ConfigError::Invalid(vec![format!("no config is named {name:?}")]))?
+            .ok_or_else(|| ConfigError::UnknownConfig(name.to_owned()))?
             .ops;
         let result = (ops.apply_text)(world, text);
         let mut registry = world.resource_mut::<Self>();
@@ -162,8 +174,10 @@ impl ConfigRegistry {
     }
 
     /// Applies `text`, then writes it to the config's file. Invalid text is
-    /// never written. The write is atomic: a temporary file is renamed over the
-    /// old one, so a crash cannot leave half a file. Returns the file written.
+    /// never written. The write is atomic and flushed to disk: a temporary file
+    /// is renamed over the old one, so a crash cannot leave half a file. The
+    /// live value then matches the file, so the status says so straight away;
+    /// the watcher's reload of the same text confirms it. Returns the file written.
     pub fn save_text(world: &mut World, name: &str, text: &str) -> Result<PathBuf, SaveError> {
         let path = {
             let registry = world.resource::<Self>();
@@ -174,6 +188,7 @@ impl ConfigRegistry {
         };
         Self::apply_text(world, name, text).map_err(SaveError::Invalid)?;
         write_atomically(&path, text).map_err(SaveError::Io)?;
+        world.resource_mut::<Self>().entry_mut(name).origin = ConfigOrigin::File;
         Ok(path)
     }
 }
@@ -192,10 +207,33 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, text)?;
-    std::fs::rename(&temporary, path).inspect_err(|_| {
+    let result =
+        write_and_flush(&temporary, text).and_then(|()| rename_with_retries(&temporary, path));
+    if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
-    })
+    }
+    result
+}
+
+fn write_and_flush(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// On Windows a virus scanner or indexer can hold the target for a moment,
+/// which makes the rename fail with "access denied"; a short retry fixes it.
+fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if attempt < 5 && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]

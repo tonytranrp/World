@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use bevy::core_pipeline::fullscreen_material::FullscreenMaterialPlugin;
 use bevy::prelude::*;
 use wgpu::{Backend, DeviceType, DownlevelFlags, Features, Limits};
+use world_core::ConfigAsset;
 use world_core::material::MaterialTable;
 use world_game::prelude::{PlayerCamera, WorldGamePlugin};
-use world_physics::prelude::{PHYSICS_CONFIG_PATH, PhysicsTuning, WorldPhysicsPlugin};
+use world_physics::prelude::{PhysicsTuning, WorldPhysicsPlugin};
 use world_reload::{CodeReloaded, ConfigOrigin, ConfigRegistry, WorldReloadPlugin, parse_config};
 use world_render::prelude::{
     AdapterReport, Budgets, Profile, RenderTier, SKY_SHADER_PATH, SkyComposite, WorldRenderPlugin,
@@ -57,7 +58,7 @@ fn render_tier() -> RenderTier {
 #[test]
 fn the_shipped_physics_tuning_is_valid_and_matches_the_defaults() {
     let tuning: PhysicsTuning =
-        parse_config(&shipped(PHYSICS_CONFIG_PATH)).unwrap_or_else(|e| panic!("physics.ron: {e}"));
+        parse_config(&shipped(PhysicsTuning::PATH)).unwrap_or_else(|e| panic!("physics.ron: {e}"));
     // The file documents the defaults; if they drift apart one of them is wrong.
     assert_eq!(tuning, PhysicsTuning::default());
 }
@@ -65,7 +66,7 @@ fn the_shipped_physics_tuning_is_valid_and_matches_the_defaults() {
 #[test]
 fn the_shipped_material_table_is_valid() {
     let table: MaterialTable =
-        parse_config(&shipped("config/materials.ron")).unwrap_or_else(|e| panic!("{e}"));
+        parse_config(&shipped(MaterialTable::PATH)).unwrap_or_else(|e| panic!("{e}"));
     assert!(!table.is_empty());
 }
 
@@ -84,6 +85,7 @@ fn every_shipped_config_is_registered_and_loads_cleanly() {
         WorldReloadPlugin,
         WorldRenderPlugin::new(render_tier()),
         WorldPhysicsPlugin,
+        WorldGamePlugin,
     ));
     app.run_for(Duration::from_secs(20), |w| {
         w.resource::<ConfigRegistry>()
@@ -275,13 +277,36 @@ fn gpu_a_broken_shader_edit_is_survived_and_a_fix_recovers() {
     };
     capture_until(&mut app, "the original sky", is_sky);
 
-    // A syntax error: the pipeline fails to compile, the app must keep running.
-    disk.write(SKY_SHADER_PATH, "this is not a shader {");
+    // A syntax error. Bevy loads shader source without compiling it, so wait
+    // until the broken text is the live shader; the pipeline compile then
+    // fails, and the app must keep rendering.
+    const BROKEN: &str = "this is not a shader {";
+    disk.write(SKY_SHADER_PATH, BROKEN);
+    let shader: Handle<bevy::shader::Shader> = app
+        .world_mut()
+        .resource::<AssetServer>()
+        .load(SKY_SHADER_PATH);
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
+    loop {
         app.capture()
             .expect("rendering stopped after a broken shader");
+        let live = app
+            .world_mut()
+            .resource::<Assets<bevy::shader::Shader>>()
+            .get(&shader)
+            .is_some_and(|s| s.source.as_str() == BROKEN);
+        if live {
+            break;
+        }
+        assert!(
+            start.elapsed() < DEADLINE,
+            "the broken shader never replaced the working one"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
+    // Still rendering frames after the failure.
+    app.capture()
+        .expect("rendering stopped after a broken shader");
 
     // A fixed shader is picked up again: solid magenta everywhere.
     let magenta = r#"

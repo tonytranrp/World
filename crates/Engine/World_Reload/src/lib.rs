@@ -19,7 +19,7 @@ pub mod prelude;
 
 pub use code::{AppReloadExt, CodeReloadStats, CodeReloaded, ReloadScoped, ReloadSystems};
 pub use config::{
-    AppConfigExt, Config, ConfigAsset, ConfigEntry, ConfigError, ConfigFile, ConfigOrigin,
-    ConfigRegistry, ConfigSystems, SaveError, parse_config, to_pretty_ron,
+    AppConfigExt, Config, ConfigAsset, ConfigEntry, ConfigError, ConfigOrigin, ConfigRegistry,
+    ConfigSystems, SaveError, parse_config, to_pretty_ron,
 };
 pub use plugin::WorldReloadPlugin;

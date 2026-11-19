@@ -46,7 +46,9 @@ impl TestProfile {
 
     /// GPU tests may not skip when they are meant to run.
     fn requires_gpu(self) -> bool {
-        matches!(self, Self::Gpu | Self::Full | Self::All | Self::Reload)
+        // Other profiles leave the variable as the caller set it: `Reload` is a
+        // local loop, and on a Mac (no software adapter) its GPU tests skip loudly.
+        matches!(self, Self::Gpu | Self::Full | Self::All)
     }
 
     /// Whether to also build `world_reload` with its `hotpatch` feature, which
@@ -57,14 +59,12 @@ impl TestProfile {
 }
 
 pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
-    let require_gpu = if profile.requires_gpu() { "1" } else { "0" };
-
     if cargo_tool_installed("nextest") {
         let mut command = cargo();
         command
             .args(["nextest", "run", "--workspace", "--no-fail-fast"])
-            .env("WORLD_TEST_PROFILE", profile.scale())
-            .env("WORLD_TEST_REQUIRE_GPU", require_gpu);
+            .env("WORLD_TEST_PROFILE", profile.scale());
+        require_gpu_if_needed(&mut command, profile);
         if let Some(filter) = profile.filter() {
             command.args(["-E", &filter]);
         }
@@ -76,8 +76,8 @@ pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
         let mut command = cargo();
         command
             .args(["test", "--workspace", "--no-fail-fast"])
-            .env("WORLD_TEST_PROFILE", profile.scale())
-            .env("WORLD_TEST_REQUIRE_GPU", require_gpu);
+            .env("WORLD_TEST_PROFILE", profile.scale());
+        require_gpu_if_needed(&mut command, profile);
         if profile == TestProfile::Fast {
             // The fallback runner has no filter language; skipping by name is the closest match.
             command.args(["--", "--skip", "gpu_"]);
@@ -103,4 +103,12 @@ pub fn run(profile: TestProfile, extra: &[String]) -> Result<(), String> {
         process::run(cargo().args(["test", "--doc", "--workspace"]))?;
     }
     Ok(())
+}
+
+/// Profiles that must run their GPU tests make a missing adapter a failure.
+/// The rest leave `WORLD_TEST_REQUIRE_GPU` as the caller set it.
+fn require_gpu_if_needed(command: &mut std::process::Command, profile: TestProfile) {
+    if profile.requires_gpu() {
+        command.env("WORLD_TEST_REQUIRE_GPU", "1");
+    }
 }

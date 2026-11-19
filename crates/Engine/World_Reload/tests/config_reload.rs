@@ -23,6 +23,7 @@ struct Speed {
 
 impl ConfigAsset for Speed {
     const NAME: &'static str = "speed";
+    const PATH: &'static str = SPEED;
     fn validate(&self) -> Result<(), Vec<String>> {
         if self.metres_per_second.is_finite() && self.metres_per_second >= 0.0 {
             Ok(())
@@ -44,6 +45,7 @@ struct Label {
 
 impl ConfigAsset for Label {
     const NAME: &'static str = "label";
+    const PATH: &'static str = LABEL;
 }
 
 const SPEED: &str = "config/speed.ron";
@@ -64,7 +66,7 @@ fn app_with(seed: Option<u64>, initial: Option<&str>) -> (HeadlessApp, MemoryAss
         assets.put(SPEED, text);
     }
     app.add_plugins(WorldReloadPlugin);
-    app.app_mut().add_config::<Speed>(SPEED);
+    app.app_mut().add_config::<Speed>();
     (app, assets)
 }
 
@@ -194,7 +196,7 @@ fn readers_see_a_change_through_change_detection() {
 fn two_configs_sharing_the_ron_extension_never_mix() {
     let (mut app, assets) = app_with(None, Some(&speed(5.0)));
     assets.put(LABEL, r#"(text: "hello")"#);
-    app.app_mut().add_config::<Label>(LABEL);
+    app.app_mut().add_config::<Label>();
     settle(&mut app, "speed", 1);
     settle(&mut app, "label", 1);
     assert_eq!(live(&app), 5.0);
@@ -213,18 +215,87 @@ fn two_configs_sharing_the_ron_extension_never_mix() {
 #[test]
 fn registering_the_same_config_twice_is_harmless() {
     let (mut app, _assets) = app_with(None, Some(&speed(1.0)));
-    app.app_mut().add_config::<Speed>(SPEED);
+    app.app_mut().add_config::<Speed>();
     settle(&mut app, "speed", 1);
     assert_eq!(app.world().resource::<ConfigRegistry>().entries().len(), 1);
     app.step(5);
     assert_eq!(entry(&app, "speed").applied, 1);
 }
 
+/// A different type that reuses `Speed`'s name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct SpeedTwin {
+    metres_per_second: f32,
+}
+
+impl ConfigAsset for SpeedTwin {
+    const NAME: &'static str = "speed";
+    const PATH: &'static str = "config/twin.ron";
+}
+
+/// A different type that reuses `Speed`'s file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct SpeedShadow {
+    metres_per_second: f32,
+}
+
+impl ConfigAsset for SpeedShadow {
+    const NAME: &'static str = "shadow";
+    const PATH: &'static str = SPEED;
+}
+
 #[test]
-#[should_panic(expected = "registered from two paths")]
-fn registering_one_config_from_two_paths_is_a_bug() {
+#[should_panic(expected = "names and files must be unique")]
+fn two_types_with_one_name_is_a_bug() {
     let (mut app, _assets) = app_with(None, None);
-    app.app_mut().add_config::<Speed>("config/other.ron");
+    app.app_mut().add_config::<SpeedTwin>();
+}
+
+#[test]
+#[should_panic(expected = "names and files must be unique")]
+fn two_types_with_one_file_is_a_bug() {
+    let (mut app, _assets) = app_with(None, None);
+    app.app_mut().add_config::<SpeedShadow>();
+}
+
+/// A config whose safe defaults are not valid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct BadDefaults {
+    level: i32,
+}
+
+impl Default for BadDefaults {
+    fn default() -> Self {
+        Self { level: -1 }
+    }
+}
+
+impl ConfigAsset for BadDefaults {
+    const NAME: &'static str = "bad_defaults";
+    const PATH: &'static str = "config/bad_defaults.ron";
+    fn validate(&self) -> Result<(), Vec<String>> {
+        if self.level >= 0 {
+            Ok(())
+        } else {
+            Err(vec!["level must not be negative".into()])
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "the defaults are invalid")]
+fn invalid_defaults_are_caught_at_registration() {
+    let (mut app, _assets) = app_with(None, None);
+    app.app_mut().add_config::<BadDefaults>();
+}
+
+#[test]
+fn hand_edits_may_start_with_a_byte_order_mark() {
+    let (mut app, _assets) = app_with(None, Some(&speed(1.0)));
+    settle(&mut app, "speed", 1);
+    let text = format!("\u{feff}{}", speed(8.0));
+    ConfigRegistry::apply_text(app.world_mut(), "speed", &text).unwrap();
+    assert_eq!(live(&app), 8.0);
 }
 
 #[test]
@@ -246,7 +317,10 @@ fn hand_edits_apply_live_and_are_validated() {
     assert!(matches!(err, ConfigError::Invalid(_)));
     assert_eq!(world.resource::<Config<Speed>>().metres_per_second, 6.0);
 
-    assert!(ConfigRegistry::apply_text(world, "nope", "()").is_err());
+    assert_eq!(
+        ConfigRegistry::apply_text(world, "nope", "()"),
+        Err(ConfigError::UnknownConfig("nope".into()))
+    );
     let text = ConfigRegistry::current_text(world, "speed").unwrap();
     assert!(text.contains("6.0"), "{text}");
 }

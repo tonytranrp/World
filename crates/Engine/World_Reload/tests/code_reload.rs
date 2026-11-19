@@ -118,6 +118,21 @@ fn many_reloads_never_accumulate_entities() {
 }
 
 #[test]
+fn reloadable_setup_without_the_plugin_still_runs_only_on_reloads() {
+    for_each_seed(|seed| {
+        let mut app = HeadlessApp::new().randomized(seed);
+        app.app_mut()
+            .init_resource::<SetupRuns>()
+            .add_reloadable_systems(|| spawn_rig);
+        app.step(10);
+        assert_eq!(app.world().resource::<SetupRuns>().0, 1, "seed {seed:#x}");
+        reload(&mut app);
+        assert_eq!(app.world().resource::<SetupRuns>().0, 2, "seed {seed:#x}");
+        assert_eq!(count::<Camera>(&mut app), 1, "seed {seed:#x}");
+    });
+}
+
+#[test]
 fn several_reload_messages_in_one_frame_rebuild_once() {
     let mut app = app(0);
     app.step(1);

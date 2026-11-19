@@ -18,9 +18,17 @@ use std::process::{Command, ExitCode};
 /// Set by `xtask hot`: the real linker the shim forwards to.
 pub const REAL_LINKER_ENV: &str = "WORLD_REAL_LINKER";
 
-/// The real linker, when this process was started as the linker shim.
+/// The real linker, when this process was started as the linker shim: the
+/// variable is set (it is inherited by everything dx starts) and the arguments
+/// look like a linker's (`@file`, `/FLAG` or `-flag`), not an xtask command.
 pub fn invoked_as_shim() -> Option<PathBuf> {
-    std::env::var_os(REAL_LINKER_ENV).map(PathBuf::from)
+    let linker = std::env::var_os(REAL_LINKER_ENV)?;
+    let first = std::env::args_os().nth(1)?;
+    looks_like_linker_arg(&first.to_string_lossy()).then(|| PathBuf::from(linker))
+}
+
+fn looks_like_linker_arg(arg: &str) -> bool {
+    arg.starts_with(['@', '/', '-'])
 }
 
 pub fn run(linker: &Path) -> ExitCode {
@@ -34,7 +42,26 @@ pub fn run(linker: &Path) -> ExitCode {
 }
 
 fn forward(linker: &Path, args: Vec<OsString>) -> Result<ExitCode, String> {
-    let mut forwarded = Vec::with_capacity(args.len());
+    // Output passes straight through, so dx sees the linker's own messages.
+    let status = Command::new(linker)
+        .args(linker_args(linker, args)?)
+        .status()
+        .map_err(|e| format!("could not run {}: {e}", linker.display()))?;
+    Ok(match status.code() {
+        Some(0) => ExitCode::SUCCESS,
+        Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        None => ExitCode::FAILURE,
+    })
+}
+
+/// What the real linker is given: `-flavor link` first for rust-lld, then
+/// every argument, with each dx response file replaced by a quoted copy.
+fn linker_args(linker: &Path, args: Vec<OsString>) -> Result<Vec<OsString>, String> {
+    let mut forwarded = Vec::with_capacity(args.len() + 2);
+    if is_rust_lld(linker) {
+        // rust-lld is a generic driver; this makes it MSVC-compatible lld-link.
+        forwarded.extend(["-flavor".into(), "link".into()]);
+    }
     for arg in args {
         let file = arg
             .to_str()
@@ -46,21 +73,7 @@ fn forward(linker: &Path, args: Vec<OsString>) -> Result<ExitCode, String> {
             _ => forwarded.push(arg),
         }
     }
-    // Output passes straight through, so dx sees the linker's own messages.
-    let mut command = Command::new(linker);
-    if is_rust_lld(linker) {
-        // rust-lld is a generic driver; this makes it MSVC-compatible lld-link.
-        command.args(["-flavor", "link"]);
-    }
-    let status = command
-        .args(&forwarded)
-        .status()
-        .map_err(|e| format!("could not run {}: {e}", linker.display()))?;
-    Ok(match status.code() {
-        Some(0) => ExitCode::SUCCESS,
-        Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
-        None => ExitCode::FAILURE,
-    })
+    Ok(forwarded)
 }
 
 fn is_rust_lld(linker: &Path) -> bool {
@@ -129,9 +142,41 @@ mod tests {
     }
 
     #[test]
+    fn rust_lld_gets_the_link_flavor_first_and_response_files_are_swapped() {
+        let dir = std::env::temp_dir().join(format!("xtask_shim_args_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rsp = dir.join("args.txt");
+        std::fs::write(&rsp, r"/LIBPATH:C:\Program Files\x").unwrap();
+        let lld = Path::new("bin").join("rust-lld.exe");
+        let args = vec![
+            OsString::from("/NOLOGO"),
+            OsString::from(format!("@{}", rsp.display())),
+        ];
+        let out = linker_args(&lld, args).unwrap();
+        assert_eq!(out[..3], ["-flavor", "link", "/NOLOGO"].map(OsString::from));
+        assert_eq!(out[3], OsString::from(format!("@{}.quoted", rsp.display())));
+        // Another linker gets no flavor flag.
+        let out = linker_args(&Path::new("bin").join("link.exe"), vec!["/NOLOGO".into()]).unwrap();
+        assert_eq!(out, ["/NOLOGO"].map(OsString::from));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xtask_commands_are_never_mistaken_for_a_link() {
+        assert!(looks_like_linker_arg(r"@C:\tmp\args.txt"));
+        assert!(looks_like_linker_arg("/NOLOGO"));
+        assert!(looks_like_linker_arg("-flavor"));
+        assert!(!looks_like_linker_arg("test"));
+        assert!(!looks_like_linker_arg("hot"));
+    }
+
+    #[test]
     fn rust_lld_is_recognised_by_name() {
-        assert!(is_rust_lld(Path::new(r"C:\rust\bin\rust-lld.exe")));
-        assert!(!is_rust_lld(Path::new(r"C:\VS\link.exe")));
+        // Built with `join` so the test means the same on every OS.
+        let bin = Path::new("toolchain").join("bin");
+        assert!(is_rust_lld(&bin.join("rust-lld.exe")));
+        assert!(is_rust_lld(&bin.join("RUST-LLD.EXE")));
+        assert!(!is_rust_lld(&bin.join("link.exe")));
     }
 
     #[test]

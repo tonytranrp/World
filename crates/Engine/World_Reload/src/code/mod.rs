@@ -53,6 +53,9 @@ impl AppReloadExt for App {
     where
         S: IntoScheduleConfigs<ScheduleSystem, M>,
     {
+        // Install the reload gate here too: without it the rebuild set would
+        // have no `run_if` and the setup would run every frame.
+        build(self);
         let rebuild: ScheduleConfigs<ScheduleSystem> =
             make().into_configs().in_set(ReloadSystems::Rebuild);
         self.add_systems(Startup, make())
@@ -60,8 +63,18 @@ impl AppReloadExt for App {
     }
 }
 
+/// Marks an app whose code-reload path is installed, so it is installed once.
+#[derive(Resource)]
+struct Installed;
+
+/// Installs the code-reload path. Idempotent: called by the plugin and by
+/// every `add_reloadable_systems`.
 pub(crate) fn build(app: &mut App) {
-    app.add_message::<CodeReloaded>()
+    if app.world().contains_resource::<Installed>() {
+        return;
+    }
+    app.insert_resource(Installed)
+        .add_message::<CodeReloaded>()
         .init_resource::<CodeReloadStats>()
         .configure_sets(
             PreUpdate,

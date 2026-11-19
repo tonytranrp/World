@@ -10,6 +10,7 @@
 
 pub mod link_shim;
 mod smoke;
+mod windows;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,38 +40,20 @@ pub fn hot(args: &[String], smoke: bool) -> Result<(), String> {
     let root = workspace_root();
     let wanted = locked_version(&root, SUBSECOND)?;
     check_dx(&wanted)?;
-    remove_stale_fat_archives(&root);
     if smoke {
         return smoke::run(&root, args);
     }
     let mut command = dx_serve(&root, args, true);
+    prepare(&mut command, &root)?;
     process::run(&mut command)
 }
 
-/// dx caches the hot-patch "fat archive" (`libdeps-<hash>.a`) next to the
-/// game, but 0.7.10 reuses it without the list of standard-library rlibs that
-/// belongs with it, so a second run links without std (undefined
-/// `__rustc::rust_panic` and friends). Deleting it makes dx rebuild both.
-pub(super) fn remove_stale_fat_archives(root: &Path) {
-    let Ok(target_dirs) = std::fs::read_dir(root.join("target")) else {
-        return;
-    };
-    for profile_dir in target_dirs
-        .flatten()
-        .filter_map(|triple| std::fs::read_dir(triple.path()).ok())
-        .flatten()
-        .flatten()
-    {
-        let Ok(files) = std::fs::read_dir(profile_dir.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let name = file.file_name().to_string_lossy().into_owned();
-            if name.starts_with("libdeps-") && name.ends_with(".a") {
-                let _ = std::fs::remove_file(file.path());
-            }
-        }
+/// Platform workarounds that `dx serve` needs before it starts.
+pub(super) fn prepare(command: &mut Command, root: &Path) -> Result<(), String> {
+    if cfg!(windows) {
+        windows::prepare(command, root)?;
     }
+    Ok(())
 }
 
 /// The `dx serve` command line shared by `hot` and the smoke test.
@@ -99,140 +82,11 @@ pub(super) fn dx_serve(root: &Path, args: &[String], interactive: bool) -> Comma
     if cfg!(windows) {
         // Keep a console so the game's log reaches dx, and the smoke test.
         command.args(["--windows-subsystem", "CONSOLE"]);
-        // dx 0.7.10 cannot drive rust-lld, which .cargo/config.toml selects,
-        // and passes MSVC's link.exe an unquoted response file. So the linker
-        // dx sees is this program acting as a shim (see `link_shim`), which
-        // quotes the arguments and runs MSVC's linker by full path: Git for
-        // Windows ships an unrelated `link.exe` that PATH would find first.
-        let shim = std::env::current_exe().expect("xtask knows its own path");
-        // dx also runs the linker itself (the hot-patch "fat binary"), outside
-        // rustc, so it needs the Visual Studio environment (LIB, LIBPATH, PATH)
-        // that rustc would otherwise provide.
-        command.envs(msvc_environment());
-        command
-            .env(
-                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
-                short_path(&shim).unwrap_or(shim),
-            )
-            .env(link_shim::REAL_LINKER_ENV, real_linker());
     }
     if !args.is_empty() {
         command.args(["--args", &args.join(" ")]);
     }
     command
-}
-
-/// The linker the shim forwards to: the toolchain's own `rust-lld` (used as
-/// `lld-link`), because dx's hot-patch "fat binary" bundles dependencies in a
-/// GNU-format archive that MSVC's `link.exe` rejects (LNK4003). Falls back to
-/// MSVC's linker if the toolchain has no `rust-lld`.
-fn real_linker() -> PathBuf {
-    let sysroot = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .ok()
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    sysroot
-        .map(|root| root.join(r"lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"))
-        .filter(|lld| lld.exists())
-        .unwrap_or_else(msvc_linker)
-}
-
-/// The full path of MSVC's `link.exe`, found with Visual Studio's `vswhere`.
-/// Falls back to the bare name, with a warning, when Visual Studio is not found.
-fn msvc_linker() -> PathBuf {
-    let vswhere =
-        Path::new(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
-    let found = Command::new(vswhere)
-        .args(["-latest", "-products", "*", "-find"])
-        .arg(r"VC\Tools\MSVC\**\bin\Hostx64\x64\link.exe")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(PathBuf::from)
-        })
-        .filter(|p| p.exists());
-    match found {
-        Some(path) => path,
-        None => {
-            eprintln!("warning: MSVC link.exe not found with vswhere; relying on PATH");
-            PathBuf::from("link.exe")
-        }
-    }
-}
-
-/// The variables `vcvars64.bat` sets: what a "Developer Command Prompt" has.
-/// Empty, with a warning, when Visual Studio is not found.
-fn msvc_environment() -> Vec<(String, String)> {
-    let vswhere =
-        Path::new(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
-    let vcvars = Command::new(vswhere)
-        .args(["-latest", "-products", "*", "-find"])
-        .arg(r"VC\Auxiliary\Build\vcvars64.bat")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(PathBuf::from)
-        })
-        .filter(|p| p.exists());
-    let Some(vcvars) = vcvars else {
-        eprintln!("warning: vcvars64.bat not found; dx may fail to link (LNK1104)");
-        return Vec::new();
-    };
-    let mut cmd = Command::new("cmd");
-    let line = format!("/C call \"{}\" >nul && set", vcvars.display());
-    // cmd does not understand Rust's `\"` escaping; hand it the line verbatim.
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::raw_arg(&mut cmd, line);
-    #[cfg(not(windows))]
-    cmd.arg(line);
-    let output = cmd.output();
-    match output {
-        Ok(o) if o.status.success() => parse_environment(&String::from_utf8_lossy(&o.stdout)),
-        _ => {
-            eprintln!("warning: running vcvars64.bat failed; dx may fail to link");
-            Vec::new()
-        }
-    }
-}
-
-/// `NAME=value` lines, as printed by `set`.
-fn parse_environment(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(name, _)| !name.is_empty())
-        .map(|(name, value)| (name.to_owned(), value.trim_end_matches('\r').to_owned()))
-        .collect()
-}
-
-/// The 8.3 short form of an existing path (`C:\PROGRA~1\...`), which has no
-/// spaces. `None` when short names are disabled on the volume.
-fn short_path(path: &Path) -> Option<PathBuf> {
-    let script = format!(
-        "(New-Object -ComObject Scripting.FileSystemObject).GetFile('{}').ShortPath",
-        path.display().to_string().replace('\'', "''")
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .ok()?;
-    let short = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if short.is_empty() || short.contains(' ') {
-        eprintln!(
-            "warning: no space-free short path for {}; dx may fail to link",
-            path.display()
-        );
-        return None;
-    }
-    Some(PathBuf::from(short))
 }
 
 /// The version of `package` recorded in Cargo.lock.
@@ -318,45 +172,6 @@ mod tests {
         assert!(has("--hot-patch") && has("--no-default-features") && has("hotpatch"));
         let pos = args.iter().position(|a| a == "--args").unwrap();
         assert_eq!(args[pos + 1], "--mac-floor");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_real_linker_is_the_toolchains_rust_lld() {
-        let linker = real_linker();
-        assert!(linker.ends_with("rust-lld.exe"), "{}", linker.display());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_msvc_linker_is_found_by_full_path() {
-        let linker = msvc_linker();
-        assert!(linker.is_absolute(), "{}", linker.display());
-        assert!(linker.exists());
-        assert!(linker.ends_with("x64/link.exe") || linker.ends_with(r"x64\link.exe"));
-    }
-
-    #[test]
-    fn set_output_is_parsed_into_variables() {
-        let vars = parse_environment("LIB=C:\\a;C:\\b\r\nPath=C:\\x=y\r\n=C:=C:\\\r\n");
-        assert_eq!(
-            vars,
-            [
-                ("LIB".to_owned(), "C:\\a;C:\\b".to_owned()),
-                ("Path".to_owned(), "C:\\x=y".to_owned())
-            ]
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_visual_studio_environment_provides_the_library_paths() {
-        let vars = msvc_environment();
-        let lib = vars.iter().find(|(k, _)| k.eq_ignore_ascii_case("LIB"));
-        assert!(
-            lib.is_some_and(|(_, v)| v.contains("um\\x64")),
-            "no Windows SDK libs in LIB"
-        );
     }
 
     #[test]

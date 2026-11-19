@@ -24,6 +24,7 @@ struct Gravity {
 
 impl ConfigAsset for Gravity {
     const NAME: &'static str = "gravity";
+    const PATH: &'static str = PATH;
     fn validate(&self) -> Result<(), Vec<String>> {
         if (0.0..=100.0).contains(&self.metres_per_second_squared) {
             Ok(())
@@ -43,7 +44,7 @@ fn app(disk: &DiskAssets) -> HeadlessApp {
     let mut app = HeadlessApp::new();
     app.add_plugins(disk.plugin())
         .add_plugins(WorldReloadPlugin);
-    app.app_mut().add_config::<Gravity>(PATH);
+    app.app_mut().add_config::<Gravity>();
     app
 }
 

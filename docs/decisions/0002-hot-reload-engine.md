@@ -42,21 +42,24 @@ found:
 - **Two ways to run.** `cargo xtask dev` is `cargo run` with the `dev` feature:
   dynamic linking, asset, shader and config hot reload, developer panels.
   `cargo xtask hot` is `dx serve --hot-patch` with the `hotpatch` feature and no
-  dynamic linking. On Windows, dx 0.7.10 needed four workarounds, all inside
-  `tools/Xtask/src/hot`, each found by a failed link:
-  1. dx cannot drive the `rust-lld` that `.cargo/config.toml` selects, and Git
-     for Windows puts an unrelated GNU `link.exe` first on PATH.
-  2. dx hands the linker an unquoted response file, so any argument with a space
-     (`/LIBPATH:C:\Program Files\...`) breaks it (LNK1104). xtask names itself as
-     the linker; as a shim it quotes dx's response files and forwards to the
-     toolchain's `rust-lld -flavor link`. `lld-link` is required anyway, because
-     dx's "fat binary" archive is GNU-format, which `link.exe` rejects (LNK4003).
-  3. dx runs the fat-binary link itself, outside rustc, with no `LIB` paths
-     (`ntdll.lib` not found), so dx starts inside the variables `vcvars64.bat` sets.
-  4. dx reuses its cached fat archive without the standard-library rlibs that
+  dynamic linking. It refuses to start when the installed `dx` does not match
+  `subsecond` in `Cargo.lock`. On Windows, dx 0.7.10 needed three workarounds,
+  all in `tools/Xtask/src/hot/windows.rs` and `link_shim.rs`, each found by a
+  failed link (the first attempts also hit Git for Windows' unrelated GNU
+  `link.exe` on PATH, which the shim's full paths avoid):
+  1. dx cannot be handed `rust-lld` by name (it picks how to drive a linker
+     from the file name) and passes linkers an unquoted response file, so any
+     argument with a space (`/LIBPATH:C:\Program Files\...`) breaks the link
+     (LNK1104). xtask names itself as the linker; as a shim it quotes dx's
+     response files and forwards to the toolchain's `rust-lld -flavor link`.
+     `lld-link` is required anyway, because dx's "fat binary" archive is
+     GNU-format, which `link.exe` rejects (LNK4003).
+  2. dx runs the fat-binary link itself, outside rustc, with no `LIB` paths
+     (`ntdll.lib` not found), so dx starts with the variables `vcvars64.bat`
+     adds (read as UTF-16; only the changed ones are passed on).
+  3. dx reuses its cached fat archive without the standard-library rlibs that
      belong with it (undefined `__rustc::rust_panic`), so xtask deletes the
-     cached archive before every start. It refuses to start when
-  the installed `dx` does not match `subsecond` in `Cargo.lock`.
+     cached archive before every start.
 - **Developer panels in `World_Game/ui/dev`**, behind the `dev_tools` feature:
   F1 entity inspector, F2 config editor (edits the file text so comments
   survive; Apply is live, Save writes atomically and the reload confirms it;

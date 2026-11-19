@@ -1,6 +1,6 @@
 //! Typed, validated, hot-reloaded configs.
 //!
-//! Lifecycle of one config `T` registered at `config/x.ron`:
+//! Lifecycle of one config `T` (file `T::PATH`):
 //!
 //! 1. `Config<T>` holds `T::default()` from the start, so readers never wait.
 //! 2. At startup the file is loaded through [`ConfigLoader`], which parses and
@@ -9,6 +9,11 @@
 //! 3. With a file watcher on, each save reloads the file the same way. A bad
 //!    save is rejected and the last good value stays live.
 //! 4. The developer panel may apply or save text through the registry.
+//!
+//! A rejected reload is also logged once more by Bevy itself ("no loader for
+//! extension ron"): after a typed reload fails it retries untyped, and config
+//! loaders register no extension. The `config <name>: rejected` line is the one
+//! that explains why.
 
 mod loader;
 mod parse;
@@ -29,10 +34,11 @@ pub use registry::{ConfigEntry, ConfigOrigin, ConfigRegistry, SaveError};
 /// Foundation types can implement it without Bevy.
 pub use world_core::ConfigAsset;
 
-/// The live value of a config. Systems read it like any resource and can use
-/// change detection to react to reloads.
+/// The live value of a config. Systems read it like any resource and use
+/// change detection to react to reloads. It can only be changed through a
+/// validated load or the registry, never by writing to it directly.
 #[derive(Resource, Debug, Default)]
-pub struct Config<T: ConfigAsset>(pub T);
+pub struct Config<T: ConfigAsset>(T);
 
 impl<T: ConfigAsset> Deref for Config<T> {
     type Target = T;
@@ -43,7 +49,7 @@ impl<T: ConfigAsset> Deref for Config<T> {
 
 /// A config as an asset: what the loader produces from one file.
 #[derive(Asset, Debug)]
-pub struct ConfigFile<T: ConfigAsset>(pub T);
+pub(crate) struct ConfigFile<T: ConfigAsset>(pub T);
 
 impl<T: ConfigAsset> TypePath for ConfigFile<T> {
     fn type_path() -> &'static str {
@@ -60,10 +66,7 @@ impl<T: ConfigAsset> TypePath for ConfigFile<T> {
 }
 
 #[derive(Resource)]
-struct ConfigHandle<T: ConfigAsset> {
-    path: String,
-    handle: Option<Handle<ConfigFile<T>>>,
-}
+struct ConfigHandle<T: ConfigAsset>(Handle<ConfigFile<T>>);
 
 /// Configs are applied in `PreUpdate`, so `Update` systems see a reload in the
 /// same frame it lands.
@@ -71,34 +74,43 @@ struct ConfigHandle<T: ConfigAsset> {
 pub struct ConfigSystems;
 
 pub trait AppConfigExt {
-    /// Registers config `T`, loaded from `path` under the asset root. Safe to
-    /// call from several plugins: the second call with the same path is a no-op.
-    fn add_config<T: ConfigAsset>(&mut self, path: &str) -> &mut Self;
+    /// Registers config `T`, loaded from `T::PATH` under the asset root. Safe
+    /// to call from several plugins: only the first call does anything.
+    ///
+    /// # Panics
+    /// When `T::default()` fails `T::validate()`: the safe defaults must be valid.
+    fn add_config<T: ConfigAsset>(&mut self) -> &mut Self;
 }
 
 impl AppConfigExt for App {
-    fn add_config<T: ConfigAsset>(&mut self, path: &str) -> &mut Self {
+    fn add_config<T: ConfigAsset>(&mut self) -> &mut Self {
         if !self.world().contains_resource::<ConfigRegistry>() {
             self.init_resource::<ConfigRegistry>();
         }
         let first = self
             .world_mut()
             .resource_mut::<ConfigRegistry>()
-            .register::<T>(path);
+            .register::<T>();
         if !first {
             return self;
+        }
+        if let Err(problems) = T::default().validate() {
+            panic!(
+                "config {:?}: the defaults are invalid: {problems:?}",
+                T::NAME
+            );
         }
         self.init_asset::<ConfigFile<T>>()
             .register_asset_loader(ConfigLoader::<T>::default())
             .insert_resource(Config::<T>::default())
-            .insert_resource(ConfigHandle::<T> {
-                path: path.to_owned(),
-                handle: None,
-            })
             .add_systems(Startup, start_loading::<T>)
             .add_systems(
                 PreUpdate,
-                (apply_loaded::<T>, record_failures::<T>).in_set(ConfigSystems),
+                // Failures after applies: if a good and a bad load land in the
+                // same frame, the status ends up showing the rejection.
+                (apply_loaded::<T>, record_failures::<T>)
+                    .chain()
+                    .in_set(ConfigSystems),
             )
     }
 }
@@ -120,34 +132,36 @@ pub(crate) fn build(app: &mut App) {
     }
 }
 
-fn start_loading<T: ConfigAsset>(server: Res<AssetServer>, mut config: ResMut<ConfigHandle<T>>) {
-    let handle = server.load::<ConfigFile<T>>(config.path.clone());
-    config.handle = Some(handle);
+fn start_loading<T: ConfigAsset>(mut commands: Commands, server: Res<AssetServer>) {
+    commands.insert_resource(ConfigHandle(server.load::<ConfigFile<T>>(T::PATH)));
 }
 
 fn apply_loaded<T: ConfigAsset>(
     mut events: MessageReader<AssetEvent<ConfigFile<T>>>,
-    handle: Res<ConfigHandle<T>>,
+    handle: Option<Res<ConfigHandle<T>>>,
     files: Res<Assets<ConfigFile<T>>>,
     mut config: ResMut<Config<T>>,
     mut registry: ResMut<ConfigRegistry>,
 ) {
-    let Some(id) = handle.handle.as_ref().map(Handle::id) else {
+    // Read every event, so none is left over to be applied again next frame.
+    let changed = events
+        .read()
+        .filter(|event| match (event, &handle) {
+            (AssetEvent::Added { id } | AssetEvent::Modified { id }, Some(handle)) => {
+                *id == handle.0.id()
+            }
+            _ => false,
+        })
+        .count()
+        > 0;
+    let (true, Some(handle)) = (changed, handle) else {
         return;
     };
-    // Several events can arrive in one frame; apply the newest value once.
-    let changed = events.read().any(|event| match event {
-        AssetEvent::Added { id: e } | AssetEvent::Modified { id: e } => *e == id,
-        _ => false,
-    });
-    if !changed {
-        return;
-    }
-    if let Some(file) = files.get(id) {
+    if let Some(file) = files.get(handle.0.id()) {
         config.0 = file.0.clone();
         registry.record_applied(T::NAME, ConfigOrigin::File);
         let applied = registry.get(T::NAME).map_or(0, |e| e.applied);
-        info!("config {}: applied {} (#{applied})", T::NAME, handle.path);
+        info!("config {}: applied {} (#{applied})", T::NAME, T::PATH);
     }
 }
 

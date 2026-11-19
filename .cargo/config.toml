@@ -3,8 +3,9 @@
 xtask = "run --quiet --package xtask --"
 
 # Rust's bundled LLD links much faster than MSVC link.exe, which matters most for
-# the many small relinks of an incremental dev build. `cargo xtask hot` overrides
-# it back to link.exe, because dx 0.7.10 cannot drive rust-lld (Dioxus #4694).
+# the many small relinks of an incremental dev build. `cargo xtask hot` replaces
+# it with xtask's own link shim, which still ends in rust-lld; dx 0.7.10 cannot
+# be handed rust-lld directly (Dioxus #4694, see decision 0002).
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
 

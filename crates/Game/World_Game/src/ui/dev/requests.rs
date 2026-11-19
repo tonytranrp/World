@@ -33,12 +33,17 @@ pub(crate) struct ConfigPanel {
 
 pub(crate) fn hotkeys(
     keys: Option<Res<ButtonInput<KeyCode>>>,
+    egui: Option<Res<bevy_egui::input::EguiWantsInput>>,
     mut panel: ResMut<ConfigPanel>,
     mut requests: ResMut<PanelRequests>,
 ) {
     let Some(keys) = keys else {
         return;
     };
+    // Typing in the config editor must not toggle panels or rebuild the game.
+    if egui.is_some_and(|e| e.wants_any_keyboard_input()) {
+        return;
+    }
     if keys.just_pressed(KeyCode::F2) {
         panel.open = !panel.open;
     }
@@ -60,6 +65,10 @@ pub(crate) fn carry_out(world: &mut World) {
     let requests = std::mem::take(&mut world.resource_mut::<PanelRequests>().0);
     for request in requests {
         let message = match request {
+            // Clicking the config already open keeps any unsaved editor text.
+            PanelRequest::Open(name) if world.resource::<ConfigPanel>().selected == Some(name) => {
+                None
+            }
             PanelRequest::Open(name) => {
                 let text = editor_text(world, name);
                 let mut panel = world.resource_mut::<ConfigPanel>();
@@ -112,14 +121,21 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Fov {
         degrees: f32,
     }
 
+    impl Default for Fov {
+        fn default() -> Self {
+            Self { degrees: 60.0 }
+        }
+    }
+
     impl ConfigAsset for Fov {
         const NAME: &'static str = "fov";
+        const PATH: &'static str = PATH;
         fn validate(&self) -> Result<(), Vec<String>> {
             if (30.0..=120.0).contains(&self.degrees) {
                 Ok(())
@@ -139,7 +155,7 @@ mod tests {
         app.add_plugins(disk.plugin())
             .add_plugins(WorldReloadPlugin)
             .add_plugins(super::super::DevToolsPlugin);
-        app.app_mut().add_config::<Fov>(PATH);
+        app.app_mut().add_config::<Fov>();
         app.run_for(WAIT, |w| w.resource::<Config<Fov>>().degrees == 70.0)
             .expect("the config never loaded");
         app

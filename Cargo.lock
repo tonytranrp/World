@@ -7751,13 +7751,11 @@ dependencies = [
 name = "world_reload"
 version = "0.1.0"
 dependencies = [
- "async-channel",
  "bevy",
  "proptest",
  "ron",
  "serde",
  "world_core",
- "world_testkit",
  "world_testkit_bevy",
 ]
 

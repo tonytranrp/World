@@ -10,4 +10,4 @@ mod table;
 
 pub use def::{MaterialDef, Rgb};
 pub use id::MaterialId;
-pub use table::{MATERIALS_CONFIG_PATH, MaterialError, MaterialErrors, MaterialTable};
+pub use table::{MaterialError, MaterialErrors, MaterialTable};

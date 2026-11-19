@@ -17,10 +17,8 @@ serde.workspace = true
 ron.workspace = true
 
 [dev-dependencies]
-world_testkit.workspace = true
 world_testkit_bevy.workspace = true
 proptest.workspace = true
-async-channel = "2.5"
 
 [lints]
 workspace = true

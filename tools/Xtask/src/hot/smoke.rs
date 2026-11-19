@@ -6,8 +6,11 @@
 //! 3. Wait for the patched value in the log. It can only appear if dx rebuilt
 //!    the patch, the running game loaded it, Bevy reported `HotPatched`, and
 //!    World_Reload re-ran setup with the new code.
-//! 4. Restore the file (also on failure or Ctrl-C-free early exit) and stop
-//!    the game. Everything dx printed is kept in `target/hot-smoke.log`.
+//! 4. Restore the file (also when the test fails) and stop the game.
+//!    Everything dx printed is kept in `target/hot-smoke.log`.
+//!
+//! If xtask itself is killed (Ctrl-C, a cancelled CI job), the restore cannot
+//! run; the next run notices a leftover probe value and puts `alpha` back.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +18,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::dx_serve;
+use super::{dx_serve, prepare};
 
 const PROBE_FILE: &str = "app/src/startup/hot_probe.rs";
 const PROBE_LINE: &str = "    \"alpha\"";
@@ -24,6 +27,7 @@ const FIRST_BUILD: Duration = Duration::from_secs(40 * 60);
 const PATCH: Duration = Duration::from_secs(5 * 60);
 
 pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
+    heal_leftover_probe(&root.join(PROBE_FILE))?;
     let probe = Restore::capture(root.join(PROBE_FILE))?;
     if !probe.original.contains(PROBE_LINE) {
         return Err(format!(
@@ -35,6 +39,13 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut log =
         std::fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
     let mut command = dx_serve(root, args, false);
+    prepare(&mut command, root)?;
+    #[cfg(unix)]
+    {
+        // Its own process group, so stopping it also stops the game dx starts.
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -154,6 +165,36 @@ fn wait_for(
     }
 }
 
+/// A run that was killed mid-test leaves `"beta<digits>"` in the probe. Put
+/// `"alpha"` back so the file is never committed edited by accident.
+fn heal_leftover_probe(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let healed = heal(&text);
+    if healed != text {
+        std::fs::write(path, healed).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("restored the probe left edited by an interrupted run");
+    }
+    Ok(())
+}
+
+fn heal(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            let digits = body
+                .trim()
+                .strip_prefix("\"beta")
+                .and_then(|rest| rest.strip_suffix('"'));
+            if digits.is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) {
+                format!("{PROBE_LINE}{ending}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
+}
+
 /// Puts the probe file back exactly as it was, however the test ends.
 struct Restore {
     path: PathBuf,
@@ -181,13 +222,69 @@ struct Running(Child);
 
 impl Drop for Running {
     fn drop(&mut self) {
+        // dx starts the game as a child process; take the whole tree down.
         if cfg!(windows) {
-            // dx starts the game as a child process; take the whole tree down.
             let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
+                .output();
+        } else {
+            // The child leads its own process group (see `run`).
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{}", self.0.id())])
                 .output();
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_leftover_probe_value_is_healed_and_nothing_else_changes() {
+        let edited = "fn probe_value() -> &'static str {\n    \"beta123456\"\n}\n";
+        let clean = "fn probe_value() -> &'static str {\n    \"alpha\"\n}\n";
+        assert_eq!(heal(edited), clean);
+        assert_eq!(heal(clean), clean);
+        // Windows line endings survive, and other strings are left alone.
+        assert_eq!(heal("    \"beta42\"\r\nx\r\n"), "    \"alpha\"\r\nx\r\n");
+        assert_eq!(heal("    \"betamax\"\n"), "    \"betamax\"\n");
+    }
+
+    #[test]
+    fn waiting_stops_at_a_failed_build_instead_of_the_timeout() {
+        let (sender, lines) = channel();
+        sender.send("compiling...".to_owned()).unwrap();
+        sender
+            .send("ERROR Build failed: linker error".to_owned())
+            .unwrap();
+        let mut log = tempfile_log();
+        let result = wait_for(&lines, &mut log, Duration::from_secs(60), |l| {
+            l.contains("never")
+        });
+        assert!(result.unwrap_err().contains("failed build"));
+    }
+
+    #[test]
+    fn waiting_succeeds_on_the_wanted_line() {
+        let (sender, lines) = channel();
+        sender.send("hot probe: alpha".to_owned()).unwrap();
+        let mut log = tempfile_log();
+        assert!(
+            wait_for(&lines, &mut log, Duration::from_secs(5), |l| l
+                .contains("alpha"))
+            .is_ok()
+        );
+    }
+
+    fn tempfile_log() -> std::fs::File {
+        let path = std::env::temp_dir().join(format!(
+            "xtask_smoke_{}_{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::File::create(path).unwrap()
     }
 }

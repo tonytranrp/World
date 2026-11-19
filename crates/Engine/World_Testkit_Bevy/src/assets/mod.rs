@@ -96,6 +96,12 @@ impl DiskAssets {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("could not create a temporary asset folder");
+        // macOS's temp folder (/var/...) is a symlink to /private/var/...; the file
+        // watcher reports resolved paths, and Bevy 0.20.1 panics when they do not
+        // start with the root it was given. Resolve it first. Not on Windows, where
+        // canonical paths gain a `\\?\` prefix that the watcher's paths lack.
+        #[cfg(unix)]
+        let root = root.canonicalize().expect("the folder was just created");
         Self { root }
     }
 

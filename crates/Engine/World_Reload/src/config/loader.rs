@@ -50,11 +50,7 @@ impl<T: ConfigAsset> AssetLoader for ConfigLoader<T> {
         reader
             .read_to_end(&mut bytes)
             .await
-            .map_err(|e| ConfigError::Parse {
-                line: 0,
-                column: 0,
-                message: format!("could not read the file: {e}"),
-            })?;
+            .map_err(|e| ConfigError::Io(e.to_string()))?;
         parse_config_bytes::<T>(&bytes).map(ConfigFile)
     }
 }
