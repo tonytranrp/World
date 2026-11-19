@@ -77,13 +77,19 @@ fn seeds() -> Vec<(&'static str, VoxelTree)> {
         ("mixed_5", 5),
         ("mixed_17", 17),
     ] {
-        seeds.push((name, mixed(VoxelPos::new(-4, -4, -4), 8, count, u64::from(count))));
+        seeds.push((
+            name,
+            mixed(VoxelPos::new(-4, -4, -4), 8, count, u64::from(count)),
+        ));
     }
 
     // Solid ground with a crater: uniform children next to split ones.
     let mut carved = VoxelTree::new();
     carved
-        .fill_box(VoxelBox::from_min_size(VoxelPos::ORIGIN, [64; 3]), MaterialId(1))
+        .fill_box(
+            VoxelBox::from_min_size(VoxelPos::ORIGIN, [64; 3]),
+            MaterialId(1),
+        )
         .unwrap();
     for z in -6i32..=6 {
         for y in -6i32..=6 {
