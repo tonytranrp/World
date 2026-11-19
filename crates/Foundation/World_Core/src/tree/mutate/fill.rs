@@ -1,11 +1,12 @@
 //! Box fills.
 
-use super::{Writer, branch};
+use super::{Writer, branch, brick};
 use crate::consts::TREE_BRANCH_DIM;
 use crate::coords::{VoxelBox, VoxelPos, path};
 use crate::edit::EditError;
 use crate::material::MaterialId;
-use crate::tree::node::{Child, NodeKind, leaf};
+use crate::tree::node::Child;
+use crate::tree::node::leaf::{self, PackedLeaf, Record};
 
 /// A non-empty box inside the world, in world-local coordinates: every `p`
 /// with `lo <= p < hi` on each axis.
@@ -78,29 +79,51 @@ impl Writer<'_> {
             return Some(target);
         }
         let existing = self.existing(child);
+        let span = path::child_span(level);
+        let child_origin = |slot: u32| {
+            let offset = path::slot_offset(slot);
+            [0, 1, 2].map(|a| origin[a] + offset[a] * span)
+        };
 
-        if level == 0 {
-            let mut voxels = self.leaf_voxels(child);
-            let before = voxels;
-            for slot in region.slots(origin, 1) {
-                voxels[slot as usize] = material;
+        if level == 1 {
+            let mut records = self.records(child);
+            let mut changed = false;
+            for slot in region.slots(origin, span) {
+                let at = child_origin(slot);
+                let old = records[slot as usize];
+                let new = if region.covers(at, span) {
+                    let filled = Record::filled(material);
+                    if old == filled {
+                        continue;
+                    }
+                    PackedLeaf::Inline(filled)
+                } else {
+                    let mut voxels = self.leaf_voxels(old);
+                    let before = voxels;
+                    for voxel in region.slots(at, 1) {
+                        voxels[voxel as usize] = material;
+                    }
+                    if voxels == before {
+                        continue;
+                    }
+                    leaf::encode(&voxels)
+                };
+                records[slot as usize] = self.store_leaf(old, new);
+                changed = true;
             }
-            return (voxels != before)
-                .then(|| self.write(existing, NodeKind::Leaf, leaf::encode(&voxels)));
+            return changed.then(|| self.write(existing, 1, brick::pack(&records)));
         }
 
-        let span = path::child_span(level);
         let mut children = self.children(child);
         let mut changed = false;
         for slot in region.slots(origin, span) {
-            let offset = path::slot_offset(slot);
-            let at = [0, 1, 2].map(|a| origin[a] + offset[a] * span);
+            let at = child_origin(slot);
             if let Some(new) = self.fill(children[slot as usize], level - 1, at, region, material) {
                 children[slot as usize] = new;
                 changed = true;
             }
         }
-        changed.then(|| self.write(existing, NodeKind::Branch, branch::pack(&children)))
+        changed.then(|| self.write(existing, level, branch::pack(&children)))
     }
 }
 

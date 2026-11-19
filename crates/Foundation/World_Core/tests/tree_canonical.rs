@@ -139,10 +139,12 @@ fn filling_a_whole_node_region_makes_a_uniform_child() {
                 "level {level} at {corner:?}: {child:?}"
             );
             let path_len = (TREE_DEPTH - level) as usize;
+            // One word per child, except that a leaf-sized child is a
+            // three-word record in its level-1 parent.
             let expected = NodeCounts {
                 branches: path_len,
                 leaves: 0,
-                words: path_len,
+                words: path_len + if level == 1 { 2 } else { 0 },
             };
             assert_eq!(check_canonical(&tree), Ok(expected));
             assert_eq!(NodeCounts::from(tree.stats()), expected);

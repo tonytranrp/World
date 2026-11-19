@@ -50,7 +50,9 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                     "a branch of one material must be a uniform child"
                 );
                 found.0 += 1;
-                found.2 += children.len();
+                // One child word each, or one leaf record each at level 1.
+                let per_child = if level == 1 { RECORD_WORDS } else { 1 };
+                found.2 += per_child * children.len();
                 for (slot, child) in children {
                     assert!(b.mask() & (1 << slot) != 0);
                     assert!(!matches!(child, NodeRef::Air));
@@ -76,7 +78,10 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                 let indices = index_words(solid, l.index_bits());
                 assert_eq!(l.index_words().len(), indices);
                 found.1 += 1;
-                found.2 += palette_words(palette.len()) + indices;
+                // One material lives in the record; more need a palette block.
+                if palette.len() > 1 {
+                    found.2 += 1 + palette_words(palette.len()) + indices;
+                }
             }
         }
     }
@@ -253,10 +258,9 @@ fn clearing_a_region_returns_every_node_and_word() {
     assert!(matches!(tree.root(), NodeRef::Air));
     assert_eq!(live(&tree), (0, 0, 0));
     let cleared = tree.stats();
-    assert_eq!(
-        cleared.free_nodes,
-        grown.branches + grown.leaves + grown.free_nodes
-    );
+    // Leaves live in their parents' blocks, so only branches were nodes.
+    assert_eq!(cleared.free_nodes, grown.branches + grown.free_nodes);
+    assert_eq!(cleared.free_words, grown.words + grown.free_words);
     assert_eq!(cleared.bytes, grown.bytes, "freeing keeps the pages");
 }
 
@@ -388,6 +392,132 @@ fn leaf_palettes_grow_and_shrink_through_every_width() {
     assert_eq!(leaf_bits(&tree), Some(0));
     tree.set(slot_pos(0), MaterialId::AIR).unwrap();
     assert_eq!(live(&tree), (0, 0, 0));
+}
+
+/// Bytes of live storage: 16 per node and 4 per word.
+fn live_bytes(tree: &VoxelTree) -> usize {
+    let s = tree.stats();
+    s.branches * size_of::<Node>() + s.words * size_of::<u32>()
+}
+
+#[test]
+fn a_single_material_leaf_is_one_three_word_record() {
+    let mut tree = VoxelTree::new();
+    tree.set(pos(0, 0, 0), STONE).unwrap();
+    let one = live_bytes(&tree);
+    // A second leaf in the same brick adds only its record.
+    tree.set(pos(4, 0, 0), STONE).unwrap();
+    tree.set(pos(5, 1, 0), STONE).unwrap();
+    assert_eq!(live_bytes(&tree) - one, 12);
+    assert_eq!(live(&tree), (9, 2, 8 + 2 * RECORD_WORDS));
+
+    let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
+        panic!("a partly solid leaf");
+    };
+    assert_eq!(l.palette().collect::<Vec<_>>(), [STONE]);
+    assert_eq!((l.index_bits(), l.index_words()), (0, &[][..]));
+    assert_eq!(l.voxel(path::child_slot([1, 1, 0], 0)), STONE);
+    assert_eq!(l.voxel(1), MaterialId::AIR);
+    assert_sound(&tree);
+}
+
+#[test]
+fn a_two_material_leaf_adds_a_palette_block() {
+    let mut tree = VoxelTree::new();
+    tree.set(pos(0, 0, 0), STONE).unwrap();
+    let one = live_bytes(&tree);
+    // 32 solid voxels of two materials: a record plus a header, one palette
+    // word and one word of 1-bit indices.
+    for i in 0..32 {
+        let m = if i % 3 == 0 { DIRT } else { STONE };
+        tree.set(pos(4 + i % 4, i / 4 % 4, i / 16), m).unwrap();
+    }
+    assert_eq!(live_bytes(&tree) - one, 4 * (RECORD_WORDS + 3));
+    let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
+        panic!("a mixed leaf");
+    };
+    assert_eq!(l.palette().collect::<Vec<_>>(), [STONE, DIRT]);
+    assert_eq!((l.index_bits(), l.index_words().len()), (1, 1));
+    assert_sound(&tree);
+
+    // Down to one material, the palette block is freed again.
+    for i in (0..32).step_by(3) {
+        tree.set(pos(4 + i % 4, i / 4 % 4, i / 16), STONE).unwrap();
+    }
+    assert_eq!(live_bytes(&tree) - one, 4 * RECORD_WORDS);
+    assert_sound(&tree);
+}
+
+/// The leaf-sized child of the tree that holds `p`.
+fn brick_child(tree: &VoxelTree, p: VoxelPos) -> NodeRef<'_> {
+    let local = path::world_local(p).unwrap();
+    let mut node = tree.root();
+    for level in (1..TREE_DEPTH).rev() {
+        let NodeRef::Branch(b) = node else {
+            return node;
+        };
+        node = b.child(path::child_slot(local, level));
+    }
+    node
+}
+
+#[test]
+fn apply_lets_the_last_edit_of_a_voxel_win_in_any_order() {
+    let a = pos(1, 1, 1);
+    let b = pos(-300, 70, 2);
+    let batch = [
+        Edit::new(b, DIRT),
+        Edit::new(a, STONE),
+        Edit::new(b, MaterialId::AIR),
+        Edit::new(a, DIRT),
+        Edit::new(b, STONE),
+        Edit::new(a, MaterialId(3)),
+    ];
+    let mut tree = VoxelTree::new();
+    let dirty = tree.apply(&batch).unwrap();
+    assert_eq!((tree.get(a), tree.get(b)), (MaterialId(3), STONE));
+    assert_eq!(dirty.as_slice(), {
+        let mut bricks = [a.brick(), b.brick()];
+        bricks.sort();
+        bricks
+    });
+    let mut sequential = VoxelTree::new();
+    for e in batch {
+        sequential.set(e.pos, e.material).unwrap();
+    }
+    assert!(same_content(&tree, &sequential));
+    assert_eq!(live(&tree), live(&sequential));
+
+    // Restoring the original value as the last edit reports nothing.
+    let restore = [Edit::new(a, DIRT), Edit::new(a, MaterialId(3))];
+    assert!(tree.apply(&restore).unwrap().is_empty());
+    assert_sound(&tree);
+}
+
+#[test]
+fn apply_rebuilds_each_node_once_and_matches_single_sets() {
+    // A whole brick in one batch: every leaf of one level-1 node.
+    let edits: Vec<Edit> = (0..16 * 16 * 16)
+        .rev()
+        .map(|i| {
+            let p = pos(i % 16, i / 16 % 16, i / 256);
+            Edit::new(p, MaterialId(1 + (i % 5) as u16))
+        })
+        .collect();
+    let mut batch = VoxelTree::new();
+    assert_eq!(
+        batch.apply(&edits).unwrap().as_slice(),
+        [BrickPos::new(0, 0, 0)]
+    );
+    let mut single = VoxelTree::new();
+    for e in &edits {
+        single.set(e.pos, e.material).unwrap();
+    }
+    assert!(same_content(&batch, &single));
+    assert_eq!(live(&batch), live(&single));
+    assert_eq!(batch.stats().free_words, 0, "nothing was built twice");
+    assert_eq!(batch.stats().free_nodes, 0);
+    assert_sound(&batch);
 }
 
 #[test]
@@ -584,4 +714,233 @@ proptest! {
         }
         assert_sound(&tree);
     }
+
+    /// A tiny region around the world centre, so batches repeat voxels often
+    /// and cross node boundaries of every level.
+    #[test]
+    fn apply_with_many_repeats_matches_the_edits_in_order(
+        setup in vec(op(), 0..4),
+        batch in vec(([-2i32..2, -2i32..2, -2i32..2], material()), 0..200),
+    ) {
+        let mut tree = VoxelTree::new();
+        let mut model = Dense::new();
+        for op in &setup {
+            run(op, &mut tree, &mut model).0.unwrap();
+        }
+        let edits: Vec<Edit> = batch.iter().map(|&(p, m)| Edit::new(p.into(), m)).collect();
+        tree.apply(&edits).unwrap();
+        for e in &edits {
+            model.fill(cube(e.pos.to_array(), 1), e.material);
+        }
+        for p in positions(checked_box()) {
+            prop_assert_eq!(tree.get(p), model.get(p), "at {:?}", p);
+        }
+        assert_sound(&tree);
+    }
+
+    /// The cursor, the direct lookup and the generic view descent agree with
+    /// the model on scattered points, small steps and jumps out of the world.
+    #[test]
+    fn every_lookup_path_matches_the_model(
+        ops in vec(op(), 0..=world_testkit::profile::scale().edits_per_case),
+        probes in vec(probe(), 1..400),
+    ) {
+        let mut tree = VoxelTree::new();
+        let mut model = Dense::new();
+        for op in &ops {
+            run(op, &mut tree, &mut model).0.unwrap();
+        }
+        let snapshot = tree.snapshot();
+        let mut cursor = tree.cursor();
+        let mut snap_cursor = snapshot.cursor();
+        let mut at = pos(0, 0, 0);
+        for probe in probes {
+            at = match probe {
+                Probe::Jump(p) => p,
+                Probe::Step(d) => pos(at.x + d[0], at.y + d[1], at.z + d[2]),
+            };
+            let expected = model.get(at);
+            prop_assert_eq!(cursor.get(at), expected, "cursor at {:?}", at);
+            prop_assert_eq!(snap_cursor.get(at), expected, "snapshot cursor at {:?}", at);
+            prop_assert_eq!(tree.get(at), expected, "get at {:?}", at);
+            let generic = read::descend(tree.root(), TREE_DEPTH, WORLD_ORIGIN, at);
+            prop_assert_eq!(generic, expected, "descent at {:?}", at);
+        }
+    }
+}
+
+/// One move of a lookup sequence.
+#[derive(Clone, Debug)]
+enum Probe {
+    /// Anywhere: inside the model, far away, or outside the world.
+    Jump(VoxelPos),
+    /// A small step from the last position, often within one leaf.
+    Step([i32; 3]),
+}
+
+fn probe() -> impl Strategy<Value = Probe> {
+    let far = || {
+        prop_oneof![
+            WORLD_MIN_VOXEL - 2..WORLD_MIN_VOXEL + 2,
+            -100_000..100_000,
+            WORLD_END_VOXEL - 2..WORLD_END_VOXEL + 2,
+        ]
+    };
+    prop_oneof![
+        3 => model_pos().prop_map(Probe::Jump),
+        1 => (far(), far(), far()).prop_map(|(x, y, z)| Probe::Jump(pos(x, y, z))),
+        6 => [-2i32..=2, -2i32..=2, -2i32..=2].prop_map(Probe::Step),
+    ]
+}
+
+#[test]
+fn a_cursor_scan_matches_get_everywhere_and_follows_its_snapshot() {
+    let mut tree = VoxelTree::new();
+    for i in 0..3000 {
+        let p = pos((i * 7) % 40 - 20, (i * 13) % 36 - 18, (i * 5) % 44 - 22);
+        tree.set(p, MaterialId(1 + (i % 6) as u16)).unwrap();
+    }
+    tree.fill_box(cube([-20, -20, -20], 12), DIRT).unwrap();
+    let region = cube([-24, -24, -24], 48);
+    let snapshot = tree.snapshot();
+    let mut cursor = snapshot.cursor();
+    let expected: Vec<(VoxelPos, MaterialId)> =
+        positions(region).map(|p| (p, tree.get(p))).collect();
+    // Forward, x fastest, then backward: every kind of shared prefix.
+    for &(p, m) in expected.iter().chain(expected.iter().rev()) {
+        assert_eq!(cursor.get(p), m, "at {p:?}");
+    }
+
+    // The tree moves on; the snapshot's cursor keeps the old content.
+    tree.fill_box(region, STONE).unwrap();
+    for &(p, m) in expected.iter().step_by(7) {
+        assert_eq!(cursor.get(p), m, "at {p:?}");
+        assert_eq!(tree.cursor().get(p), STONE);
+    }
+}
+
+#[test]
+fn cursors_on_air_and_uniform_roots_need_no_nodes() {
+    let mut tree = VoxelTree::new();
+    assert_eq!(tree.cursor().get(pos(1, 2, 3)), MaterialId::AIR);
+    tree.fill_box(VoxelBox::WORLD, DIRT).unwrap();
+    let mut cursor = tree.cursor();
+    assert_eq!(cursor.get(pos(WORLD_MIN_VOXEL, 0, 0)), DIRT);
+    assert_eq!(cursor.get(pos(WORLD_END_VOXEL, 0, 0)), MaterialId::AIR);
+    assert_eq!(cursor.get(pos(5, 5, 5)), DIRT);
+}
+
+#[test]
+fn views_are_canonical_voxel_sources() {
+    let mut tree = VoxelTree::new();
+    tree.set(pos(0, 0, 0), STONE).unwrap();
+    tree.set(pos(1, 0, 0), DIRT).unwrap();
+    tree.fill_box(cube([4, 0, 0], 4), STONE).unwrap();
+    assert_eq!(VoxelSource::levels(&tree), TREE_DEPTH);
+    assert_eq!(VoxelSource::origin(&tree), VoxelBox::WORLD.min());
+    assert_eq!(VoxelSource::get(&tree, pos(1, 0, 0)), DIRT);
+
+    let NodeRef::Leaf(_) = brick_child(&tree, pos(0, 0, 0)) else {
+        panic!("a mixed leaf");
+    };
+    let leaf = brick_child(&tree, pos(0, 0, 0));
+    assert_eq!(leaf.kind(), NodeKind::Leaf);
+    assert_eq!(leaf.mask(), 0b11);
+    assert_eq!(leaf.palette().as_slice(), [STONE, DIRT]);
+    let uniform = brick_child(&tree, pos(4, 0, 0));
+    assert_eq!(uniform.kind(), NodeKind::Uniform(STONE));
+    assert_eq!(uniform.mask(), u64::MAX);
+    assert_eq!(uniform.palette().as_slice(), [STONE]);
+    assert_eq!(uniform.child(9).voxel(3), STONE);
+    let air = brick_child(&tree, pos(8, 0, 0));
+    assert_eq!((air.kind(), air.mask()), (NodeKind::Air, 0));
+    assert_eq!(air.palette().as_slice(), []);
+    assert_eq!(
+        Palette::from_voxels([DIRT, MaterialId::AIR, STONE, DIRT]).as_slice(),
+        [STONE, DIRT]
+    );
+}
+
+/// The child of `tree` that stands at `level` (where a level-`level` node
+/// would) and holds `p`.
+fn child_at_level(tree: &VoxelTree, p: VoxelPos, level: u32) -> NodeRef<'_> {
+    let local = path::world_local(p).unwrap();
+    let mut node = tree.root();
+    for parent in (level + 1..TREE_DEPTH).rev() {
+        node = node.child(path::child_slot(local, parent));
+    }
+    node
+}
+
+proptest! {
+    #![proptest_config(world_testkit::profile::proptest_config())]
+
+    /// A grid and the node-aligned region of the world tree with the same
+    /// voxels have identical canonical views: same kinds, masks and voxels
+    /// all the way down.
+    #[test]
+    fn a_grid_reads_like_the_matching_subtree(
+        levels in 1u32..=3,
+        corner in [-2i32..2, -2i32..2, -2i32..2],
+        writes in vec(([0u32..64, 0u32..64, 0u32..64], material()), 0..300),
+        filled in material(),
+    ) {
+        let size = 1u32 << (2 * levels);
+        let origin = VoxelPos::from(corner.map(|c| c * size as i32));
+        let mut grid = DenseGrid::new(levels, origin);
+        let mut tree = VoxelTree::new();
+        // Start from a filled half sometimes, so uniform regions split.
+        let half = VoxelBox::from_min_size(origin, [size, size, size / 2]);
+        tree.fill_box(half, filled).unwrap();
+        for p in positions(half) {
+            grid.set(p, filled);
+        }
+        for &(offset, m) in &writes {
+            let [x, y, z] = offset.map(|v| (v % size) as i32);
+            let p = pos(origin.x + x, origin.y + y, origin.z + z);
+            prop_assert_eq!(grid.set(p, m), tree.set(p, m).unwrap());
+        }
+        let subtree = child_at_level(&tree, origin, levels - 1);
+        prop_assert!(read::same_node(grid.root(), subtree));
+        prop_assert!(read::same_node(subtree, grid.root()));
+        for p in positions(grid.bounds()).step_by(7) {
+            prop_assert_eq!(grid.get(p), tree.get(p));
+        }
+        // Equal content at different places or sizes is not the same source.
+        prop_assert!(!same_content(&grid, &tree));
+        prop_assert!(same_content(&grid, &grid.clone()));
+    }
+}
+
+#[test]
+fn snapshot_pages_expose_the_raw_layout_without_copying() {
+    let mut tree = VoxelTree::new();
+    assert_eq!(tree.snapshot().root_word(), None);
+    tree.set(pos(1, 2, 3), STONE).unwrap();
+    tree.set(pos(-100, 50, 7), DIRT).unwrap();
+    let snap = tree.snapshot();
+
+    let nodes: Vec<(usize, &[Node])> = snap.node_pages().collect();
+    let words: Vec<(usize, &[u32])> = snap.word_pages().collect();
+    assert_eq!((nodes.len(), words.len()), (1, 1));
+    assert_eq!((nodes[0].0, words[0].0), (0, 0));
+    assert_eq!(nodes[0].1.len(), NODE_PAGE_LEN);
+    assert_eq!(words[0].1.len(), WORD_PAGE_LEN);
+    let bytes: &[u8] = bytemuck::cast_slice(nodes[0].1);
+    assert_eq!(bytes.len(), NODE_PAGE_LEN * 16);
+
+    // The root word leads to the node a reader sees.
+    let root = snap.root_word().unwrap();
+    assert_eq!(root & UNIFORM_BIT, 0);
+    let node = nodes[0].1[root as usize];
+    let NodeRef::Branch(b) = snap.root() else {
+        panic!("two voxels need a root branch");
+    };
+    assert_eq!(node.mask, b.mask());
+    assert_eq!(node.info, 0);
+    let first = words[0].1[node.base as usize];
+    assert_eq!(first & UNIFORM_BIT, 0, "the root's children are nodes");
+
+    tree.fill_box(VoxelBox::WORLD, STONE).unwrap();
+    assert_eq!(tree.snapshot().root_word(), Some(UNIFORM_BIT | 1));
 }

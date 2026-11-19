@@ -1,24 +1,23 @@
-//! Reading and packing the 64 children of a branch.
+//! Reading and packing the 64 child words of a level-2-or-higher node.
 
 use super::Writer;
 use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
-use crate::tree::node::{Child, Node, NodeKind, Packed, PackedNode, bit, rank, slots};
+use crate::tree::node::{Child, Node, Packed, PackedNode, bit, rank, slots};
 
-/// The children of one branch in slot order, air included.
+/// The children of one node in slot order, air included.
 pub(super) type Children = [Child; TREE_FANOUT as usize];
 
 impl Writer<'_> {
-    /// The 64 children of a branch-level child: a node's decoded words, or
-    /// 64 copies of an air or uniform child (what splitting it gives).
+    /// The 64 children of a child at level 2 or higher: a node's decoded
+    /// words, or 64 copies of an air or uniform child (what splitting it
+    /// gives).
     pub(super) fn children(&self, child: Child) -> Children {
         let Child::Node(index) = child else {
             return [child; TREE_FANOUT as usize];
         };
         let node = self.store.node(index);
-        let block = self
-            .store
-            .block(node.base, node.block_len(NodeKind::Branch));
+        let block = self.store.block(node.base, node.mask.count_ones() as usize);
         let mut children = [Child::Air; TREE_FANOUT as usize];
         for (slot, &word) in slots(node.mask).zip(block) {
             children[slot as usize] = Child::from_word(word);
@@ -26,22 +25,37 @@ impl Writer<'_> {
         children
     }
 
-    /// Child `slot` of a stored branch.
+    /// Child `slot` of a stored node at level 2 or higher.
     pub(super) fn child(&self, node: Node, slot: u32) -> Child {
         if node.mask & bit(slot) == 0 {
             return Child::Air;
         }
-        let block = self
-            .store
-            .block(node.base, node.block_len(NodeKind::Branch));
-        Child::from_word(block[rank(node.mask, slot)])
+        Child::from_word(self.store.word(node.base + rank(node.mask, slot) as u32))
+    }
+
+    /// Overwrites child `slot` of a stored node at level 2 or higher with
+    /// `new` where that keeps the node canonical without repacking: the slot
+    /// already holds a child, `new` is not air, and the node cannot collapse
+    /// (it can only once every slot holds a uniform child). Returns whether
+    /// it wrote.
+    pub(super) fn patch_child(&mut self, node: Node, slot: u32, new: Child) -> bool {
+        let Some(word) = new.word() else {
+            return false;
+        };
+        let may_collapse = node.mask == u64::MAX && matches!(new, Child::Uniform(_));
+        if node.mask & bit(slot) == 0 || may_collapse {
+            return false;
+        }
+        let at = node.base + rank(node.mask, slot) as u32;
+        self.store.write_block(at, &[word]);
+        true
     }
 }
 
-/// Packs 64 canonical children into canonical branch content: all air or all
+/// Packs 64 canonical children into canonical node content: all air or all
 /// the same uniform child collapses to [`Packed::Filled`]; anything else is a
 /// mask and one word per non-air child.
-pub(super) fn pack(children: &Children) -> Packed {
+pub(super) fn pack(children: &Children) -> Packed<{ TREE_FANOUT as usize }> {
     let mut mask = 0;
     let mut words = [0; TREE_FANOUT as usize];
     let mut len = 0;
@@ -60,7 +74,7 @@ pub(super) fn pack(children: &Children) -> Packed {
     {
         return Packed::Filled(material);
     }
-    Packed::Node(PackedNode::new(mask, 0, &words[..len]))
+    Packed::Node(PackedNode::new(mask, &words[..len]))
 }
 
 #[cfg(test)]
@@ -83,7 +97,6 @@ mod tests {
             panic!("mixed children need a node");
         };
         assert_eq!(p.mask, bit(3) | bit(40));
-        assert_eq!(p.info, 0);
         assert_eq!(p.words(), [9, (1 << 31) | 5]);
     }
 
