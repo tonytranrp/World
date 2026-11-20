@@ -331,7 +331,7 @@ fn the_render_tree_shows_loaded_chunks_and_coarse_beyond() {
     assert_eq!(full.lookup(far_below), None, "not loaded at full detail");
     assert!(!render.get(far_below).is_air(), "coarse cells fill it");
     let changes = world.take_changes();
-    assert!(!changes.render_bricks.is_empty());
+    assert!(!changes.render_chunks.is_empty());
 
     // Edits reach the render tree, and their bricks are reported.
     let target = ground_below(&world, eye);
@@ -387,12 +387,14 @@ fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
     for frame in 1..=120 {
         world.update(eye, FRAME);
         let snapshot = world.render_snapshot();
-        let dirty = world_core::DirtyBricks::from_unsorted(world.take_changes().render_bricks);
+        let changes = world.take_changes();
+        let dirty = world_core::DirtyBricks::from_unsorted(changes.render_bricks);
         let input = FrameInput {
             source: &snapshot,
             frame,
             refresh: frame == 1,
             dirty: dirty.as_slice(),
+            chunks: &changes.render_chunks,
             view: Some(view),
             requests: &[],
             victims: &[],

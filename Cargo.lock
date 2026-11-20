@@ -7986,6 +7986,7 @@ dependencies = [
  "wesl",
  "wgpu",
  "world_core",
+ "world_gen",
  "world_reload",
  "world_testkit",
  "world_testkit_bevy",

@@ -80,11 +80,12 @@ struct Checkpoint {
 /// What changed in the world since the renderer last asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldChanges {
-    /// Bricks of the render tree whose content changed: edited bricks, and
-    /// one brick of every chunk that was swapped (loaded, unloaded, or
-    /// switched between full and coarse), which makes the GPU cache rebuild
-    /// that region from the snapshot.
+    /// Bricks of the render tree whose content changed by edits.
     pub render_bricks: Vec<BrickPos>,
+    /// The lowest voxel of every chunk of the render tree that was swapped
+    /// (loaded, unloaded, or switched between full and coarse), which makes
+    /// the GPU cache rebuild that region from the snapshot.
+    pub render_chunks: Vec<VoxelPos>,
     /// Bricks edited in loaded chunks.
     pub bricks: Vec<BrickPos>,
     /// Chunks that joined the tree (every brick of them is new).
@@ -409,7 +410,7 @@ impl StreamedWorld {
             None => self.render.take_chunk(min).map(|_| true),
         };
         if result.is_ok() {
-            self.changes.render_bricks.push(min.brick());
+            self.changes.render_chunks.push(min);
         }
     }
 

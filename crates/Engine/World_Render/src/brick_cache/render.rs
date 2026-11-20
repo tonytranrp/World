@@ -304,9 +304,14 @@ pub fn run_brick_cache(
     let shape = state.residency.shape();
     let layout = state.pools.layout.clone();
 
+    let ray_guided = config.0.stage == Stage::RayGuided;
     for readback in state.ring.collect(wgpu_device) {
-        let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
-        state.requests = requests;
+        // Stage 1 ignores requests: decoding and sorting a full block costs
+        // milliseconds a frame.
+        if ray_guided {
+            let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
+            state.requests = requests;
+        }
         if !readback.victims.is_empty() {
             let (victims, _) =
                 decode_victims(&readback.victims, layout.victim_capacity, layout.brick_ids);
@@ -355,6 +360,7 @@ pub fn run_brick_cache(
         frame: state.frame,
         refresh,
         dirty: &feed.dirty,
+        chunks: &feed.chunks,
         view: view.0,
         requests: &requests,
         victims: &victims,
@@ -458,7 +464,7 @@ pub fn log_cache_stats(
     let s = state.residency.stats();
     let r = state.last_report;
     info!(
-        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
+        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} changes applied, {} pending, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
         state.frame,
         s.entries,
         s.expanded,
@@ -470,6 +476,8 @@ pub fn log_cache_stats(
         r.expanded,
         r.edited_uploaded,
         r.edited_unlinked,
+        r.changes_applied,
+        r.changes_pending,
         r.evicted,
         r.victims_applied,
         r.upload_bytes,

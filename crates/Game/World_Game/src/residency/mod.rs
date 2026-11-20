@@ -154,7 +154,11 @@ fn feed_renderer(world: Option<ResMut<World>>, feed: Option<ResMut<VoxelWorldFee
     if world.is_added() {
         feed.replace(snapshot);
     } else {
-        feed.publish(snapshot, &DirtyBricks::from_unsorted(changes.render_bricks));
+        feed.publish_with_chunks(
+            snapshot,
+            &DirtyBricks::from_unsorted(changes.render_bricks),
+            &changes.render_chunks,
+        );
     }
 }
 

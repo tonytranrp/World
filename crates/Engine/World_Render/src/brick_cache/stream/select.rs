@@ -10,9 +10,10 @@
 //!
 //! A whole walk visits every resident record, one table lookup each, which
 //! is too much for one frame once the table holds hundreds of thousands of
-//! records. [`select_budgeted`] splits it in two, and both halves visit at
-//! most `lod.max_visits_per_frame` records per frame and resume where they
-//! stopped:
+//! records. [`select_split`] splits it in two, each with its own budget per
+//! frame (growth `lod.max_visits_per_frame`, shrink
+//! `lod.max_shrink_visits_per_frame` and `lod.max_collapses_per_frame`),
+//! and both resume where they stopped:
 //!
 //! - **Growth** (expand and load) only descends into nodes that want
 //!   refining. A child's cells are a quarter of its parent's and never
@@ -21,8 +22,9 @@
 //!   best-first: the nodes covering the most pixels are visited first, so a
 //!   pass the budget splits finds the nearest work in its first frame.
 //!   Candidates the upload budget turns away are carried to the next frame.
-//! - **Shrink** (collapse and evict) must look at every record, so it is a
-//!   plain resumable walk.
+//! - **Shrink** (collapse and evict) must look at every expanded node and
+//!   resident brick, so it is a plain resumable walk; it skips children
+//!   without records and level-1 children without bricks.
 //!
 //! Both are functions of the view, the pressure and the table alone, so a
 //! new pass of either starts only once the camera moved more than
@@ -31,9 +33,17 @@
 //! camera over a settled cache walks nothing.
 //! Nodes expanded while a pass runs rejoin it, so their children are judged
 //! by the same pass. A growth pass whose camera moved more than
-//! `regrow_voxels` starts over from the root, so a moving camera always
-//! works on its current view, nearest and coarsest first. Every node taken
-//! off a queue counts against the budget, whether or not it still exists.
+//! `restart_voxels` (at least `regrow_voxels`) starts over from the root, so
+//! a moving camera works on its current view, nearest and coarsest first;
+//! smaller moves let it finish, since every node is checked against the
+//! current view when it is taken. Every node taken off a queue or put on
+//! one counts against the budget, whether or not it still exists. Only
+//! children with records of their own are queued, and of a level-2 node's
+//! only those whose bricks are not resident, so a settled region costs one
+//! visit per expanded node instead of one per child.
+//!
+//! Nodes in a replaced chunk that waits to be applied are skipped: it is
+//! rebuilt when applied.
 //!
 //! A growth pass or a shrink pass run to completion under one view gives
 //! exactly [`select`]'s answer.
@@ -202,6 +212,10 @@ pub struct GrowthState {
     /// Candidates found but not taken yet; checked again before use.
     carry_expand: Vec<NodeKey>,
     carry_load: Vec<NodeKey>,
+    /// Pops and pushes the last growth step made.
+    visits: u32,
+    /// Records the last shrink step took.
+    shrink_visits: u32,
 }
 
 /// Whether a pass that last started at `last` must start again for `view`.
@@ -258,6 +272,22 @@ impl GrowthState {
         self.active
     }
 
+    /// The view the pass in progress (or the last one) started with.
+    pub fn started_at(&self) -> Option<ViewPoint> {
+        self.last
+    }
+
+    /// Queue pops and pushes the last growth step made, which the visit
+    /// budget bounds (one node's pushes may overshoot it by up to 64).
+    pub fn last_visits(&self) -> u32 {
+        self.visits
+    }
+
+    /// Records the last shrink step took off its walk.
+    pub fn last_shrink_visits(&self) -> u32 {
+        self.shrink_visits
+    }
+
     /// Node `key`, just expanded, rejoins the pass in progress so its
     /// children are judged. Without a pass in progress the next pass will.
     pub fn rejoin(&mut self, key: NodeKey, pixels: f32) {
@@ -302,6 +332,51 @@ pub fn select_budgeted(
     pressure: f32,
     max_visits: u32,
 ) -> Selection {
+    select_split(
+        res,
+        walk,
+        growth,
+        view,
+        lod,
+        pressure,
+        Budgets::visits(max_visits),
+    )
+}
+
+/// What one call of [`select_split`] may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    /// Growth queue pops and pushes.
+    pub growth_visits: u32,
+    /// Records the shrink walk takes.
+    pub shrink_visits: u32,
+    /// Collapses the shrink walk may find; it stops at the last one and
+    /// resumes there, since releasing a subtree costs per record.
+    pub collapses: u32,
+}
+
+impl Budgets {
+    /// Both walks at `visits`, collapses unbounded.
+    pub fn visits(visits: u32) -> Self {
+        Self {
+            growth_visits: visits,
+            shrink_visits: visits,
+            collapses: u32::MAX,
+        }
+    }
+}
+
+/// [`select_budgeted`] with separate budgets for growth and shrink.
+pub fn select_split(
+    res: &Residency,
+    walk: &mut Vec<NodeKey>,
+    growth: &mut GrowthState,
+    view: &ViewPoint,
+    lod: &LodTuning,
+    pressure: f32,
+    budgets: Budgets,
+) -> Selection {
+    let max_visits = budgets.growth_visits;
     let shape = res.shape();
     let always = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
     let mut out = Selection::default();
@@ -339,7 +414,8 @@ pub fn select_budgeted(
     // A pass whose camera moved on restarts: its queue was ordered for a
     // view that is gone. Table changes wait for the pass to finish (nodes
     // expanded meanwhile rejoin it).
-    let moved = growth.active && pass_due(growth.last, false, view, lod.regrow_voxels);
+    let restart = lod.restart_voxels.max(lod.regrow_voxels);
+    let moved = growth.active && pass_due(growth.last, false, view, restart);
     if moved || (!growth.active && growth.due(view, lod.regrow_voxels)) {
         growth.ran(*view);
         let d2 = distance2(origin, root, eye);
@@ -366,6 +442,11 @@ pub fn select_budgeted(
         let Some(node) = res.node_state(key) else {
             continue;
         };
+        // A replaced chunk not applied yet is rebuilt when it is: nothing
+        // in it is worth refining until then.
+        if res.in_waiting_chunk(key) {
+            continue;
+        }
         if key.level >= 2 {
             if node.expanded {
                 // Per-axis squared distances to the four child slabs.
@@ -378,7 +459,13 @@ pub fn select_budgeted(
                         d * d
                     })
                 });
-                let mut mask = node.mask;
+                // Only children with records can need work; of a level-2
+                // node's, only those whose bricks are not resident.
+                let mut mask = if key.level == 2 {
+                    node.kids & !node.bricks
+                } else {
+                    node.kids
+                };
                 while mask != 0 {
                     let slot = 63 - mask.leading_zeros();
                     mask &= !(1u64 << slot);
@@ -390,6 +477,8 @@ pub fn select_budgeted(
                     );
                     let d2 = slabs[0][ox] + slabs[1][oy] + slabs[2][oz];
                     if wanted(child, d2) {
+                        // Pushes count too: a node can queue 64 children.
+                        visits += 1;
                         growth.frontier.push(Pending {
                             pixels: pixels(child, d2),
                             key: child,
@@ -411,10 +500,12 @@ pub fn select_budgeted(
     if growth.frontier.is_empty() {
         growth.active = false;
     }
+    growth.visits = visits;
 
     // Candidates carried from earlier frames, if they still apply.
     for key in std::mem::take(&mut growth.carry_expand) {
         let still = res.node_state(key).is_some_and(|n| !n.expanded)
+            && !res.in_waiting_chunk(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             let priority = if forced(key.level) {
@@ -427,6 +518,7 @@ pub fn select_budgeted(
     }
     for key in std::mem::take(&mut growth.carry_load) {
         let still = res.node_state(key).is_some_and(|n| !n.brick_resident)
+            && !res.in_waiting_chunk(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             load.push((projected_pixels(shape.origin, key, view), key));
@@ -443,7 +535,7 @@ pub fn select_budgeted(
         walk.push(shape.root());
     }
     let mut visits = 0u32;
-    while visits < max_visits {
+    while visits < budgets.shrink_visits && out.collapse.len() < budgets.collapses as usize {
         let Some(key) = walk.pop() else {
             break;
         };
@@ -458,7 +550,14 @@ pub fn select_budgeted(
             let forced = key.level() >= always;
             if node.expanded {
                 if forced || keep {
-                    push_children(walk, key, node.mask);
+                    // Only children with records can shrink; of a level-2
+                    // node's, only those with resident bricks.
+                    let kids = if key.level == 2 {
+                        node.bricks
+                    } else {
+                        node.kids
+                    };
+                    push_children(walk, key, kids);
                 } else {
                     out.collapse.push(key);
                 }
@@ -467,6 +566,7 @@ pub fn select_budgeted(
             out.evict.push(key);
         }
     }
+    growth.shrink_visits = visits;
     let by_priority =
         |a: &(f32, NodeKey), b: &(f32, NodeKey)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
     expand.sort_by(by_priority);
