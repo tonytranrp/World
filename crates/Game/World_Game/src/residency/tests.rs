@@ -13,6 +13,9 @@ use world_gen::TerrainConfig;
 use super::config::ResidencyConfig;
 use super::world::StreamedWorld;
 
+/// The time between updates in these tests, in seconds.
+const FRAME: f32 = 1.0 / 60.0;
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("world_residency_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -43,9 +46,9 @@ fn eye_at(world: &StreamedWorld, x: i32, z: i32) -> VoxelPos {
 /// Updates until everything around `eye` is loaded and nothing is in flight.
 fn settle(world: &mut StreamedWorld, eye: VoxelPos) {
     for _ in 0..2000 {
-        world.update(eye);
+        world.update(eye, FRAME);
         let s = world.stats();
-        if world.is_settled(eye) && s.loading == 0 && s.saving == 0 {
+        if world.is_settled(eye) && s.loading == 0 && s.saving == 0 && s.compressing == 0 {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -162,7 +165,7 @@ fn edits_survive_a_crash_through_the_log() {
             .fill_box(VoxelBox::from_min_size(above, [8; 3]), MaterialId(1))
             .unwrap();
         // One frame syncs the log; then the process "crashes" (no save).
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let log = std::fs::read(dir.join("edits.wvl")).unwrap();
     assert_eq!(read_log(&log).unwrap().0.len(), 2, "both edits logged");
@@ -234,7 +237,7 @@ fn coarse_columns_surround_the_player() {
     );
     let eye = eye_at(&world, 5000, 5000);
     for _ in 0..50 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let s = world.stats();
     assert!(s.coarse_columns >= 9, "{s:?}");
@@ -310,7 +313,7 @@ fn the_render_tree_shows_loaded_chunks_and_coarse_beyond() {
     let eye = eye_at(&world, 3000, -4000);
     settle(&mut world, eye);
     for _ in 0..30 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let render = world.render_snapshot();
     let full = world.snapshot();
@@ -381,7 +384,7 @@ fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
     };
     let mut batch = UploadBatch::default();
     for frame in 1..=120 {
-        world.update(eye);
+        world.update(eye, FRAME);
         let snapshot = world.render_snapshot();
         let dirty = world_core::DirtyBricks::from_unsorted(world.take_changes().render_bricks);
         let input = FrameInput {
@@ -424,7 +427,7 @@ fn destruction_shows_from_afar_once_its_chunk_is_written() {
     let eye = eye_at(&world, 6000, -6000);
     settle(&mut world, eye);
     for _ in 0..30 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     // A 1 m cube 2.5 m under the ground, aligned to coarse cells.
     let ground = world.generator().column(eye.x, eye.z).unwrap().height;
@@ -445,7 +448,7 @@ fn destruction_shows_from_afar_once_its_chunk_is_written() {
     let away = eye_at(&world, eye.x + 56 * 64, eye.z);
     settle(&mut world, away);
     for _ in 0..10 {
-        world.update(away);
+        world.update(away, FRAME);
     }
     assert_eq!(world.snapshot().lookup(centre), None, "evicted");
     assert!(world.stats().saved_chunks >= 1);
@@ -662,7 +665,7 @@ fn a_large_log_is_folded_into_region_files_at_a_checkpoint() {
             }
         }
         world.apply(&edits).unwrap();
-        world.update(eye);
+        world.update(eye, FRAME);
         assert!(world.stats().saving >= 1, "the checkpoint writes the chunk");
         // An edit while the checkpoint runs stays in the log.
         late = Edit::new(
@@ -670,7 +673,7 @@ fn a_large_log_is_folded_into_region_files_at_a_checkpoint() {
             MaterialId(6),
         );
         world.apply(&[late]).unwrap();
-        world.update(eye);
+        world.update(eye, FRAME);
         let s = world.stats();
         assert_eq!(s.checkpoints, 1, "{s:?}");
         assert!(s.log_bytes < 1024, "{s:?}");
@@ -745,11 +748,14 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
 
     // An evicted chunk waiting for its write still counts toward the cap.
     let away = eye_at(&world, eye.x + 200 * 64, eye.z);
-    world.update(away);
+    world.update(away, FRAME);
     let s = world.stats();
     assert!(s.saving >= 1 && s.saving_bytes > 0, "{s:?}");
     assert_eq!(s.hot_bytes, world.hot_bytes_walked());
-    assert_eq!(world.hot_bytes_counted(), s.hot_bytes + s.saving_bytes);
+    assert_eq!(
+        world.hot_bytes_counted(),
+        s.hot_bytes + s.saving_bytes + s.compressing_bytes
+    );
     settle(&mut world, away);
     assert_eq!(world.stats().saving_bytes, 0);
 
@@ -760,7 +766,7 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
     let sphere = super::plan::sphere(aside, 16.0).len();
     assert!(world.stats().loaded > sphere, "{:?}", world.stats());
     world.config_mut().hot_cap_mib = 0;
-    world.update(aside);
+    world.update(aside, FRAME);
     assert_eq!(world.stats().loaded, sphere);
     assert_eq!(world.stats().hot_bytes, world.hot_bytes_walked());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -801,4 +807,192 @@ fn save_all_keeps_the_log_when_a_write_fails() {
     assert_eq!(world.snapshot().get(target), MaterialId(3));
     world.save_all().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A chunk's content as a hash, for comparing loads.
+fn chunk_hash(coord: world_gen::ChunkCoord, data: world_core::tree::ChunkData) -> u64 {
+    let mut tree = world_core::VoxelTree::unloaded();
+    tree.insert_chunk(coord.min_voxel(), data).unwrap();
+    world_core::serialize::content_hash(&tree)
+}
+
+#[test]
+fn unedited_chunks_come_back_from_the_warm_cache_unchanged() {
+    let dir = temp_dir("warm_generated");
+    let mut world = open(&dir, config(0));
+    let eye = eye_at(&world, 3500, 1500);
+    settle(&mut world, eye);
+    let around = world.loaded_chunks();
+    assert_eq!(world.stats().generated, around.len(), "{:?}", world.stats());
+
+    // Away: the unedited chunks are evicted, nothing is written, and they
+    // stay compressed in RAM.
+    // Loads come first: while they fill the in-flight cap, the evicted
+    // chunks wait (counted toward the hot cap) instead of taking workers.
+    let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    world.update(away, FRAME);
+    let s = world.stats();
+    assert!(s.loading > 0, "{s:?}");
+    assert!(s.compressing > 0 && s.compressing_bytes > 0, "{s:?}");
+    assert_eq!(s.warm_chunks, 0, "{s:?}");
+    settle(&mut world, away);
+    let s = world.stats();
+    assert_eq!(s.writes, 0);
+    assert!(around.iter().all(|&c| world.is_warm(c)), "{s:?}");
+    assert_eq!(s.warm_edited, 0);
+    assert_eq!(s.warm_bytes, world.warm_bytes_walked());
+
+    // Back: every one of them is decompressed, none generated again, and
+    // each matches the generator exactly.
+    let before = world.stats();
+    settle(&mut world, eye);
+    let after = world.stats();
+    assert_eq!(after.warm_hits - before.warm_hits, around.len());
+    assert_eq!(after.generated, before.generated);
+    for &c in &around {
+        let fresh = super::jobs::generate(world.generator(), c);
+        let back = world.chunk_data(c).unwrap();
+        assert_eq!(chunk_hash(c, back), chunk_hash(c, fresh), "{c:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Digs near (`x`, `z`), then walks away in 40 m steps with a small warm
+/// cache. Returns whether the edited chunk is still warm at the end, after
+/// checking the warm bytes against the budget at every step.
+fn edited_chunk_stays_warm(name: &str, x: i32, z: i32, edited_weight: f32) -> bool {
+    let dir = temp_dir(name);
+    let cap_mib = 2;
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            warm_cap_mib: cap_mib,
+            warm_edited_weight: edited_weight,
+            ..config(0)
+        },
+    );
+    let eye = eye_at(&world, x, z);
+    settle(&mut world, eye);
+    let target = ground_below(&world, eye);
+    dig(&mut world, target);
+    let edited = world_gen::ChunkCoord::containing(target).unwrap();
+    let mut evicted = 0;
+    for step in 1..=4 {
+        let at = eye_at(&world, eye.x + step * 40 * 64, eye.z);
+        let before = world.stats().loaded;
+        settle(&mut world, at);
+        evicted += before;
+        let s = world.stats();
+        assert_eq!(s.warm_bytes, world.warm_bytes_walked(), "{s:?}");
+        assert!(s.warm_bytes <= (cap_mib as usize) << 20, "{s:?}");
+    }
+    let s = world.stats();
+    assert!(s.warm_chunks < evicted, "the budget dropped some: {s:?}");
+    let warm = world.is_warm(edited);
+    drop(world);
+    std::fs::remove_dir_all(&dir).unwrap();
+    warm
+}
+
+#[test]
+fn the_warm_cache_keeps_to_its_budget_and_prefers_edited_chunks() {
+    assert!(
+        !edited_chunk_stays_warm("warm_lru", -3500, 6500, 1.0),
+        "plain least recently used: the edited chunk is long gone"
+    );
+    assert!(
+        edited_chunk_stays_warm("warm_weighted", -3500, 6500, 64.0),
+        "weighted: it outlasts the generated chunks evicted after it"
+    );
+}
+
+/// What a walk saw: the chunks joined in order, and the world at the end.
+struct Walk {
+    joined: Vec<world_gen::ChunkCoord>,
+    world: StreamedWorld,
+    eye: VoxelPos,
+}
+
+/// Opens a world and walks from (`x`, `z`) along +x at 8 m/s for `updates`
+/// updates of 1/60 s, zero workers (so at most four loads per update), with
+/// the given lookahead.
+fn walk(name: &str, x: i32, z: i32, lookahead_secs: f32, updates: i32) -> Walk {
+    let dir = temp_dir(name);
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            full_radius_m: 32.0,
+            evict_radius_m: 48.0,
+            prefetch_radius_m: 32.0,
+            prefetch_lookahead_secs: lookahead_secs,
+            velocity_smoothing_secs: 0.0,
+            ..config(0)
+        },
+    );
+    let mut joined = Vec::new();
+    let mut eye = eye_at(&world, x, z);
+    for i in 0..updates {
+        // 8 m/s is 512 voxels a second, 8.53 per update.
+        eye = eye_at(&world, x + i * 512 / 60, z);
+        world.update(eye, FRAME);
+        joined.extend(world.take_changes().loaded);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Walk { joined, world, eye }
+}
+
+/// Of `chunks`, how many lie ahead of (+x) and behind the chunk at `x`.
+fn split_ahead(chunks: &[world_gen::ChunkCoord], x: i32) -> (usize, usize) {
+    let at = world_gen::ChunkCoord::containing(VoxelPos::new(x, 0, 0))
+        .unwrap()
+        .x();
+    let ahead = chunks.iter().filter(|c| c.x() > at).count();
+    let behind = chunks.iter().filter(|c| c.x() < at).count();
+    (ahead, behind)
+}
+
+#[test]
+fn moving_loads_the_chunks_ahead_first() {
+    let (x, z) = (4500, -1500);
+    // Starting from nothing and walking at once, the sphere fills over a
+    // few dozen updates. The first 40 chunks joined:
+    let plain = walk("prefetch_off", x, z, 0.0, 12);
+    let ahead = walk("prefetch_on", x, z, 3.0, 12);
+    let first = |w: &Walk| w.joined[..40.min(w.joined.len())].to_vec();
+    let (p_ahead, p_behind) = split_ahead(&first(&plain), x);
+    let (a_ahead, a_behind) = split_ahead(&first(&ahead), x);
+    assert!(
+        a_ahead > p_ahead && a_behind <= p_behind,
+        "prefetch {a_ahead} ahead / {a_behind} behind, nearest first {p_ahead} / {p_behind}"
+    );
+    assert!(a_ahead > a_behind, "{a_ahead} / {a_behind}");
+    // The player's own chunk is never put off.
+    let own = world_gen::ChunkCoord::containing(eye_at(&ahead.world, x, z)).unwrap();
+    let pos = ahead.joined.iter().position(|&c| c == own).unwrap();
+    assert!(pos < 8, "{pos}");
+
+    // The same walk gives the same loads in the same order.
+    let again = walk("prefetch_again", x, z, 3.0, 12);
+    assert_eq!(again.joined, ahead.joined);
+}
+
+#[test]
+fn prefetch_loads_ahead_of_the_sphere_and_never_starves_it() {
+    let (x, z) = (-5500, 3500);
+    let mut w = walk("prefetch_long", x, z, 3.0, 240);
+    // Four loads an update keep up at 8 m/s: the sphere around the player is
+    // whole, and the lookahead has loaded chunks beyond it, all ahead.
+    assert_eq!(w.world.stats().holes, 0, "{:?}", w.world.stats());
+    let full = super::plan::voxels(32.0);
+    let beyond: Vec<_> = w
+        .world
+        .loaded_chunks()
+        .into_iter()
+        .filter(|&c| super::plan::chunk_distance(w.eye, c) > full)
+        .collect();
+    let (ahead, _) = split_ahead(&beyond, w.eye.x);
+    assert!(ahead > 0, "{beyond:?}");
+    // Standing still, everything around the player settles.
+    settle(&mut w.world, w.eye);
+    assert!(w.world.is_settled(w.eye));
 }

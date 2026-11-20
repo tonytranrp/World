@@ -27,10 +27,11 @@ use world_core::{Edit, EditError, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_gen::{CHUNK_SIZE, ChunkCoord, Generator, GeneratorVersion, TerrainConfig};
 
 use super::config::ResidencyConfig;
-use super::jobs::{Generators, WarmChunk};
-use super::plan;
+use super::jobs::{Generators, LoadSource, WarmChunk};
+use super::plan::{self, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
+use super::warm::Warm;
 
 /// What one loaded chunk is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +109,15 @@ pub struct ResidencyStats {
     /// Bytes of the loaded chunks.
     pub hot_bytes: usize,
     pub warm_chunks: usize,
+    /// Of those, the ones holding saved edits.
+    pub warm_edited: usize,
     pub warm_bytes: usize,
+    /// Unchanged chunks waiting to be compressed for the warm cache or
+    /// being compressed.
+    pub compressing: usize,
+    /// Bytes of the chunks waiting to be compressed; they count toward the
+    /// hot cap.
+    pub compressing_bytes: usize,
     pub coarse_columns: usize,
     pub coarse_bytes: usize,
     pub saved_chunks: usize,
@@ -118,43 +127,20 @@ pub struct ResidencyStats {
     pub checkpoints: usize,
     /// Bytes in the edit log.
     pub log_bytes: u64,
-}
-
-/// Compressed chunks as their region files hold them, kept in RAM after
-/// they were written or loaded, least recently used first out.
-#[derive(Default)]
-struct Warm {
-    entries: BTreeMap<ChunkCoord, (u64, WarmChunk)>,
-    bytes: usize,
-    tick: u64,
-}
-
-impl Warm {
-    fn insert(&mut self, coord: ChunkCoord, chunk: WarmChunk, cap: usize) {
-        self.tick += 1;
-        self.bytes += chunk.size();
-        if let Some((_, old)) = self.entries.insert(coord, (self.tick, chunk)) {
-            self.bytes -= old.size();
-        }
-        while self.bytes > cap {
-            let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, (t, _))| *t) else {
-                break;
-            };
-            if let Some((_, old)) = self.entries.remove(&oldest) {
-                self.bytes -= old.size();
-            }
-        }
-    }
-
-    /// A copy of the entry for `coord`, which becomes the most recently
-    /// used. The entry stays: it matches the region file until the chunk is
-    /// written again, which replaces it.
-    fn get(&mut self, coord: ChunkCoord) -> Option<WarmChunk> {
-        self.tick += 1;
-        let (tick, chunk) = self.entries.get_mut(&coord)?;
-        *tick = self.tick;
-        Some(chunk.clone())
-    }
+    /// Chunks within the full-detail radius that were not loaded at the last
+    /// update.
+    pub holes: usize,
+    /// Of those, the ones ahead of the player's motion.
+    pub holes_ahead: usize,
+    /// `holes` and `holes_ahead` summed over every update, and the number
+    /// of updates, for averages over an interval.
+    pub hole_sum: u64,
+    pub hole_ahead_sum: u64,
+    pub updates: u64,
+    /// Chunk loads since the world opened, by where their content came from.
+    pub generated: usize,
+    pub warm_hits: usize,
+    pub disk_loads: usize,
 }
 
 const MIB: usize = 1 << 20;
@@ -190,6 +176,20 @@ pub struct StreamedWorld {
     /// before the chunk is written.
     refused: BTreeSet<ChunkCoord>,
     warm: Warm,
+    /// Unchanged chunks waiting to be compressed for the warm cache, or
+    /// being compressed, with the ticket of the newest request. A write that
+    /// lands makes the requests before it stale (their content is older
+    /// than the region file).
+    compressing: BTreeMap<ChunkCoord, u64>,
+    tickets: u64,
+    /// Compressions waiting for idle workers, oldest first, with their
+    /// tickets and bytes. Loads come first: a chunk is compressed only
+    /// while fewer loads than the in-flight cap are outstanding, and the
+    /// oldest waiting ones are dropped (not kept warm) past a bound.
+    to_compress: VecDeque<(ChunkCoord, ChunkData, u64, usize)>,
+    /// Sum of the bytes in `to_compress`; they count toward the hot cap.
+    to_compress_bytes: usize,
+    compress_in_flight: usize,
     coarse_loaded: BTreeMap<(u32, u32), Vec<(ChunkCoord, usize)>>,
     coarse_loading: BTreeSet<(u32, u32)>,
     /// Columns being built while one of their chunks was written; their
@@ -212,6 +212,22 @@ pub struct StreamedWorld {
     write_failures: usize,
     changes: WorldChanges,
     errors: Vec<String>,
+    motion: Motion,
+    /// Load and hole figures for [`ResidencyStats`].
+    counters: Counters,
+}
+
+/// Running figures reported in [`ResidencyStats`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    holes: usize,
+    holes_ahead: usize,
+    hole_sum: u64,
+    hole_ahead_sum: u64,
+    updates: u64,
+    generated: usize,
+    warm_hits: usize,
+    disk_loads: usize,
 }
 
 /// The chunk-aligned boxes of `region`, one per chunk it touches.
@@ -287,6 +303,11 @@ impl StreamedWorld {
             saved,
             refused: BTreeSet::new(),
             warm: Warm::default(),
+            compressing: BTreeMap::new(),
+            tickets: 0,
+            to_compress: VecDeque::new(),
+            to_compress_bytes: 0,
+            compress_in_flight: 0,
             coarse_loaded: BTreeMap::new(),
             coarse_loading: BTreeSet::new(),
             coarse_stale: BTreeSet::new(),
@@ -304,6 +325,8 @@ impl StreamedWorld {
             write_failures: 0,
             changes: WorldChanges::default(),
             errors: Vec::new(),
+            motion: Motion::default(),
+            counters: Counters::default(),
         };
         for record in replay {
             match record {
@@ -395,15 +418,33 @@ impl StreamedWorld {
             saving_bytes: self.held_bytes,
             pending_chunks: self.pending.len(),
             hot_bytes: self.hot_bytes,
-            warm_chunks: self.warm.entries.len(),
-            warm_bytes: self.warm.bytes,
+            warm_chunks: self.warm.len(),
+            warm_edited: self.warm.edited(),
+            warm_bytes: self.warm.bytes(),
+            compressing: self.to_compress.len() + self.compress_in_flight,
+            compressing_bytes: self.to_compress_bytes,
             coarse_columns: self.coarse_loaded.len(),
             coarse_bytes: self.coarse_bytes,
             saved_chunks: self.saved.len(),
             writes: self.writes_submitted,
             checkpoints: self.checkpoints,
             log_bytes: self.wal_bytes,
+            holes: self.counters.holes,
+            holes_ahead: self.counters.holes_ahead,
+            hole_sum: self.counters.hole_sum,
+            hole_ahead_sum: self.counters.hole_ahead_sum,
+            updates: self.counters.updates,
+            generated: self.counters.generated,
+            warm_hits: self.counters.warm_hits,
+            disk_loads: self.counters.disk_loads,
         }
+    }
+
+    /// The player's smoothed velocity, in metres per second.
+    pub fn velocity_m_s(&self) -> [f32; 3] {
+        self.motion
+            .velocity()
+            .map(|v| v / world_core::consts::VOXELS_PER_METER as f32)
     }
 
     /// Whether every chunk within the full-detail radius of `eye` is loaded.
@@ -413,14 +454,22 @@ impl StreamedWorld {
             .all(|c| self.loaded.contains_key(c))
     }
 
-    /// One frame of residency around `eye`.
-    pub fn update(&mut self, eye: VoxelPos) {
+    /// One frame of residency around `eye`, `dt_secs` after the previous
+    /// one (successive positions give the player's velocity).
+    pub fn update(&mut self, eye: VoxelPos, dt_secs: f32) {
+        self.motion.observe(
+            eye,
+            dt_secs,
+            self.config.velocity_smoothing_secs,
+            plan::voxels(self.config.evict_radius_m),
+        );
         for done in self.pool.drain() {
             self.finish(done, eye);
         }
         self.graft_ready();
         self.request_loads(eye);
         self.evict(eye);
+        self.submit_compressions();
         self.update_coarse(eye);
         if self.wal_dirty {
             if let Err(e) = self.wal.sync() {
@@ -794,8 +843,14 @@ impl StreamedWorld {
                 data,
                 refused,
                 error,
+                source,
             } => {
                 self.loading.remove(&coord);
+                match source {
+                    LoadSource::Warm => self.counters.warm_hits += 1,
+                    LoadSource::Saved => self.counters.disk_loads += 1,
+                    LoadSource::Generated => self.counters.generated += 1,
+                }
                 if let Some(e) = error {
                     self.errors.push(e);
                 }
@@ -807,6 +862,10 @@ impl StreamedWorld {
                     || self.pending.contains_key(&coord);
                 if wanted && !self.loaded.contains_key(&coord) {
                     self.ready.push_back((coord, data, false));
+                } else if !wanted {
+                    // The player moved on before it arrived: keep it warm
+                    // for a return.
+                    self.keep_warm(coord, data);
                 }
             }
             Done::Saved {
@@ -845,6 +904,82 @@ impl StreamedWorld {
                 self.coarse_loaded.insert((x, z), entry);
                 self.changes.coarse = true;
             }
+            Done::Compressed {
+                coord,
+                warm,
+                ticket,
+            } => {
+                self.compress_in_flight = self.compress_in_flight.saturating_sub(1);
+                if self.compressing.get(&coord) != Some(&ticket) {
+                    return;
+                }
+                self.compressing.remove(&coord);
+                let edited = self.saved.contains(&coord);
+                self.warm.insert(
+                    coord,
+                    warm,
+                    edited,
+                    self.warm_cap(),
+                    self.config.warm_edited_weight,
+                );
+            }
+        }
+    }
+
+    fn warm_cap(&self) -> usize {
+        self.config.warm_cap_mib as usize * MIB
+    }
+
+    /// Loads and compressions in flight at most.
+    fn in_flight_cap(&self) -> usize {
+        (self.config.workers.max(1) as usize) * 4
+    }
+
+    /// Keeps the unchanged chunk `data` at `coord` in the warm cache: its
+    /// entry is marked used if it has one (still exact: an entry is replaced
+    /// whenever the chunk is written), else it waits for a worker to
+    /// compress it.
+    fn keep_warm(&mut self, coord: ChunkCoord, data: ChunkData) {
+        if self.warm_cap() == 0 || self.warm.touch(coord) {
+            return;
+        }
+        self.tickets += 1;
+        self.compressing.insert(coord, self.tickets);
+        let bytes = data.bytes();
+        self.to_compress
+            .push_back((coord, data, self.tickets, bytes));
+        self.to_compress_bytes += bytes;
+        let bound = self.in_flight_cap() * 4;
+        while self.to_compress.len() > bound {
+            let Some((c, _, ticket, bytes)) = self.to_compress.pop_front() else {
+                break;
+            };
+            self.to_compress_bytes -= bytes;
+            if self.compressing.get(&c) == Some(&ticket) {
+                self.compressing.remove(&c);
+            }
+        }
+    }
+
+    /// Hands waiting compressions to the workers while fewer loads than the
+    /// in-flight cap are outstanding, the most recently evicted first (the
+    /// nearest to the player, so the likeliest to be wanted again).
+    fn submit_compressions(&mut self) {
+        let cap = self.in_flight_cap();
+        while self.loading.len() + self.compress_in_flight < cap {
+            let Some((coord, data, ticket, bytes)) = self.to_compress.pop_back() else {
+                break;
+            };
+            self.to_compress_bytes -= bytes;
+            if self.compressing.get(&coord) != Some(&ticket) {
+                continue;
+            }
+            self.compress_in_flight += 1;
+            self.pool.submit(Request::Compress {
+                coord,
+                data,
+                ticket,
+            });
         }
     }
 
@@ -894,8 +1029,11 @@ impl StreamedWorld {
         if let Some(checkpoint) = &mut self.checkpoint {
             checkpoint.waiting.remove(&coord);
         }
+        // The region file changed: compressions of older content are stale.
+        self.compressing.remove(&coord);
+        let cap = self.warm_cap();
         self.warm
-            .insert(coord, warm, self.config.warm_cap_mib as usize * MIB);
+            .insert(coord, warm, true, cap, self.config.warm_edited_weight);
         if let Some(coarse) = coarse {
             self.replace_coarse(coord, coarse);
         }
@@ -987,8 +1125,10 @@ impl StreamedWorld {
     }
 
     fn request_loads(&mut self, eye: VoxelPos) {
-        let in_flight_cap = (self.config.workers.max(1) as usize) * 4;
-        for coord in plan::sphere(eye, self.config.full_radius_m) {
+        let in_flight_cap = self.in_flight_cap();
+        let sphere = plan::sphere(eye, self.config.full_radius_m);
+        self.count_holes(eye, &sphere);
+        for coord in self.load_order(eye, sphere) {
             if self.loaded.contains_key(&coord)
                 || self.loading.contains(&coord)
                 || self.ready.iter().any(|(c, _, _)| *c == coord)
@@ -1021,10 +1161,57 @@ impl StreamedWorld {
         }
     }
 
-    /// RAM held by full-detail chunks: the loaded ones and evicted ones
-    /// waiting for their writes.
+    /// The order to request chunks in: the full-detail `sphere` (nearest
+    /// first) ahead of the motion first, then, once all of it is requested
+    /// and while the hot tier is under its cap, the lookahead sphere. Every
+    /// chunk of the full-detail sphere precedes every lookahead chunk, so
+    /// prefetching never starves it.
+    fn load_order(&self, eye: VoxelPos, sphere: Vec<ChunkCoord>) -> Vec<ChunkCoord> {
+        let c = &self.config;
+        let Some(predicted) = self.motion.predicted(
+            eye,
+            c.prefetch_lookahead_secs,
+            plan::voxels(c.evict_radius_m),
+        ) else {
+            return sphere;
+        };
+        let mut order = plan::ahead_first(eye, predicted, &sphere);
+        if self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB {
+            order.extend(plan::lookahead(
+                eye,
+                predicted,
+                c.prefetch_radius_m,
+                c.full_radius_m,
+                c.evict_radius_m,
+            ));
+        }
+        order
+    }
+
+    /// Records the chunks of the full-detail `sphere` around `eye` that are
+    /// not loaded.
+    fn count_holes(&mut self, eye: VoxelPos, sphere: &[ChunkCoord]) {
+        let (mut holes, mut ahead) = (0, 0);
+        for &c in sphere {
+            if !self.loaded.contains_key(&c) {
+                holes += 1;
+                if self.motion.is_ahead(eye, c) {
+                    ahead += 1;
+                }
+            }
+        }
+        let n = &mut self.counters;
+        n.holes = holes;
+        n.holes_ahead = ahead;
+        n.hole_sum += holes as u64;
+        n.hole_ahead_sum += ahead as u64;
+        n.updates += 1;
+    }
+
+    /// RAM held by full-detail chunks: the loaded ones, evicted ones
+    /// waiting for their writes and unchanged ones waiting to be compressed.
     fn hot_bytes_in_use(&self) -> usize {
-        self.hot_bytes + self.held_bytes
+        self.hot_bytes + self.held_bytes + self.to_compress_bytes
     }
 
     fn evict(&mut self, eye: VoxelPos) {
@@ -1080,6 +1267,10 @@ impl StreamedWorld {
                 self.held_bytes -= old;
             }
             self.held_bytes += bytes;
+        } else {
+            // What the region file or the generator gives: kept compressed,
+            // so a return does not generate it again.
+            self.keep_warm(coord, data);
         }
         self.changes.unloaded.push(coord);
         self.refresh_render(coord);
@@ -1150,6 +1341,29 @@ impl StreamedWorld {
     /// RAM the hot cap is checked against.
     pub(super) fn hot_bytes_counted(&self) -> usize {
         self.hot_bytes_in_use()
+    }
+
+    /// The warm cache's bytes, summed afresh from its entries.
+    pub(super) fn warm_bytes_walked(&self) -> usize {
+        self.warm.bytes_walked()
+    }
+
+    /// Whether the warm cache holds `coord`.
+    pub(super) fn is_warm(&self, coord: ChunkCoord) -> bool {
+        self.warm.contains(coord)
+    }
+
+    /// The loaded content of `coord`.
+    pub(super) fn chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
+        self.loaded
+            .contains_key(&coord)
+            .then(|| self.tree.chunk_data(coord.min_voxel()))
+            .flatten()
+    }
+
+    /// The loaded chunks.
+    pub(super) fn loaded_chunks(&self) -> Vec<ChunkCoord> {
+        self.loaded.keys().copied().collect()
     }
 }
 

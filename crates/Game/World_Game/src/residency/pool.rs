@@ -14,7 +14,7 @@ use world_core::serialize::region::RecordKind;
 use world_core::tree::ChunkData;
 use world_gen::ChunkCoord;
 
-use super::jobs::{self, Generators, WarmChunk};
+use super::jobs::{self, Generators, LoadSource, WarmChunk};
 use super::store::{RegionStore, SavedChunk};
 
 /// What the main thread asks for.
@@ -41,6 +41,13 @@ pub enum Request {
         z: u32,
         edited: Vec<ChunkCoord>,
     },
+    /// Compress an unchanged chunk for the warm cache; `ticket` comes back
+    /// with the result.
+    Compress {
+        coord: ChunkCoord,
+        data: ChunkData,
+        ticket: u64,
+    },
 }
 
 /// What comes back.
@@ -50,6 +57,7 @@ pub enum Done {
         data: ChunkData,
         refused: bool,
         error: Option<String>,
+        source: LoadSource,
     },
     Saved {
         coord: ChunkCoord,
@@ -62,6 +70,11 @@ pub enum Done {
         x: u32,
         z: u32,
         chunks: Vec<(ChunkCoord, ChunkData)>,
+    },
+    Compressed {
+        coord: ChunkCoord,
+        warm: WarmChunk,
+        ticket: u64,
     },
 }
 
@@ -94,6 +107,7 @@ enum WorkJob {
     Load(ChunkCoord, Option<WarmChunk>, Vec<SavedChunk>),
     Save(ChunkCoord, ChunkData, bool),
     Coarse(u32, u32, Vec<(ChunkCoord, SavedChunk)>),
+    Compress(ChunkCoord, ChunkData, u64),
 }
 
 /// The I/O thread and the workers.
@@ -193,6 +207,11 @@ impl Pool {
                     Request::Coarse { x, z, edited } => {
                         WorkJob::Coarse(x, z, read_coarse(store, &edited, shared.coarse_level))
                     }
+                    Request::Compress {
+                        coord,
+                        data,
+                        ticket,
+                    } => WorkJob::Compress(coord, data, ticket),
                 };
                 match run(&shared, job) {
                     Ran::Done(d) => done.push(d),
@@ -224,6 +243,11 @@ impl Pool {
                     Request::Coarse { x, z, .. } => {
                         work.send(WorkJob::Coarse(x, z, Vec::new())).is_ok()
                     }
+                    Request::Compress {
+                        coord,
+                        data,
+                        ticket,
+                    } => work.send(WorkJob::Compress(coord, data, ticket)).is_ok(),
                 };
             }
         }
@@ -336,6 +360,7 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 data: loaded.data,
                 refused: loaded.refused,
                 error: loaded.error,
+                source: loaded.source,
             })
         }
         WorkJob::Save(coord, data, set_aside) => {
@@ -358,6 +383,11 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 shared.coarse_level,
                 &saved,
             ),
+        }),
+        WorkJob::Compress(coord, data, ticket) => Ran::Done(Done::Compressed {
+            coord,
+            warm: jobs::compress(coord, data),
+            ticket,
         }),
     }
 }

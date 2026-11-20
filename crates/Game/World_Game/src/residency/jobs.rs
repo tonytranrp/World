@@ -16,11 +16,12 @@ use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator, GeneratorVersio
 
 use super::store::SavedChunk;
 
-/// An edited chunk kept compressed in RAM after eviction: the LZ4 of its
-/// full encoding.
+/// A chunk kept compressed in RAM after eviction: the LZ4 of the full
+/// encoding of a tree holding only it. The bytes are shared, so handing an
+/// entry to a load copies nothing.
 #[derive(Clone, Debug)]
 pub struct WarmChunk {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub len: usize,
 }
 
@@ -82,6 +83,17 @@ impl Generators {
     }
 }
 
+/// Where a loaded chunk's content came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadSource {
+    /// Decompressed from the warm cache.
+    Warm,
+    /// Decoded from its region file records.
+    Saved,
+    /// Generated from the seed.
+    Generated,
+}
+
 /// A loaded chunk, ready to join the world. Its content is what the warm
 /// cache, the region file or the generator holds, so it needs no saving
 /// until it changes.
@@ -93,6 +105,7 @@ pub struct Loaded {
     /// before anything replaces it.
     pub refused: bool,
     pub error: Option<String>,
+    pub source: LoadSource,
 }
 
 /// Generates the chunk at `coord` into detached data.
@@ -137,6 +150,7 @@ pub fn load(
                         data,
                         refused: false,
                         error: None,
+                        source: LoadSource::Warm,
                     };
                 }
             }
@@ -187,6 +201,7 @@ pub fn load(
                     data,
                     refused,
                     error,
+                    source: LoadSource::Saved,
                 };
             }
             Err(e) => {
@@ -199,6 +214,7 @@ pub fn load(
         data: generate(generators.current(), coord),
         refused,
         error,
+        source: LoadSource::Generated,
     }
 }
 
@@ -252,15 +268,28 @@ pub fn encode_chunk(
         });
         coarse_data = coarse.take_chunk(min).ok();
     }
-    let warm = WarmChunk {
-        bytes: codec::compress(Codec::Lz4, &full),
-        len: full.len(),
-    };
+    let warm = warm_of(&full);
     Encoded {
         records,
         warm,
         coarse: coarse_data,
     }
+}
+
+/// The warm form of a chunk's full encoding.
+fn warm_of(full: &[u8]) -> WarmChunk {
+    WarmChunk {
+        bytes: codec::compress(Codec::Lz4, full).into(),
+        len: full.len(),
+    }
+}
+
+/// Compresses the unchanged chunk `data` at `coord` for the warm cache.
+pub fn compress(coord: ChunkCoord, data: ChunkData) -> WarmChunk {
+    let mut tree = VoxelTree::unloaded();
+    // An aligned chunk position always inserts.
+    let _ = tree.insert_chunk(coord.min_voxel(), data);
+    warm_of(&encode(&tree))
 }
 
 /// The chunks of coarse column (`x`, `z`) that cross the terrain surface,
