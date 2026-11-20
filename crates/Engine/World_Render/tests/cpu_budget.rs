@@ -1892,7 +1892,7 @@ fn burials_stay_exact_under_random_operations() {
                 }
                 7 => {
                     let i = rng.next() as usize % CHUNKS.len();
-                    let data = if rng.next() % 2 == 0 {
+                    let data = if rng.next().is_multiple_of(2) {
                         replacement(CHUNKS[i])
                     } else {
                         originals[i].clone()
