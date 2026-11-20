@@ -142,6 +142,17 @@ fn chunk_to_tree(c: &mut Criterion) {
             })
         });
     }
+    // An all-air chunk above the surface: most chunks the streamed world
+    // loads, which cost their columns and nothing more.
+    let air = ChunkCoord::containing(world_core::VoxelPos::new(
+        min.x,
+        hi + CHUNK_SIZE as i32,
+        min.z,
+    ))
+    .expect("inside the world");
+    group.bench_function("air_columns_and_build", |b| {
+        b.iter(|| build(black_box(air)))
+    });
     let source = g.chunk_source(deep);
     group.bench_function("caves_underground_build_only", |b| {
         b.iter(|| {

@@ -151,23 +151,76 @@ pub fn lerp(t: f32, a: f32, b: f32) -> f32 {
 }
 
 /// The reference gradient: twelve cube-edge directions (four repeated),
-/// chosen by the low four bits of the hash.
+/// chosen by the low four bits of the hash. The reference picks `u` and `v`
+/// and their signs with branches, which a random hash defeats; here they
+/// come from tables and the signs are flipped with the sign bit, which is
+/// exactly what negation does, so the result is the same bits.
+#[inline]
 fn grad(hash: usize, x: f32, y: f32, z: f32) -> f32 {
     let h = hash & 15;
-    let u = if h < 8 { x } else { y };
-    let v = if h < 4 {
-        y
-    } else if h == 12 || h == 14 {
-        x
-    } else {
-        z
-    };
-    (if h & 1 == 0 { u } else { -u }) + (if h & 2 == 0 { v } else { -v })
+    let xyz = [x, y, z];
+    let u = xyz[GRAD_U[h]].to_bits() ^ ((h as u32 & 1) << 31);
+    let v = xyz[GRAD_V[h]].to_bits() ^ ((h as u32 & 2) << 30);
+    f32::from_bits(u) + f32::from_bits(v)
 }
+
+/// Which of `x, y, z` the reference gradient takes as `u`: `x` below 8.
+const GRAD_U: [usize; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+
+/// And as `v`: `y` below 4, `x` at 12 and 14, else `z`.
+const GRAD_V: [usize; 16] = [1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 0, 2];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gradient as the reference writes it.
+    fn reference_grad(hash: usize, x: f32, y: f32, z: f32) -> f32 {
+        let h = hash & 15;
+        let u = if h < 8 { x } else { y };
+        let v = if h < 4 {
+            y
+        } else if h == 12 || h == 14 {
+            x
+        } else {
+            z
+        };
+        (if h & 1 == 0 { u } else { -u }) + (if h & 2 == 0 { v } else { -v })
+    }
+
+    #[test]
+    fn the_gradient_is_the_reference_bit_for_bit() {
+        let values = [
+            0.0,
+            -0.0,
+            0.25,
+            -0.75,
+            1.0,
+            -1.0,
+            1.5e-39,
+            3.0e38,
+            f32::INFINITY,
+        ];
+        for hash in 0..64 {
+            for &x in &values {
+                for &y in &values {
+                    for &z in &values {
+                        let (got, want) = (grad(hash, x, y, z), reference_grad(hash, x, y, z));
+                        assert_eq!(got.to_bits(), want.to_bits(), "{hash} {x} {y} {z}");
+                    }
+                }
+            }
+        }
+        let mut s = Stream::new(4);
+        for _ in 0..100_000 {
+            let hash = s.next_u64() as usize;
+            let [x, y, z] = [(); 3].map(|_| s.unit_f32() * 2.0 - 1.0);
+            assert_eq!(
+                grad(hash, x, y, z).to_bits(),
+                reference_grad(hash, x, y, z).to_bits()
+            );
+        }
+    }
 
     #[test]
     fn the_reference_permutation_is_a_permutation() {

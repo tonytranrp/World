@@ -37,7 +37,7 @@ mod tests;
 use std::fmt;
 
 pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
-pub use build::RegionSource;
+pub use build::{LeafFill, RegionSource, brick_by_leaves};
 pub use chunks::{ChunkData, ChunkInfo, MemoryBreakdown, representative};
 pub use cursor::TreeCursor;
 pub use grid::{DenseGrid, GridNode, MAX_GRID_LEVELS};

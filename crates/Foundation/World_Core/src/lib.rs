@@ -17,5 +17,5 @@ pub use coords::{BrickPos, VoxelBox, VoxelPos};
 pub use edit::{DirtyBricks, Edit, EditError};
 pub use material::{MaterialDef, MaterialId, MaterialTable};
 pub use tree::{
-    DenseGrid, RegionSource, TreeCursor, TreeRead, TreeSnapshot, VoxelSource, VoxelTree,
+    DenseGrid, LeafFill, RegionSource, TreeCursor, TreeRead, TreeSnapshot, VoxelSource, VoxelTree,
 };
