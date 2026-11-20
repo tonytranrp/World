@@ -98,12 +98,13 @@ impl ChunkKeys {
     }
 
     fn link(&mut self, id: u32, key: u32) {
+        // Already linked there: touch nothing a snapshot may share.
+        if self.keys.get(id as usize) == Some(&key) {
+            return;
+        }
         let keys = Arc::make_mut(&mut self.keys);
         if keys.len() <= id as usize {
             keys.resize(id as usize + 1, NO_KEY);
-        }
-        if keys[id as usize] == key {
-            return;
         }
         keys[id as usize] = key;
         Arc::make_mut(&mut self.index).insert(key, id);
