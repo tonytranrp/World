@@ -62,11 +62,19 @@ and tests stay deterministic.
   mask.** The GPU finds children and leaves by their rank in the record's
   mask, and a change elsewhere can rewrite the record of a node whose own
   change has not been applied (a waiting chunk, or a node above a deferred
-  edit). Each entry keeps the mask its group or block was laid out for;
-  before its record is written again, what it holds below is dropped if
-  that mask differs or the node lies in a waiting chunk, and stage 1
-  refines it again. Releasing a subtree walks the entries below, not the
-  record's mask.
+  edit, whose mask in the source changed with it). Each entry keeps the
+  mask its group or block was laid out for. When its parent's group is
+  written again and that mask differs, or the node lies in a waiting
+  chunk, it keeps its record (moved to its new index): it describes the
+  old content until the change below rewrites its path. Dropping its
+  subtree instead was tried and regressed walking badly: a chunk waiting
+  below a level-5 node changes that node's mask, so every rewrite above
+  dropped the whole node (13 releases freed 634,000 records in 100
+  frames), stage 1 rebuilt it, the change queue grew to 1,200 to 2,300,
+  and frames went from 16-17 ms (max 33-38) to 20-21 ms (max 86-99).
+  Releasing a subtree walks the entries below, not the record's mask.
+  verify checks only the structure of records on a pending change's path
+  or in a waiting chunk.
 - **Summaries below the chunk level are kept per chunk**, so a replaced
   chunk forgets its own at once, and air and uniform children are answered
   without a cache lookup.

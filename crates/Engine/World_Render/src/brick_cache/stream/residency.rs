@@ -522,14 +522,39 @@ impl Residency {
 
     /// The record a child should have, given the table, or `None` for air.
     fn child_record<N: NodeView>(&mut self, key: NodeKey, view: N) -> Option<GpuNode> {
+        self.record_of(key, view, false)
+    }
+
+    /// The record to write for child `key` (whose view is `view`) when its
+    /// parent's group is written: [`child_record`](Self::child_record),
+    /// except that a mixed child whose group or brick block was laid out for
+    /// another mask, or that lies in a replaced chunk that waits, keeps its
+    /// current record. Such a node's content changed under a change not
+    /// applied yet; until that change rewrites its path it keeps describing
+    /// the old content (decision 0012), with the mask its group or block was
+    /// laid out for. Rewriting it would make the GPU read children by rank
+    /// in the wrong mask; dropping what it holds instead would throw away
+    /// whole subtrees for stage 1 to rebuild.
+    fn group_record<N: NodeView>(&mut self, key: NodeKey, view: N) -> Option<GpuNode> {
+        self.record_of(key, view, true)
+    }
+
+    fn record_of<N: NodeView>(&mut self, key: NodeKey, view: N, keep: bool) -> Option<GpuNode> {
         let edited = self.edited_bit(key);
         match content(&view) {
             Content::Air => None,
             Content::Uniform(m) => Some(GpuNode::uniform(m, edited)),
             Content::Unloaded => Some(GpuNode::not_resident(0, MaterialId::AIR, edited)),
             Content::Branch | Content::Leaf => {
-                let material = self.summary(key, view).material;
                 let mask = view.mask();
+                if keep
+                    && let Some(e) = self.entries.get(&key)
+                    && (e.group.is_some() || e.brick.is_some())
+                    && (e.layout != mask || self.in_waiting_chunk(key))
+                {
+                    return Some(e.record);
+                }
+                let material = self.summary(key, view).material;
                 let e = self.entries.get(&key);
                 Some(match (e.and_then(|e| e.group), e.and_then(|e| e.brick)) {
                     (Some(g), _) if key.level >= 2 => {
@@ -599,21 +624,6 @@ impl Residency {
         if let Some(e) = self.entries.get_mut(&key) {
             e.layout = mask;
         }
-    }
-
-    /// The record to keep for `key` when its parent's group is written
-    /// again and its content's mask is now `mask`: its current one, when it
-    /// points at a group or brick block laid out for another mask, or lies
-    /// in a replaced chunk that waits. Such a node's content changed under a
-    /// change not applied yet; until that change rewrites its path, it keeps
-    /// describing the old content (decision 0012), and its record keeps the
-    /// mask its group or block was laid out for. Rewriting it would make the
-    /// GPU read children by rank in the wrong mask; dropping what it holds
-    /// instead would throw away whole subtrees for stage 1 to rebuild.
-    fn kept_record(&self, key: NodeKey, mask: u64) -> Option<GpuNode> {
-        let e = self.entries.get(&key)?;
-        let linked = e.group.is_some() || e.brick.is_some();
-        (linked && (e.layout != mask || self.in_waiting_chunk(key))).then_some(e.record)
     }
 
     /// Forgets everything below and including `key` without writing records:
@@ -713,10 +723,7 @@ impl Residency {
         for (k, (slot, child)) in view.children().enumerate() {
             let ck = key.child(slot);
             let index = group.first + k as u32;
-            let Some(record) = self
-                .kept_record(ck, child.mask())
-                .or_else(|| self.child_record(ck, child))
-            else {
+            let Some(record) = self.group_record(ck, child) else {
                 continue;
             };
             if content(&child) == Content::Branch {
@@ -760,10 +767,7 @@ impl Residency {
                 self.drop_subtree(ck, batch);
             }
             let index = group.first + (mask & ((1u64 << slot) - 1)).count_ones();
-            let record = self
-                .kept_record(ck, child.mask())
-                .or_else(|| self.child_record(ck, child));
-            if let Some(record) = record {
+            if let Some(record) = self.group_record(ck, child) {
                 if branch {
                     self.put_entry(ck, index, record);
                 }
