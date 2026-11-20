@@ -93,6 +93,8 @@ cargo xtask bench --instructions --check main --threshold 5   # fail on >5% more
 cargo xtask fuzz [decode|round_trip] [--time SECS]     # cargo-fuzz on the decoder (nightly), 300 s each
 cargo xtask mutants [-- ARGS]                          # cargo-mutants on World_Core, results in mutants.out/
 cargo bench -p world_core --bench memory               # print tree memory per surface voxel and fragmentation
+cargo bench -p world_core --bench workloads -- chunks   # chunk move, compaction, LZ4 and zstd throughput
+cargo bench -p world_gen --bench terrain -- terrain_tree   # seed to tree for one 16 m chunk
 ```
 
 - Benchmarks: `World_Core/benches/tree.rs` (microbenchmarks) and `workloads.rs` (dense overwrites, carving, coherent reads, `apply` batches, the first edit after a snapshot of a 500 MiB tree, serialization) are Criterion wall-time benches; `memory.rs` prints `stats()` figures; `instructions.rs` counts instructions with gungraun under Valgrind and is what CI gates on (`quality` workflow, `bench-instructions` job), because instruction counts are stable on shared runners and wall time is not.
@@ -123,6 +125,16 @@ cargo xtask test reload    # every hot-reload test, GPU shader reload and the ho
 ```
 
 `dx` must match the `subsecond` version in `Cargo.lock` (0.7.10): `cargo install dioxus-cli --version 0.7.10 --locked`.
+
+## The streamed world
+
+Design and reasons: decisions 0006 to 0009.
+
+- The world tree is stored per chunk: the subtree under each level-4 node (1024 voxels, 16 m) has its own arenas. A chunk-level or larger region can be not resident; reads report it (`lookup` returns `None`) and edits there fail with `EditError::NotResident`.
+- Build trees bottom-up through a `RegionSource` (`VoxelTree::from_source`, `build_region`), never with one `set` per voxel. Move finished chunks between trees with `take_chunk` and `insert_chunk` (O(1)).
+- World_Game's `residency` domain owns the world (`StreamedWorld`): loading around the player, saving edited chunks as overlays in region files, the edit log, the warm and coarse tiers. Gameplay edits go through it, never straight to a tree. Tune it in `assets/config/residency.ron`; terrain lives in `assets/config/terrain.ron`.
+- Saves are in `saves/` (git-ignored). Deleting it resets the world to the seed.
+- Terrain generation is bit-exact on every platform (decision 0008): plain `f32`, no `mul_add`, no platform math functions, no runtime SIMD dispatch. World_Gen's golden hashes run on Windows, macOS arm64 and macOS x86_64.
 
 ## Building and running
 

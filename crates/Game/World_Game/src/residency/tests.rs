@@ -270,3 +270,22 @@ fn the_threaded_pool_gives_the_same_world() {
     std::fs::remove_dir_all(&dir).unwrap();
     let _ = std::fs::remove_dir_all(temp_dir("threads2"));
 }
+
+#[test]
+fn an_overlay_from_another_generator_version_is_refused() {
+    use super::jobs;
+    use super::store::SavedChunk;
+    use world_core::serialize::region::RecordKind;
+    let dir = temp_dir("version");
+    let world = open(&dir, config(0));
+    let coord = world_gen::ChunkCoord::new(500, 512, 500).unwrap();
+    let saved = [SavedChunk {
+        kind: RecordKind::Overlay,
+        generator: 99,
+        bytes: vec![1, 2, 3],
+    }];
+    let loaded = jobs::load(world.generator(), 1, coord, None, &saved);
+    assert!(!loaded.edited, "the generated chunk stands in");
+    assert!(loaded.error.unwrap().contains("version 99"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

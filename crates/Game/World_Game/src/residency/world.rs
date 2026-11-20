@@ -275,7 +275,6 @@ impl StreamedWorld {
     }
 
     /// Whether every chunk within the full-detail radius of `eye` is loaded.
-    #[cfg(test)]
     pub fn is_settled(&self, eye: VoxelPos) -> bool {
         plan::sphere(eye, self.config.full_radius_m)
             .iter()

@@ -13,10 +13,10 @@ pub mod world;
 mod tests;
 
 use bevy::prelude::*;
-use world_core::VoxelPos;
 use world_core::consts::VOXELS_PER_METER;
+use world_core::{ConfigAsset, VoxelPos};
 use world_gen::TerrainConfig;
-use world_reload::{AppConfigExt, Config};
+use world_reload::{AppConfigExt, Config, ConfigOrigin, ConfigRegistry};
 
 pub use config::ResidencyConfig;
 pub use world::StreamedWorld;
@@ -47,15 +47,31 @@ fn eye_voxel(transform: &GlobalTransform) -> VoxelPos {
     VoxelPos::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
 }
 
-/// Opens the world once the configs are in, and again when either changes,
-/// so the seed and terrain can be tuned live (unsaved edits are saved first).
+/// How long to wait for the config files before opening the world with
+/// the safe defaults (a missing or broken file never blocks the game).
+const CONFIG_GRACE_SECS: f32 = 3.0;
+
+/// Opens the world once the config files are in, and again when either
+/// changes, so the seed and terrain can be tuned live (unsaved edits are
+/// saved first).
 fn open_world(
     mut commands: Commands,
     world: Option<ResMut<World>>,
     residency: Res<Config<ResidencyConfig>>,
     terrain: Res<Config<TerrainConfig>>,
+    registry: Res<ConfigRegistry>,
+    time: Res<Time>,
 ) {
     if world.is_some() && !residency.is_changed() && !terrain.is_changed() {
+        return;
+    }
+    let from_file = |name: &str| {
+        registry
+            .get(name)
+            .is_some_and(|e| e.origin != ConfigOrigin::Defaults)
+    };
+    let files_in = from_file(ResidencyConfig::NAME) && from_file(TerrainConfig::NAME);
+    if world.is_none() && !files_in && time.elapsed_secs() < CONFIG_GRACE_SECS {
         return;
     }
     if let Some(mut old) = world
@@ -77,14 +93,35 @@ fn open_world(
     }
 }
 
-fn update_world(world: Option<ResMut<World>>, camera: Query<&GlobalTransform, With<PlayerCamera>>) {
+fn update_world(
+    world: Option<ResMut<World>>,
+    camera: Query<&GlobalTransform, With<PlayerCamera>>,
+    time: Res<Time>,
+    mut opened_at: Local<Option<f32>>,
+) {
     let Some(mut world) = world else {
         return;
     };
     let Ok(transform) = camera.single() else {
         return;
     };
-    world.0.update(eye_voxel(transform));
+    if world.is_added() {
+        *opened_at = Some(time.elapsed_secs());
+    }
+    let eye = eye_voxel(transform);
+    world.0.update(eye);
+    if let Some(start) = *opened_at
+        && world.0.is_settled(eye)
+    {
+        let s = world.0.stats();
+        info!(
+            "world settled around the player in {:.2} s: {} chunks, {:.0} MiB",
+            time.elapsed_secs() - start,
+            s.loaded,
+            s.hot_bytes as f64 / 1048576.0
+        );
+        *opened_at = None;
+    }
     for e in world.0.take_errors() {
         warn!("world residency: {e}");
     }

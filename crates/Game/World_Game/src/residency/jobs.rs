@@ -56,9 +56,12 @@ fn empty() -> ChunkData {
 }
 
 /// Loads `coord` from a warm entry, saved records or the generator, in that
-/// order of preference.
+/// order of preference. An overlay saved by another generator version would
+/// land on the wrong base, so it is refused (and kept on disk); a full record
+/// does not depend on the generator.
 pub fn load(
     generator: &Generator,
+    generator_version: u32,
     coord: ChunkCoord,
     warm: Option<&WarmChunk>,
     saved: &[SavedChunk],
@@ -83,6 +86,13 @@ pub fn load(
         }
     }
     for record in saved {
+        if record.kind == RecordKind::Overlay && record.generator != generator_version {
+            error = Some(format!(
+                "saved chunk {coord:?}: an overlay made with generator version {}, this build                  generates version {generator_version}",
+                record.generator
+            ));
+            continue;
+        }
         let result = decode(&record.bytes)
             .map_err(|e| e.to_string())
             .and_then(|saved_tree| {

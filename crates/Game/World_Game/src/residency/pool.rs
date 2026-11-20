@@ -300,7 +300,13 @@ enum Ran {
 fn run(shared: &Shared, job: WorkJob) -> Ran {
     match job {
         WorkJob::Load(coord, warm, saved) => {
-            let loaded = jobs::load(&shared.generator, coord, warm.as_ref(), &saved);
+            let loaded = jobs::load(
+                &shared.generator,
+                shared.generator_version,
+                coord,
+                warm.as_ref(),
+                &saved,
+            );
             Ran::Done(Done::Loaded {
                 coord,
                 data: loaded.data,
