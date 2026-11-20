@@ -188,10 +188,8 @@ pub fn run_frame<S: VoxelSource + Sync>(
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
     // Brick encoding and a replaced chunk's summaries are split into up to
-    // this many tasks on Bevy's compute task pool.
-    let threads = bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default)
-        .thread_num()
-        .clamp(1, 8);
+    // this many tasks on the brick cache's task pool.
+    let threads = super::residency::pool_threads();
     let summary_tasks = match input.config.summary_threads {
         0 => threads,
         n => n as usize,

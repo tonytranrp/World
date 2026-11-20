@@ -22,7 +22,7 @@
 //!   brick id, and each entry's child masks match its children's entries.
 
 use bevy::platform::collections::{HashMap, HashSet};
-use bevy::tasks::{ComputeTaskPool, TaskPool};
+use bevy::tasks::{TaskPool, TaskPoolBuilder};
 use world_core::MaterialId;
 use world_core::tree::{NodeView, VoxelSource};
 
@@ -1744,9 +1744,28 @@ fn summarize_level2<S: VoxelSource + Sync>(
     in_parallel(keys, tasks, run)
 }
 
-/// `run` over `items` split into up to `tasks` contiguous parts, on Bevy's
-/// compute task pool (no threads are spawned), the results concatenated in
-/// order. A panic in a part is raised again here.
+/// The brick cache's own task pool: up to 8 threads, made once. Not Bevy's
+/// compute task pool: a scope there, from inside the render system, made
+/// frames wait on Bevy's own tasks (walking, p95 and p99 5 to 7 ms higher).
+fn pool() -> &'static TaskPool {
+    static POOL: std::sync::OnceLock<TaskPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
+        TaskPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name("brick cache".to_string())
+            .build()
+    })
+}
+
+/// Threads of the brick cache's task pool, for sizing parallel work.
+pub fn pool_threads() -> usize {
+    pool().thread_num().max(1)
+}
+
+/// `run` over `items` split into up to `tasks` contiguous parts, on the
+/// brick cache's task pool (no threads are spawned per call), the results
+/// concatenated in order. A panic in a part is raised again here.
 fn in_parallel<T: Sync, R: Send + 'static>(
     items: &[T],
     tasks: usize,
@@ -1756,9 +1775,8 @@ fn in_parallel<T: Sync, R: Send + 'static>(
         return run(items);
     }
     let per = items.len().div_ceil(tasks);
-    let pool = ComputeTaskPool::get_or_init(TaskPool::default);
     let run = &run;
-    let parts = pool.scope(|scope| {
+    let parts = pool().scope(|scope| {
         for part in items.chunks(per) {
             scope.spawn(async move {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(part)))

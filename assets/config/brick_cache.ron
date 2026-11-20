@@ -79,8 +79,8 @@
     // computed on up to 8 threads. Walking at 8 m/s needs 1,500 to 2,500 a
     // frame. 1..=16777216
     max_summaries_per_frame: 8192,
-    // Tasks a replaced chunk's summaries are split into on Bevy's compute task
-    // pool; 0 picks one per pool thread, at most 8. 0..=64
+    // Tasks a replaced chunk's summaries are split into on the brick cache's
+    // task pool; 0 picks one per pool thread (at most 8). 0..=64
     summary_threads: 0,
     // Records whose groups and bricks are freed per frame after a collapse or
     // a replaced chunk took them out of the tree; the rest wait, and nothing

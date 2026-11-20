@@ -121,8 +121,8 @@ pub struct BrickCacheConfig {
     /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
     /// needs 1,500 to 2,500 a frame. `1..=16777216`.
     pub max_summaries_per_frame: u32,
-    /// Tasks a replaced chunk's summaries are split into on Bevy's compute
-    /// task pool; 0 picks one per pool thread, at most 8. `0..=64`.
+    /// Tasks a replaced chunk's summaries are split into on the brick cache's
+    /// task pool; 0 picks one per pool thread (at most 8). `0..=64`.
     pub summary_threads: u32,
     /// Records whose groups and bricks are freed per frame after a collapse
     /// or a replaced chunk took them out of the tree; the rest wait, and
