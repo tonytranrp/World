@@ -7953,9 +7953,18 @@ name = "world_render"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
+ "criterion",
+ "image",
+ "offset-allocator",
+ "proptest",
+ "serde",
+ "wesl",
  "wgpu",
  "world_core",
  "world_reload",
+ "world_testkit",
+ "world_testkit_bevy",
 ]
 
 [[package]]

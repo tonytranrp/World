@@ -1,0 +1,53 @@
+// Brick cache tuning (decision 0007). Hot-reloads on save; a bad value is
+// rejected and the last good tuning stays live. Fields marked "read at
+// startup" size the GPU pools, which never grow: editing them needs a restart.
+(
+    // Distance (stage 1: CPU picks nodes and bricks by distance) or
+    // RayGuided (stage 2: bricks are paged from ray requests).
+    stage: Distance,
+    // Pools on the floor Mac (--mac-floor), read at startup.
+    // node_pool_mib 1..=4096, brick_pool_mib 16..=16384,
+    // upload_budget_mib 1..=256 and at most the brick pool.
+    floor: (
+        node_pool_mib: 64,
+        brick_pool_mib: 768,
+        upload_budget_mib: 6,
+    ),
+    // Pools on the PC, read at startup.
+    pc: (
+        node_pool_mib: 128,
+        brick_pool_mib: 2048,
+        upload_budget_mib: 24,
+    ),
+    // Largest brick segment in MiB; 0 uses the adapter's binding limit.
+    // Read at startup. 0..=4096
+    max_segment_mib: 0,
+    // Expected mean brick block size in bytes; sizes the brick id table.
+    // Read at startup. 64..=16384
+    mean_brick_bytes: 1024,
+    // Evict when the brick pool is fuller than this fraction. 0.1..=1.0
+    evict_threshold: 0.9,
+    // Fraction of resident bricks one eviction pass tries to free. 0.001..=0.5
+    evict_fraction: 0.05,
+    // Bricks used within this many frames are never evicted. 2..=10000
+    min_evict_age_frames: 30,
+    // Ray requests per frame and victims per eviction pass.
+    // Read at startup. 64..=1048576
+    request_capacity: 16384,
+    victim_capacity: 16384,
+    lod: (
+        // Stage 1 refines a node when its cells would cover this many
+        // pixels. 0.05..=64.0
+        detail_pixels: 1.0,
+        // Stage 1 keeps a node refined until its cells shrink below
+        // detail_pixels * hysteresis. 0.1..=1.0
+        hysteresis: 0.7,
+        // Rays stop where a cell is smaller than this many pixel
+        // footprints; 0.0 traces at full resolution. 0.0..=16.0
+        footprint_bias: 1.0,
+    ),
+    // A small built-in scene while nothing feeds the renderer a world.
+    debug_scene: true,
+    // Animate a carve in the debug scene, exercising edit uploads.
+    debug_scene_edits: true,
+)
