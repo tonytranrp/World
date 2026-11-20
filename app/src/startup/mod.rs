@@ -22,7 +22,7 @@ use bevy::render::RenderPlugin;
 use bevy::render::settings::{Backends, PowerPreference, WgpuSettings};
 use clap::Parser;
 use world_anim::prelude::WorldAnimPlugin;
-use world_game::prelude::WorldGamePlugin;
+use world_game::prelude::{Autopilot, WorldGamePlugin};
 use world_physics::prelude::WorldPhysicsPlugin;
 use world_reload::prelude::WorldReloadPlugin;
 use world_render::prelude::{
@@ -131,6 +131,9 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
                 ..default()
             })
             .add_systems(Update, (frame_stats::record, exit_after_frames).chain());
+        if let Some(speed) = config.walk {
+            app.insert_resource(Autopilot::new(speed));
+        }
         if let Some(path) = &config.screenshot {
             app.insert_resource(ScreenshotAt {
                 frame: frames.saturating_sub(SCREENSHOT_LEAD_FRAMES).max(1),
@@ -190,11 +193,18 @@ fn exit_after_frames(
     limit: Res<ExitAfter>,
     mut frames: Local<u32>,
     times: Res<frame_stats::FrameTimes>,
+    pilot: Option<Res<Autopilot>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frames += 1;
     if *frames == limit.0 {
         frame_stats::report(&times);
+        if let Some(pilot) = pilot {
+            info!(
+                "walked {:.0} m at {} m/s",
+                pilot.walked_m, pilot.speed_m_per_s
+            );
+        }
     }
     if *frames >= limit.0 {
         exit.write(AppExit::Success);

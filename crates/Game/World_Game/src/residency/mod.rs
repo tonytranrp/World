@@ -2,6 +2,7 @@
 //! how every edit is kept (decision 0006). The core is plain Rust in
 //! [`world`]; this module adds the Bevy glue.
 
+mod autopilot;
 pub mod config;
 mod jobs;
 pub mod plan;
@@ -21,6 +22,7 @@ use world_gen::TerrainConfig;
 use world_reload::{AppConfigExt, Config, ConfigOrigin, ConfigRegistry};
 use world_render::prelude::VoxelWorldFeed;
 
+pub use autopilot::Autopilot;
 pub use config::ResidencyConfig;
 pub use world::StreamedWorld;
 
@@ -41,6 +43,7 @@ impl Plugin for ResidencyPlugin {
                 (
                     open_world,
                     place_on_ground,
+                    autopilot::walk,
                     update_world,
                     feed_renderer,
                     log_stats,

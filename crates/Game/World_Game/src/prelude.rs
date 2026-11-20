@@ -2,3 +2,4 @@
 
 pub use crate::WorldGamePlugin;
 pub use crate::player::PlayerCamera;
+pub use crate::residency::Autopilot;

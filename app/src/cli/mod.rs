@@ -41,6 +41,11 @@ pub struct Cli {
     /// this path when `--exit-after-frames` ends the run.
     #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
     pub frame_times: Option<std::path::PathBuf>,
+
+    /// Developer: walk the camera forward at this speed in metres per
+    /// second, over the terrain, to measure streaming under motion.
+    #[arg(long, value_name = "M_PER_S", requires = "exit_after_frames")]
+    pub walk: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -103,6 +108,14 @@ mod tests {
             cli.frame_times.as_deref(),
             Some(std::path::Path::new("t.txt"))
         );
+    }
+
+    #[test]
+    fn walking_needs_a_fixed_length_run() {
+        assert!(Cli::try_parse_from(["world", "--walk", "4"]).is_err());
+        let cli =
+            Cli::try_parse_from(["world", "--exit-after-frames", "60", "--walk", "4.5"]).unwrap();
+        assert_eq!(cli.walk, Some(4.5));
     }
 
     #[test]

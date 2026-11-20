@@ -15,6 +15,7 @@ pub struct Config {
     pub exit_after_frames: Option<u32>,
     pub screenshot: Option<std::path::PathBuf>,
     pub frame_times: Option<std::path::PathBuf>,
+    pub walk: Option<f32>,
 }
 
 impl Default for Config {
@@ -26,6 +27,7 @@ impl Default for Config {
             exit_after_frames: None,
             screenshot: None,
             frame_times: None,
+            walk: None,
         }
     }
 }
@@ -44,6 +46,7 @@ impl Config {
             exit_after_frames: cli.exit_after_frames,
             screenshot: cli.screenshot.clone(),
             frame_times: cli.frame_times.clone(),
+            walk: cli.walk,
         }
     }
 }
