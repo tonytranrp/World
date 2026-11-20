@@ -29,6 +29,10 @@ pub struct ResidencyConfig {
     pub workers: u32,
     /// Chunks joined to the world per frame at most.
     pub grafts_per_frame: u32,
+    /// When the edit log grows this much past its size after the last
+    /// checkpoint, the edited chunks are written to their region files and
+    /// the log restarts from a checkpoint, in KiB.
+    pub log_checkpoint_kib: u32,
     /// Where region files and the edit log live, relative to the working
     /// directory.
     pub save_dir: String,
@@ -47,6 +51,7 @@ impl Default for ResidencyConfig {
             coarse_cap_mib: 500,
             workers: 4,
             grafts_per_frame: 8,
+            log_checkpoint_kib: 16384,
             save_dir: "saves/world".into(),
         }
     }
@@ -76,6 +81,12 @@ impl ConfigAsset for ResidencyConfig {
             self.grafts_per_frame.into(),
             1.0,
             1024.0,
+        );
+        range(
+            "log_checkpoint_kib",
+            self.log_checkpoint_kib.into(),
+            64.0,
+            1_048_576.0,
         );
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());
@@ -109,10 +120,11 @@ mod tests {
             full_radius_m: 200.0,
             evict_radius_m: 100.0,
             workers: 100,
+            log_checkpoint_kib: 1,
             save_dir: " ".into(),
             ..ResidencyConfig::default()
         };
-        assert_eq!(bad.validate().unwrap_err().len(), 3);
+        assert_eq!(bad.validate().unwrap_err().len(), 4);
     }
 
     #[test]

@@ -4,12 +4,15 @@
 //! column. Each builds a standalone tree and hands back detached chunk data,
 //! which joins the world in O(1).
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
+
 use world_core::serialize::codec::{self, Codec};
 use world_core::serialize::region::RecordKind;
 use world_core::serialize::{decode, encode};
 use world_core::tree::{CHUNK_LEVEL, ChunkData};
 use world_core::{MaterialId, VoxelTree};
-use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator};
+use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator, GeneratorVersion};
 
 use super::store::SavedChunk;
 
@@ -28,13 +31,67 @@ impl WarmChunk {
     }
 }
 
-/// A loaded chunk, ready to join the world.
+/// The world's generator and every older version this build supports, for
+/// the same seed and terrain. An overlay saved against an older version is
+/// merged onto that version's base, so its edits land where they were made.
+pub struct Generators {
+    current: Arc<Generator>,
+    /// Older versions, each built the first time a record asks for it.
+    older: BTreeMap<u32, OnceLock<Option<Generator>>>,
+}
+
+impl Generators {
+    pub fn new(current: Arc<Generator>) -> Self {
+        let now = current.id().version;
+        let older = GeneratorVersion::SUPPORTED
+            .iter()
+            .filter(|&&v| v != now)
+            .map(|v| (v.0, OnceLock::new()))
+            .collect();
+        Self { current, older }
+    }
+
+    /// The generator new chunks come from.
+    pub fn current(&self) -> &Generator {
+        &self.current
+    }
+
+    /// The version of [`current`](Self::current), stored in every record
+    /// written.
+    pub fn version(&self) -> u32 {
+        self.current.id().version.0
+    }
+
+    /// The generator of `version` with the current seed and terrain, or
+    /// `None` when this build cannot generate it.
+    pub fn get(&self, version: u32) -> Option<&Generator> {
+        if version == self.version() {
+            return Some(&self.current);
+        }
+        self.older
+            .get(&version)?
+            .get_or_init(|| {
+                Generator::new(
+                    self.current.id().seed,
+                    GeneratorVersion(version),
+                    self.current.config().clone(),
+                )
+                .ok()
+            })
+            .as_ref()
+    }
+}
+
+/// A loaded chunk, ready to join the world. Its content is what the warm
+/// cache, the region file or the generator holds, so it needs no saving
+/// until it changes.
 pub struct Loaded {
     pub data: ChunkData,
-    /// Whether the content differs from the generated terrain.
-    pub edited: bool,
-    /// A saved record that could not be read; the chunk was generated
-    /// instead. The record stays on disk.
+    /// A saved record could not be used (unreadable, or made by a generator
+    /// version this build does not have), so the chunk came from another
+    /// record or the generator. The record stays on disk and is set aside
+    /// before anything replaces it.
+    pub refused: bool,
     pub error: Option<String>,
 }
 
@@ -56,18 +113,19 @@ fn empty() -> ChunkData {
 }
 
 /// Loads `coord` from a warm entry, saved records or the generator, in that
-/// order of preference. An overlay saved by another generator version would
-/// land on the wrong base, so it is refused (and kept on disk); a full record
-/// does not depend on the generator.
+/// order of preference. An overlay is merged onto the base of the generator
+/// version it was saved with; one from a version this build cannot generate
+/// is refused (and kept on disk). A full record does not depend on the
+/// generator.
 pub fn load(
-    generator: &Generator,
-    generator_version: u32,
+    generators: &Generators,
     coord: ChunkCoord,
     warm: Option<&WarmChunk>,
     saved: &[SavedChunk],
 ) -> Loaded {
     let min = coord.min_voxel();
     let mut error = None;
+    let mut refused = false;
     if let Some(warm) = warm {
         match codec::decompress(Codec::Lz4, &warm.bytes, warm.len)
             .map_err(|e| e.to_string())
@@ -77,37 +135,49 @@ pub fn load(
                 if let Ok(data) = tree.take_chunk(min) {
                     return Loaded {
                         data,
-                        edited: true,
+                        refused: false,
                         error: None,
                     };
                 }
             }
-            Err(e) => error = Some(format!("warm chunk {coord:?}: {e}")),
+            Err(e) => {
+                // The warm copy stands for the region file, which was not
+                // read: refuse it, so that file is set aside before anything
+                // replaces it.
+                error = Some(format!("warm chunk {coord:?}: {e}"));
+                refused = true;
+            }
         }
     }
     for record in saved {
-        if record.kind == RecordKind::Overlay && record.generator != generator_version {
-            error = Some(format!(
-                "saved chunk {coord:?}: an overlay made with generator version {}, this build                  generates version {generator_version}",
-                record.generator
-            ));
-            continue;
-        }
+        let base = match record.kind {
+            RecordKind::Overlay => match generators.get(record.generator) {
+                Some(generator) => Some(generator),
+                None => {
+                    error = Some(format!(
+                        "saved chunk {coord:?}: an overlay made with generator version {}, which \
+                         this build cannot generate",
+                        record.generator
+                    ));
+                    refused = true;
+                    continue;
+                }
+            },
+            _ => None,
+        };
         let result = decode(&record.bytes)
             .map_err(|e| e.to_string())
             .and_then(|saved_tree| {
-                let mut tree = match record.kind {
-                    RecordKind::Full => saved_tree,
-                    RecordKind::Overlay => {
+                let mut tree = match (record.kind, base) {
+                    (RecordKind::Full, _) => saved_tree,
+                    (RecordKind::Overlay, Some(generator)) => {
                         let base = generator.chunk_source(coord);
                         let mut tree = VoxelTree::unloaded();
                         tree.apply_overlay(min, &base, &saved_tree)
                             .map_err(|e| e.to_string())?;
                         tree
                     }
-                    RecordKind::Coarse(_) => {
-                        return Err("a coarse record cannot load a chunk".into());
-                    }
+                    _ => return Err("this record cannot load a chunk".into()),
                 };
                 tree.take_chunk(min).map_err(|e| e.to_string())
             });
@@ -115,16 +185,19 @@ pub fn load(
             Ok(data) => {
                 return Loaded {
                     data,
-                    edited: true,
+                    refused,
                     error,
                 };
             }
-            Err(e) => error = Some(format!("saved chunk {coord:?} ({:?}): {e}", record.kind)),
+            Err(e) => {
+                error = Some(format!("saved chunk {coord:?} ({:?}): {e}", record.kind));
+                refused = true;
+            }
         }
     }
     Loaded {
-        data: generate(generator, coord),
-        edited: false,
+        data: generate(generators.current(), coord),
+        refused,
         error,
     }
 }
@@ -135,14 +208,16 @@ pub struct Encoded {
     /// summary.
     pub records: Vec<SavedChunk>,
     pub warm: WarmChunk,
+    /// The coarse summary as chunk data, which replaces the coarse chunk the
+    /// world shows from afar.
+    pub coarse: Option<ChunkData>,
 }
 
-/// Encodes the edited chunk `data` at `coord`: its overlay against the
-/// generated base, or its full content when that is not more than twice as
-/// large, plus a coarse summary with `4^coarse_level` cells.
+/// Encodes the edited chunk `data` at `coord`: its overlay against the base
+/// of the current generator, or its full content when the overlay is more
+/// than twice as large, plus a coarse summary with `4^coarse_level` cells.
 pub fn encode_chunk(
-    generator: &Generator,
-    generator_version: u32,
+    generators: &Generators,
     coord: ChunkCoord,
     data: ChunkData,
     coarse_level: u32,
@@ -152,7 +227,8 @@ pub fn encode_chunk(
     // An aligned chunk position always inserts.
     let _ = tree.insert_chunk(min, data);
     let full = encode(&tree);
-    let base = generator.chunk_source(coord);
+    let generator_version = generators.version();
+    let base = generators.current().chunk_source(coord);
     let overlay = tree.overlay(min, &base).map(|o| encode(&o)).ok();
     let primary = match overlay {
         Some(bytes) if bytes.len() <= 2 * full.len() => SavedChunk {
@@ -167,23 +243,30 @@ pub fn encode_chunk(
         },
     };
     let mut records = vec![primary];
-    if let Ok(coarse) = tree.extract_coarse(CHUNK_LEVEL, min, coarse_level) {
+    let mut coarse_data = None;
+    if let Ok(mut coarse) = tree.extract_coarse(CHUNK_LEVEL, min, coarse_level) {
         records.push(SavedChunk {
             kind: RecordKind::Coarse(coarse_level as u8),
             generator: generator_version,
             bytes: encode(&coarse),
         });
+        coarse_data = coarse.take_chunk(min).ok();
     }
     let warm = WarmChunk {
         bytes: codec::compress(Codec::Lz4, &full),
         len: full.len(),
     };
-    Encoded { records, warm }
+    Encoded {
+        records,
+        warm,
+        coarse: coarse_data,
+    }
 }
 
 /// The chunks of coarse column (`x`, `z`) that cross the terrain surface,
 /// one below it included, built with `4^level` cells. `saved` holds coarse
-/// summaries of edited chunks, which replace the generated ones.
+/// summaries of edited chunks, which replace the generated ones wherever
+/// they are (a tower built far above the surface shows too).
 pub fn coarse_column(
     generator: &Generator,
     x: u32,
@@ -210,8 +293,15 @@ pub fn coarse_column(
     else {
         return Vec::new();
     };
+    let mut ys: BTreeSet<u32> = (bottom.y()..=top.y()).collect();
+    ys.extend(
+        saved
+            .iter()
+            .filter(|(c, _)| c.x() == x && c.z() == z)
+            .map(|(c, _)| c.y()),
+    );
     let mut out = Vec::new();
-    for y in bottom.y()..=top.y() {
+    for y in ys {
         let Ok(coord) = ChunkCoord::new(x, y, z) else {
             continue;
         };

@@ -22,6 +22,9 @@
     workers: 4,
     // Chunks joined to the world per frame at most.
     grafts_per_frame: 8,
+    // The edit log is folded into the region files (edited chunks written, the log
+    // restarted from a checkpoint) each time it grows this much, KiB. 64..=1048576
+    log_checkpoint_kib: 16384,
     // Region files and the edit log, relative to the working directory.
     save_dir: "saves/world",
 )
