@@ -28,10 +28,13 @@
 
 use super::columns::ChunkColumns;
 use super::coord::CHUNK_SIZE;
-use crate::regional::caves::{CAVE_CELL, CaveGrid, Caves, CubeCaves, block_field, trilinear};
+use crate::regional::caves::{
+    CAVE_CELL, CaveGrid, Caves, CubeCaves, block_field, range, trilinear,
+};
 use crate::surface::Column;
 use std::sync::{Arc, OnceLock};
-use world_core::{MaterialId, RegionSource, VoxelPos};
+use world_core::tree::brick_by_leaves;
+use world_core::{LeafFill, MaterialId, RegionSource, VoxelPos};
 
 /// Footprint summary: the highest column and the lowest bedrock boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,16 +162,108 @@ impl ChunkSource {
             None => CubeCaves::None,
         };
         match caves {
-            CubeCaves::All => return Some(MaterialId::AIR),
-            CubeCaves::Mixed => return None,
-            CubeCaves::None => {}
+            CubeCaves::All => Some(MaterialId::AIR),
+            CubeCaves::Mixed => None,
+            CubeCaves::None => self.layered(&span, bottom, top),
         }
+    }
+
+    /// The material of a cube from height `bottom` to `top` (inclusive)
+    /// under footprint `span` when it lies inside one layer of every column
+    /// (bedrock or soil) and caves leave it alone; `None` otherwise.
+    #[inline]
+    fn layered(&self, span: &Span, bottom: i64, top: i64) -> Option<MaterialId> {
         if top < i64::from(span.min_bedrock) {
             Some(self.columns.layers().bedrock)
         } else if bottom >= i64::from(span.max_soil_start) && top < i64::from(span.min_soil_end) {
             Some(self.columns.layers().soil)
         } else {
             None
+        }
+    }
+
+    /// The 64 leaves of the level-1 node at `min` (see
+    /// [`RegionSource::brick`]), with the answers of [`uniform`](Self::uniform)
+    /// and [`leaf`](Self::leaf). A node inside the chunk reads each leaf's
+    /// footprint straight from the pyramid, and in a cell the caves may
+    /// carve, evaluates the cell's field once at all the leaves' corners and
+    /// each leaf's 64 values at most once.
+    pub fn brick(&self, min: VoxelPos, each: &mut dyn FnMut(u32, LeafFill<'_>)) {
+        let chunk_min = self.columns.chunk().min_voxel();
+        let local = |v: i32, o: i32| i64::from(v) - i64::from(o);
+        let (lx, ly, lz) = (
+            local(min.x, chunk_min.x),
+            local(min.y, chunk_min.y),
+            local(min.z, chunk_min.z),
+        );
+        let inside = |d: i64| (0..=i64::from(CHUNK_SIZE) - 16).contains(&d) && d % 16 == 0;
+        if !(inside(lx) && inside(ly) && inside(lz)) {
+            return brick_by_leaves(self, min, each);
+        }
+        let (lx, lz) = (lx as usize, lz as usize);
+        let level1 = &self.pyramid()[0];
+        let row = CHUNK_SIZE as usize / 4;
+        // The node is one cave cell; `None` when nothing in it is carved.
+        let cell = self.caves.as_ref().and_then(|(caves, grid)| {
+            let grid = grid.as_ref()?;
+            if grid.cell_bounds(min).0 >= 0.0 {
+                return None;
+            }
+            Some((&**caves, grid.corners(min)?))
+        });
+        // The field at every leaf's corner voxels, `[k][j][i]` for offsets
+        // 0, 3, 4, 7, ... 15; computed when a leaf first needs it.
+        let mut leaf_corners = None;
+        let mut voxels = [MaterialId::AIR; 64];
+        for slot in 0..64u32 {
+            let [ox, oy, oz] = [slot & 3, slot >> 2 & 3, slot >> 4].map(|v| v as usize);
+            let leaf_min = VoxelPos::new(
+                min.x + 4 * ox as i32,
+                min.y + 4 * oy as i32,
+                min.z + 4 * oz as i32,
+            );
+            let span = level1[(lz / 4 + oz) * row + lx / 4 + ox];
+            let bottom = i64::from(leaf_min.y);
+            let top = bottom + 3;
+            if bottom >= i64::from(span.max_height) {
+                each(slot, LeafFill::Uniform(MaterialId::AIR));
+                continue;
+            }
+            // `Caves::cube` for this leaf, from the shared corners.
+            let mut field = None;
+            let caves = match &cell {
+                Some((caves, corners)) if caves.reaches(bottom, top + 1, span.max_height) => {
+                    let f = leaf_corners.get_or_insert_with(|| {
+                        block_field(corners, min, [0, 3, 4, 7, 8, 11, 12, 15])
+                    });
+                    let mut at_corners = (f32::INFINITY, f32::NEG_INFINITY);
+                    for k in [2 * oz, 2 * oz + 1] {
+                        for j in [2 * oy, 2 * oy + 1] {
+                            for &v in &f[k][j][2 * ox..2 * ox + 2] {
+                                at_corners = (at_corners.0.min(v), at_corners.1.max(v));
+                            }
+                        }
+                    }
+                    let all = || range(field.insert(block_field(corners, leaf_min, [0, 1, 2, 3])));
+                    caves.settle_in_cell(bottom, top + 1, span.min_height, at_corners, Some(all))
+                }
+                _ => CubeCaves::None,
+            };
+            let uniform = match caves {
+                CubeCaves::All => Some(MaterialId::AIR),
+                CubeCaves::Mixed => None,
+                CubeCaves::None => self.layered(&span, bottom, top),
+            };
+            if let Some(material) = uniform {
+                each(slot, LeafFill::Uniform(material));
+                continue;
+            }
+            let carving = cell.as_ref().map(|(caves, corners)| {
+                let f = field.unwrap_or_else(|| block_field(corners, leaf_min, [0, 1, 2, 3]));
+                (*caves, Some(f))
+            });
+            self.fill_leaf(leaf_min, lx + 4 * ox, lz + 4 * oz, carving, &mut voxels);
+            each(slot, LeafFill::Voxels(&voxels));
         }
     }
 
@@ -182,16 +277,32 @@ impl ChunkSource {
         if !(inside.contains(&local_x) && inside.contains(&local_z)) {
             return self.leaf_at_edge(min, voxels);
         }
+        let carving = self.leaf_caves(min).map(|c| {
+            // Inside one cell the 64 field values share their interpolation.
+            let field = c
+                .corners
+                .map(|corners| block_field(&corners, min, [0, 1, 2, 3]));
+            (c.caves, field)
+        });
+        self.fill_leaf(min, local_x as usize, local_z as usize, carving, voxels);
+    }
+
+    /// The voxels of the leaf at `min`, whose footprint starts at chunk-local
+    /// `(local_x, local_z)` inside the chunk's. `carving` is `None` when no
+    /// voxel can be carved, else the caves and the leaf's field (`[z][y][x]`,
+    /// see [`block_field`]), or `None` to compute each voxel's own.
+    fn fill_leaf(
+        &self,
+        min: VoxelPos,
+        local_x: usize,
+        local_z: usize,
+        carving: Option<(&Caves, Option<[[[f32; 4]; 4]; 4]>)>,
+        voxels: &mut [MaterialId; 64],
+    ) {
         let layers = self.columns.layers();
-        let carving = self.leaf_caves(min);
-        // Inside one cell the 64 field values share their interpolation.
-        let field = carving
-            .as_ref()
-            .and_then(|c| c.corners)
-            .map(|corners| block_field(&corners, min, [0, 1, 2, 3]));
         let ys: [i64; 4] = std::array::from_fn(|y| i64::from(min.y.wrapping_add(y as i32)));
         let n = CHUNK_SIZE as usize;
-        let first = local_z as usize * n + local_x as usize;
+        let first = local_z * n + local_x;
         for z in 0..4 {
             let row = &self.columns.columns()[first + z * n..][..4];
             for (x, column) in row.iter().enumerate() {
@@ -199,7 +310,7 @@ impl ChunkSource {
                 let height = i64::from(column.height);
                 let cover_from = height - i64::from(column.surface_depth);
                 let soil_from = height - i64::from(column.soil_depth);
-                let carvable = carving.as_ref().map(|c| c.caves.carvable_range(column));
+                let carvable = carving.map(|(caves, _)| caves.carvable_range(column));
                 for (y, &at) in ys.iter().enumerate() {
                     let mut material = if at >= height {
                         MaterialId::AIR
@@ -210,12 +321,12 @@ impl ChunkSource {
                     } else {
                         layers.bedrock
                     };
-                    if let (Some(carving), Some((lo, hi))) = (&carving, carvable)
+                    if let (Some((caves, field)), Some((lo, hi))) = (&carving, carvable)
                         && !material.is_air()
                         && lo <= at
                         && at < hi
                     {
-                        let carved = match &field {
+                        let carved = match field {
                             Some(f) => f[z][y][x] < 0.0,
                             None => {
                                 let pos = VoxelPos::new(
@@ -223,7 +334,7 @@ impl ChunkSource {
                                     min.y.wrapping_add(y as i32),
                                     min.z.wrapping_add(z as i32),
                                 );
-                                carving.caves.carved(pos, column)
+                                caves.carved(pos, column)
                             }
                         };
                         if carved {
@@ -431,6 +542,10 @@ impl RegionSource for ChunkSource {
 
     fn leaf(&self, min: VoxelPos, voxels: &mut [MaterialId; 64]) {
         ChunkSource::leaf(self, min, voxels);
+    }
+
+    fn brick(&self, min: VoxelPos, each: &mut dyn FnMut(u32, LeafFill<'_>)) {
+        ChunkSource::brick(self, min, each);
     }
 }
 
@@ -663,6 +778,39 @@ mod tests {
                 leaf_by_voxels(&site.generator, min),
                 "{} leaf at {:?}", KINDS[kind], min
             );
+        }
+
+        /// A level-1 node's leaves from `brick` equal those of `uniform` and
+        /// `leaf` one by one, and every slot comes once.
+        #[test]
+        fn bricks_equal_their_leaves(
+            kind in 0usize..KINDS.len(),
+            near in proptest::option::weighted(0.8, any::<usize>()),
+            anywhere in (0i32..1024, -40i32..1064, 0i32..1024),
+            jitter in (-31i32..32, -31i32..32, -31i32..32),
+        ) {
+            let site = &sites()[kind];
+            let at = pick(site, near, anywhere, jitter);
+            let min = VoxelPos::new(at.x & !15, at.y & !15, at.z & !15);
+            let collect = |by_leaves: bool| {
+                let mut out = vec![None; 64];
+                let mut each = |slot: u32, fill: LeafFill<'_>| {
+                    assert!(out[slot as usize].is_none(), "slot {slot} twice");
+                    out[slot as usize] = Some(match fill {
+                        LeafFill::Uniform(m) => [m; 64],
+                        LeafFill::Voxels(v) => *v,
+                    });
+                };
+                if by_leaves {
+                    brick_by_leaves(&site.source, min, &mut each);
+                } else {
+                    site.source.brick(min, &mut each);
+                }
+                out
+            };
+            let fast = collect(false);
+            prop_assert!(fast.iter().all(Option::is_some));
+            prop_assert_eq!(fast, collect(true), "{} node at {:?}", KINDS[kind], min);
         }
 
         /// Uniform answers for cubes of every tree size, aligned or not, at

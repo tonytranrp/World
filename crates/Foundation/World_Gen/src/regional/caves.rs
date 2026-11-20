@@ -406,7 +406,7 @@ impl Caves {
     ) -> CubeCaves {
         let bottom = i64::from(min.y);
         let top = bottom + i64::from(size); // exclusive
-        if top <= i64::from(self.band.0) || bottom >= self.carve_top(max_height) {
+        if !self.reaches(bottom, top, max_height) {
             return CubeCaves::None;
         }
         let c = chunk.min_voxel();
@@ -421,37 +421,76 @@ impl Caves {
             return CubeCaves::None;
         };
         let one_cell = |v: i32| (v & (CAVE_CELL - 1)) + size as i32 <= CAVE_CELL;
-        let hi = if inside_cells && one_cell(min.x) && one_cell(min.y) && one_cell(min.z) {
-            // One cell: the eight corner voxels bound the cube.
+        if inside_cells && one_cell(min.x) && one_cell(min.y) && one_cell(min.z) {
+            // One cell. A cell with no negative corner carves nothing (the
+            // test leaves make), which settles most cubes in one lookup;
+            // otherwise the eight corner voxels bound the cube.
+            if grid.cell_bounds(min).0 >= 0.0 {
+                return CubeCaves::None;
+            }
             let Some(corners) = grid.corners(min) else {
                 return CubeCaves::None;
             };
             let last = size as i32 - 1;
-            let (lo, hi) = range(&block_field(&corners, min, [0, last]));
-            if lo >= CARVED_MARGIN {
-                return CubeCaves::None;
-            }
-            if size == 4 && hi > -CARVED_MARGIN {
-                // A leaf near a cave wall: rounding could put an inner voxel
-                // past its corners, so decide from all 64 values, computed
-                // exactly as the leaf computes them.
-                let (lo, hi) = range(&block_field(&corners, min, [0, 1, 2, 3]));
+            let at_corners = range(&block_field(&corners, min, [0, last]));
+            let all = (size == 4).then_some(|| range(&block_field(&corners, min, [0, 1, 2, 3])));
+            return self.settle_in_cell(bottom, top, min_height, at_corners, all);
+        }
+        let (lo, hi) = grid.bounds(min, size);
+        if lo >= 0.0 {
+            return CubeCaves::None;
+        }
+        self.carved_or_mixed(bottom, top, min_height, hi)
+    }
+
+    /// Whether a cube from height `bottom` to `top` (exclusive), under a
+    /// footprint whose highest column is `max_height`, holds any voxel that
+    /// may be carved (the band and the cover; says nothing about the field).
+    #[inline]
+    pub fn reaches(&self, bottom: i64, top: i64, max_height: i32) -> bool {
+        top > i64::from(self.band.0) && bottom < self.carve_top(max_height)
+    }
+
+    /// What the field does to a cube from `bottom` to `top` (exclusive)
+    /// inside one cell, under a footprint whose lowest column is
+    /// `min_height`, from the range of the field at its eight corner voxels.
+    /// Corners within [`CARVED_MARGIN`] of zero leave the cube mixed unless
+    /// `all` gives the range of every voxel's value (for a leaf, computed
+    /// exactly as the leaf computes them), which settles it exactly.
+    #[inline]
+    pub fn settle_in_cell(
+        &self,
+        bottom: i64,
+        top: i64,
+        min_height: i32,
+        (lo, hi): (f32, f32),
+        all: Option<impl FnOnce() -> (f32, f32)>,
+    ) -> CubeCaves {
+        if lo >= CARVED_MARGIN {
+            return CubeCaves::None;
+        }
+        let hi = match all {
+            Some(all) if hi > -CARVED_MARGIN => {
+                // Near a cave wall rounding could put an inner voxel past the
+                // corners, so decide from every value.
+                let (lo, hi) = all();
                 if lo >= 0.0 {
                     return CubeCaves::None;
                 }
                 // All carved needs `hi < 0`; the margin test below asks for
                 // more, so pass a value that meets it exactly when it holds.
                 if hi < 0.0 { -CARVED_MARGIN } else { hi }
-            } else {
-                hi
             }
-        } else {
-            let (lo, hi) = grid.bounds(min, size);
-            if lo >= 0.0 {
-                return CubeCaves::None;
-            }
-            hi
+            _ => hi,
         };
+        self.carved_or_mixed(bottom, top, min_height, hi)
+    }
+
+    /// All carved when the field stays below `-CARVED_MARGIN` (`hi` bounds
+    /// it; the margin absorbs rounding) and every voxel of the cube from
+    /// `bottom` to `top` (exclusive) may be carved; else mixed. For a cube
+    /// whose field is known to go below zero somewhere.
+    fn carved_or_mixed(&self, bottom: i64, top: i64, min_height: i32, hi: f32) -> CubeCaves {
         let under_cover = top <= i64::from(min_height) - i64::from(self.cover);
         if hi <= -CARVED_MARGIN
             && bottom >= i64::from(self.band.0)
@@ -644,7 +683,7 @@ pub fn block_field<const N: usize>(
 
 /// The smallest and largest of a block of field values (which are never NaN).
 #[inline]
-fn range<const N: usize>(f: &[[[f32; N]; N]; N]) -> (f32, f32) {
+pub fn range<const N: usize>(f: &[[[f32; N]; N]; N]) -> (f32, f32) {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for &v in f.as_flattened().as_flattened() {
         if v < lo {
