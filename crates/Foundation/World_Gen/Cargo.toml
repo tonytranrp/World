@@ -5,9 +5,27 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+autobenches = false
+
+# The library's unit tests are not benchmarks, and libtest rejects Criterion's flags.
+[lib]
+bench = false
 
 [dependencies]
 world_core.workspace = true
+# The terrain parameters are a RON config (`world_core::ConfigAsset`).
+serde.workspace = true
+
+[dev-dependencies]
+world_testkit.workspace = true
+proptest.workspace = true
+ron.workspace = true
+criterion.workspace = true
+
+# Columns per chunk, coarse sampling and per-voxel material queries.
+[[bench]]
+name = "terrain"
+harness = false
 
 [lints]
 workspace = true
