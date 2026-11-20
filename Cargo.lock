@@ -7924,10 +7924,14 @@ dependencies = [
  "bevy",
  "bevy-inspector-egui",
  "bevy_egui",
+ "ron",
  "serde",
  "world_core",
+ "world_cpu_ref",
+ "world_gen",
  "world_reload",
  "world_render",
+ "world_testkit",
  "world_testkit_bevy",
 ]
 

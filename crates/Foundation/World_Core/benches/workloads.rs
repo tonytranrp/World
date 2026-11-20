@@ -277,6 +277,67 @@ fn serialization(c: &mut Criterion) {
     group.finish();
 }
 
+/// Whole-chunk operations (decision 0006): moving a chunk between trees,
+/// compacting it, and compressing its encoding for the warm tier (LZ4) and
+/// region files (zstd).
+fn chunk_operations(c: &mut Criterion) {
+    use world_core::serialize::codec::{self, Codec};
+    use world_core::tree::CHUNK_LEVEL;
+    let dense = dense();
+    let chunk_min = VoxelPos::ORIGIN;
+    let mut group = c.benchmark_group("chunks");
+    group.sample_size(20);
+    group.bench_function("take_and_insert_dense_chunk", |b| {
+        b.iter_batched(
+            || (dense_clone(&dense), VoxelTree::unloaded()),
+            |(mut from, mut to)| {
+                let data = from.take_chunk(chunk_min).unwrap();
+                to.insert_chunk(chunk_min, data).unwrap();
+                (from, to)
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    let mut fragmented = dense_clone(&dense);
+    for e in random_edits(20_000, VoxelPos::ORIGIN, DENSE_EDGE, 1, 99) {
+        fragmented.set(e.pos, e.material).unwrap();
+    }
+    group.bench_function("compact_fragmented_dense_chunk", |b| {
+        b.iter_batched(
+            || dense_clone(&fragmented),
+            |mut t| {
+                t.compact_chunk(chunk_min).unwrap();
+                t
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    let bytes = encode(&dense);
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    for codec_kind in [Codec::Lz4, Codec::Zstd] {
+        let packed = codec::compress(codec_kind, &bytes);
+        eprintln!(
+            "chunks: dense_128 encoding {} bytes, {codec_kind:?} {} bytes ({:.1}x)",
+            bytes.len(),
+            packed.len(),
+            bytes.len() as f64 / packed.len() as f64
+        );
+        group.bench_function(format!("compress_{codec_kind:?}"), |b| {
+            b.iter(|| codec::compress(codec_kind, black_box(&bytes)))
+        });
+        group.bench_function(format!("decompress_{codec_kind:?}"), |b| {
+            b.iter(|| codec::decompress(codec_kind, black_box(&packed), bytes.len()).unwrap())
+        });
+    }
+    let _ = CHUNK_LEVEL;
+    group.finish();
+}
+
+/// A fresh copy of a tree, through its encoding (trees are not `Clone`).
+fn dense_clone(tree: &VoxelTree) -> VoxelTree {
+    decode(&encode(tree)).unwrap()
+}
+
 criterion_group!(
     benches,
     overwrite_dense,
@@ -284,6 +345,7 @@ criterion_group!(
     coherent_reads,
     apply_batches,
     snapshot_then_edit,
-    serialization
+    serialization,
+    chunk_operations
 );
 criterion_main!(benches);

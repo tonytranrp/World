@@ -1,0 +1,48 @@
+// Terrain generation (decision 0008). Hot-reloads on save: the world is
+// reopened with the new terrain (edits are saved first). Changing anything
+// here changes every generated voxel, so saved overlays from older values
+// no longer line up; bump the generator version for released saves.
+// Lengths are metres unless named voxels.
+(
+    continental: (
+        // Continents and oceans: elevation in metres by noise value.
+        continent: (wavelength_m: 4096.0, octaves: 4, lacunarity: 2.0, persistence: 0.5),
+        warp: (wavelength_m: 2048.0, octaves: 2, lacunarity: 2.0, persistence: 0.5),
+        warp_strength_m: 600.0,
+        elevation_curve: [
+            (-1.0, -48.0),
+            (-0.35, -10.0),
+            (-0.1, 2.0),
+            (0.25, 18.0),
+            (0.6, 40.0),
+            (1.0, 64.0),
+        ],
+        // Where mountains rise, and how high.
+        mountain_mask: (wavelength_m: 3072.0, octaves: 2, lacunarity: 2.0, persistence: 0.5),
+        mountain_mask_range: (0.0, 0.45),
+        mountains: (wavelength_m: 1024.0, octaves: 5, lacunarity: 2.0, persistence: 0.5),
+        mountain_height_m: 220.0,
+        hills: (wavelength_m: 256.0, octaves: 4, lacunarity: 2.0, persistence: 0.5),
+        hill_height_m: 9.0,
+        moisture: (wavelength_m: 1536.0, octaves: 3, lacunarity: 2.0, persistence: 0.5),
+        soil: (wavelength_m: 48.0, octaves: 2, lacunarity: 2.0, persistence: 0.5),
+        soil_depth_m: (0.5, 1.75),
+    ),
+    regional: (
+        // Small bumps on the 4-voxel lattice.
+        relief: (wavelength_m: 16.0, octaves: 6, lacunarity: 2.0, persistence: 0.5),
+        relief_height_m: 1.0,
+    ),
+    surface: (
+        // Material ids from materials.ron.
+        grass: 3,
+        dirt: 2,
+        stone: 1,
+        sea_level_m: 0.0,
+        rock_line_m: 150.0,
+        grass_max_slope: 0.8,
+        cliff_slope: 1.4,
+        dry_moisture: -0.3,
+        grass_depth_voxels: (2, 5),
+    ),
+)

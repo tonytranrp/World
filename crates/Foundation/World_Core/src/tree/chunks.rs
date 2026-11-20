@@ -265,6 +265,24 @@ impl VoxelTree {
         Ok(ChunkData { content })
     }
 
+    /// The content of the chunk-level region at `min`, shared rather than
+    /// detached: O(1), and later edits to this tree copy what they change,
+    /// so the returned data never sees them. `None` if not resident.
+    pub fn chunk_data(&self, min: VoxelPos) -> Option<ChunkData> {
+        let local = node_origin(CHUNK_LEVEL, min).ok()?;
+        if !self.view().resident(local) {
+            return None;
+        }
+        let content = match self.view().chunk_id(local) {
+            Some(id) => ChunkContent::Chunk(self.forest.chunk_arc(id)),
+            None => ChunkContent::Filled(match node_at(self.root(), CHUNK_LEVEL, local) {
+                NodeRef::Uniform(m) => Child::Uniform(m),
+                _ => Child::Air,
+            }),
+        };
+        Some(ChunkData { content })
+    }
+
     /// Puts detached chunk content at the chunk-level region at `min`,
     /// replacing whatever was there (loading it if it was not resident).
     /// O(1) apart from the path above it. Returns whether anything changed.

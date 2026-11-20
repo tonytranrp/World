@@ -1,0 +1,27 @@
+// World residency (decision 0006): what stays in memory around the player
+// and where edits are saved. Hot-reloads on save; changing the seed reopens
+// the world (edits are saved first).
+(
+    // The world seed.
+    seed: 0x5EED,
+    // Full-detail chunks (16 m) whose centre is this close are loaded, metres. 16.0..=512.0
+    full_radius_m: 64.0,
+    // They are evicted only beyond this distance, metres. At least full_radius_m.
+    evict_radius_m: 96.0,
+    // Coarse chunk columns reach this far horizontally, metres. 0.0 turns them off.
+    coarse_radius_m: 384.0,
+    // Coarse cells are 4^level voxels: 2 is a quarter metre. 1..=4
+    coarse_cell_level: 2,
+    // RAM for full-detail chunks, MiB. Far chunks go first when it is exceeded.
+    hot_cap_mib: 1300,
+    // RAM for compressed edited chunks after eviction, MiB.
+    warm_cap_mib: 400,
+    // RAM for coarse chunks, MiB.
+    coarse_cap_mib: 500,
+    // Worker threads for generation and saving. 0 runs everything on the main thread.
+    workers: 4,
+    // Chunks joined to the world per frame at most.
+    grafts_per_frame: 8,
+    // Region files and the edit log, relative to the working directory.
+    save_dir: "saves/world",
+)
