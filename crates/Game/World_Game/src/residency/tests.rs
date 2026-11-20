@@ -10,6 +10,7 @@ use world_core::serialize::wal::{WalRecord, WalWriter, read_log};
 use world_core::{Edit, MaterialId, VoxelBox, VoxelPos};
 use world_gen::TerrainConfig;
 
+use super::columns::ColumnCache;
 use super::config::ResidencyConfig;
 use super::world::StreamedWorld;
 
@@ -293,7 +294,7 @@ fn an_overlay_from_another_generator_version_is_refused() {
         bytes: vec![1, 2, 3],
     }];
     let generators = jobs::Generators::new(Arc::new(world.generator().clone()));
-    let loaded = jobs::load(&generators, coord, None, &saved);
+    let loaded = jobs::load(&generators, &ColumnCache::new(64), coord, None, &saved);
     assert!(loaded.refused, "the generated chunk stands in");
     assert!(loaded.error.unwrap().contains("version 99"));
     std::fs::remove_dir_all(&dir).unwrap();
@@ -479,6 +480,8 @@ fn an_overlay_from_an_older_generator_keeps_its_edits() {
     let v2 = Arc::new(Generator::new(seed, GeneratorVersion::V2, terrain).unwrap());
     let old = Generators::new(Arc::clone(&v1));
     let now = Generators::new(Arc::clone(&v2));
+    // One cache for both versions: each keeps its own footprints.
+    let cache = ColumnCache::new(64);
     let tree_of = |coord: ChunkCoord, data: ChunkData| {
         let mut tree = VoxelTree::unloaded();
         tree.insert_chunk(coord.min_voxel(), data).unwrap();
@@ -506,12 +509,12 @@ fn an_overlay_from_an_older_generator_keeps_its_edits() {
         }
         let expected = edited_v1(coord, &[Edit::new(p, MaterialId(3))]);
         let data = expected.chunk_data(coord.min_voxel()).unwrap();
-        let records = jobs::encode_chunk(&old, coord, data, 2).records;
+        let records = jobs::encode_chunk(&old, &cache, coord, data, 2).records;
         assert_eq!(
             (records[0].kind, records[0].generator),
             (RecordKind::Overlay, 1)
         );
-        let loaded = jobs::load(&now, coord, None, &records[..1]);
+        let loaded = jobs::load(&now, &cache, coord, None, &records[..1]);
         assert!(!loaded.refused, "{:?}", loaded.error);
         assert_eq!(
             content_hash(&tree_of(coord, loaded.data)),
@@ -533,7 +536,8 @@ fn an_overlay_from_an_older_generator_keeps_its_edits() {
     let first = VoxelPos::new(cmin.x + 5, cmin.y + 5, cmin.z + 5);
     assert_ne!(v1.material(first).unwrap(), MaterialId(3));
     let expected = edited_v1(coord, &[Edit::new(first, MaterialId(3))]);
-    let records = jobs::encode_chunk(&old, coord, expected.chunk_data(cmin).unwrap(), 2).records;
+    let records =
+        jobs::encode_chunk(&old, &cache, coord, expected.chunk_data(cmin).unwrap(), 2).records;
     RegionStore::open(&dir)
         .unwrap()
         .write(coord, records)
@@ -1077,4 +1081,126 @@ fn chunks_waiting_to_be_compressed_do_not_push_the_hot_tier_over_its_cap() {
     }
     assert!(waited > 0, "no chunk ever waited to be compressed");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Settles `world` around `eye` and returns the chunks joined, in order.
+fn settle_joined(world: &mut StreamedWorld, eye: VoxelPos) -> Vec<world_gen::ChunkCoord> {
+    let mut joined = Vec::new();
+    for _ in 0..2000 {
+        world.update(eye, FRAME);
+        joined.extend(world.take_changes().loaded);
+        let s = world.stats();
+        if world.is_settled(eye) && s.loading == 0 && s.compressing == 0 {
+            return joined;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("the world never settled around {eye:?}");
+}
+
+/// An eye two metres above ground near (`x`, `z`) where the ground lies in
+/// the upper part of its chunk, so the chunks under the eye's are buried.
+fn eye_high_in_its_chunk(world: &StreamedWorld, x: i32, z: i32) -> VoxelPos {
+    (0..64)
+        .map(|i| eye_at(world, x + i * 1300, z))
+        .find(|eye| (600..800).contains(&eye.y.rem_euclid(world_gen::CHUNK_SIZE as i32)))
+        .expect("a site with high ground")
+}
+
+#[test]
+fn shared_columns_and_uniform_chunks_load_exactly_the_generated_chunks() {
+    let dir = temp_dir("columns_exact");
+    // Tall enough to hold air above the terrain and rock below it.
+    let tall = ResidencyConfig {
+        full_radius_m: 24.0,
+        evict_radius_m: 32.0,
+        ..config(0)
+    };
+    let mut world = open(&dir, tall.clone());
+    let eye = eye_high_in_its_chunk(&world, 1500, 2500);
+    settle(&mut world, eye);
+    let s = world.stats();
+    assert!(
+        s.column_misses < s.generated as u64 && s.column_hits > 0,
+        "chunks stacked in a column share its footprint: {s:?}"
+    );
+    assert!(s.uniform_loads > 0, "the air above is not built: {s:?}");
+    let loaded = world.loaded_chunks();
+    for &c in &loaded {
+        let fresh = super::jobs::generate(world.generator(), c);
+        let cached = world.chunk_data(c).unwrap();
+        assert_eq!(chunk_hash(c, cached), chunk_hash(c, fresh), "{c:?}");
+    }
+
+    // Without the cache, on threads: the same chunks.
+    let off = temp_dir("columns_off");
+    let mut uncached = open(
+        &off,
+        ResidencyConfig {
+            column_cache_mib: 0,
+            workers: 3,
+            ..tall
+        },
+    );
+    settle(&mut uncached, eye);
+    assert_eq!(uncached.stats().column_hits, 0);
+    assert_eq!(uncached.loaded_chunks(), loaded);
+    for &c in &loaded {
+        let a = chunk_hash(c, world.chunk_data(c).unwrap());
+        let b = chunk_hash(c, uncached.chunk_data(c).unwrap());
+        assert_eq!(a, b, "{c:?}");
+    }
+    drop(uncached);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&off);
+}
+
+#[test]
+fn buried_chunks_load_after_the_visible_ones_around_them() {
+    let joined = |name: &str, delay_m: f32| {
+        let dir = temp_dir(name);
+        let mut world = open(
+            &dir,
+            ResidencyConfig {
+                full_radius_m: 32.0,
+                evict_radius_m: 40.0,
+                coarse_radius_m: 64.0,
+                coarse_cell_level: 3,
+                buried_delay_m: delay_m,
+                ..config(0)
+            },
+        );
+        let eye = eye_high_in_its_chunk(&world, -2500, 4500);
+        let order = settle_joined(&mut world, eye);
+        let _ = std::fs::remove_dir_all(&dir);
+        (order, world)
+    };
+    let (plain, world) = joined("buried_off", 0.0);
+    let (delayed, _) = joined("buried_on", 48.0);
+    let mut a = plain.clone();
+    let mut b = delayed.clone();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b, "the same chunks load");
+
+    let generator = world.generator();
+    let buried = |c: world_gen::ChunkCoord| {
+        let bounds = world.column_cache().bounds(generator, c).unwrap();
+        i64::from(c.min_voxel().y) + i64::from(world_gen::CHUNK_SIZE)
+            <= i64::from(bounds.height_range.0)
+    };
+    let positions = |order: &[world_gen::ChunkCoord]| -> Vec<usize> {
+        (0..order.len()).filter(|&i| buried(order[i])).collect()
+    };
+    let (p, d) = (positions(&plain), positions(&delayed));
+    assert!(!p.is_empty(), "no buried chunk in the sphere");
+    let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;
+    assert!(
+        mean(&d) > mean(&p),
+        "buried chunks at {d:?} with the delay, {p:?} without"
+    );
+
+    // Deterministic: the same inputs give the same order.
+    let (again, _) = joined("buried_again", 48.0);
+    assert_eq!(again, delayed);
 }

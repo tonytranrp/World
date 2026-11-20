@@ -113,3 +113,29 @@ waiting to be compressed kept the hot total over its cap, so eviction took
 another batch every frame; and a region file that failed to read was
 treated as holding no edits, then kept warm, so a later save could
 overwrite them. 622 tests pass on the Radeon, golden images match.
+
+## Shared column footprints and surface-first loading
+
+Every generated chunk computed its footprint's whole 1024 x 1024
+heightfield, again for each chunk stacked in the same column, and an
+all-air chunk cost as much as the heightfield. The workers now share a
+bounded cache of footprints (`column_cache_mib`, 256 MiB, least recently
+used out), a chunk whose footprint bounds prove it air or bedrock is not
+built, and chunks entirely below their footprint's lowest column load as if
+`buried_delay_m` (32 m) farther away.
+
+Single-threaded, development build, five chunks of one column from two
+below the surface to two above: an air chunk 36 ms to 5 µs, a stacked
+built chunk 27 to 37 ms less (surface 72 to 45 ms, buried 261 to 224 ms),
+the column 21 to 26% less. The first chunk of a column costs the same, and
+buried chunks (cave carving, 110 to 270 ms) remain the expensive ones.
+
+Walking at 4 m/s in mac-floor, 1500 frames, three runs each, screen
+locked: holes 90 to 98 per frame on average before, 63 to 73 after; the
+second five seconds 111 to 144 before, 72 to 96 after. Worker time per
+generated chunk 176 to 213 ms before, 157 to 177 ms after, with 37% of the
+loads uniform. At 8 m/s both versions fall behind the walk (holes near the
+sphere's 280) after the first 40 s and the runs are too noisy to compare.
+What remains is per-stacked-chunk work World_Gen's ChunkSource does again
+(copying the columns and rebuilding their pyramid, about 10 ms) and the
+cave grid and carving of buried chunks.

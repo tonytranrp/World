@@ -50,6 +50,13 @@ pub struct ResidencyConfig {
     /// every chunk within the full-detail radius is requested, and only out
     /// to the evict radius.
     pub prefetch_radius_m: f32,
+    /// Column footprints (the heightfield under a chunk, 8 MiB each) shared
+    /// by the workers, so chunks stacked in a column compute it once, in
+    /// MiB. 0 turns the cache off.
+    pub column_cache_mib: u32,
+    /// Chunks entirely below the terrain surface load as if they were this
+    /// much farther away, in metres, so the visible ones come first.
+    pub buried_delay_m: f32,
 }
 
 impl Default for ResidencyConfig {
@@ -71,6 +78,8 @@ impl Default for ResidencyConfig {
             velocity_smoothing_secs: 0.5,
             prefetch_lookahead_secs: 2.0,
             prefetch_radius_m: 64.0,
+            column_cache_mib: 256,
+            buried_delay_m: 32.0,
         }
     }
 }
@@ -130,6 +139,13 @@ impl ConfigAsset for ResidencyConfig {
             16.0,
             1024.0,
         );
+        range(
+            "column_cache_mib",
+            self.column_cache_mib.into(),
+            0.0,
+            16384.0,
+        );
+        range("buried_delay_m", self.buried_delay_m.into(), 0.0, 1024.0);
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());
         }
@@ -168,9 +184,11 @@ mod tests {
             prefetch_lookahead_secs: -1.0,
             prefetch_radius_m: 4.0,
             warm_edited_weight: 0.5,
+            column_cache_mib: 20000,
+            buried_delay_m: f32::NAN,
             ..ResidencyConfig::default()
         };
-        assert_eq!(bad.validate().unwrap_err().len(), 8);
+        assert_eq!(bad.validate().unwrap_err().len(), 10);
     }
 
     #[test]

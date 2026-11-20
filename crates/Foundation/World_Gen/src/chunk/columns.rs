@@ -87,6 +87,58 @@ impl ChunkColumns {
             .min()
             .unwrap_or(i32::MIN)
     }
+
+    /// Whether these columns are the footprint of `chunk` (any `y`) for
+    /// `generator`.
+    pub fn serves(&self, generator: GeneratorId, chunk: ChunkCoord) -> bool {
+        self.generator == generator && self.chunk.x() == chunk.x() && self.chunk.z() == chunk.z()
+    }
+
+    /// The same columns as the footprint of `chunk`, which must share their
+    /// `x` and `z` (`None` otherwise). Columns do not depend on `y`, so the
+    /// result equals the generator's columns for `chunk` without computing
+    /// any noise; it copies them (8 bytes a column).
+    pub fn for_chunk(&self, chunk: ChunkCoord) -> Option<Self> {
+        (self.chunk.x() == chunk.x() && self.chunk.z() == chunk.z()).then(|| Self {
+            chunk,
+            ..self.clone()
+        })
+    }
+
+    /// The footprint's bounds, for deciding whole chunks without the columns
+    /// (one pass over them).
+    pub fn bounds(&self) -> FootprintBounds {
+        FootprintBounds {
+            generator: self.generator,
+            x: self.chunk.x(),
+            z: self.chunk.z(),
+            height_range: self.height_range,
+            bedrock_below: self.bedrock_below(),
+        }
+    }
+}
+
+/// What a chunk footprint's columns bound, for every chunk stacked on it:
+/// 24 bytes against the columns' 8 MiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FootprintBounds {
+    pub generator: GeneratorId,
+    /// The footprint's chunk `x` and `z`.
+    pub x: u32,
+    pub z: u32,
+    /// [`ChunkColumns::height_range`]: voxels at or above the highest are
+    /// air.
+    pub height_range: (i32, i32),
+    /// [`ChunkColumns::bedrock_below`].
+    pub bedrock_below: i32,
+}
+
+impl FootprintBounds {
+    /// Whether these are the bounds of `chunk`'s footprint (any `y`) for
+    /// `generator`.
+    pub fn serves(&self, generator: GeneratorId, chunk: ChunkCoord) -> bool {
+        self.generator == generator && self.x == chunk.x() && self.z == chunk.z()
+    }
 }
 
 /// The deepest coarse level: one sample per chunk.

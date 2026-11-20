@@ -15,7 +15,7 @@ pub mod coord;
 pub mod source;
 
 pub use coarse_source::CoarseSource;
-pub use columns::{ChunkColumns, CoarseColumns, MAX_COARSE_LEVEL};
+pub use columns::{ChunkColumns, CoarseColumns, FootprintBounds, MAX_COARSE_LEVEL};
 pub use coord::{CHUNK_SHIFT, CHUNK_SIZE, CHUNKS_PER_AXIS, ChunkCoord, ChunkOutOfWorld};
 pub use source::ChunkSource;
 

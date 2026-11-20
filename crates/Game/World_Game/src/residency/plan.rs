@@ -1,6 +1,8 @@
 //! Which chunks the player needs: full-detail chunks in a sphere, coarse
 //! chunk columns in a disc, both nearest first, and while the player moves,
 //! the chunks ahead first and a lookahead sphere around where they will be.
+//! Chunks buried under the terrain, which show only once dug into, wait as
+//! if they were farther away.
 
 use world_core::VoxelPos;
 use world_core::consts::VOXELS_PER_METER;
@@ -92,13 +94,20 @@ pub fn disc(eye: VoxelPos, radius_m: f32) -> Vec<(u32, u32)> {
     out.into_iter().map(|(_, c)| c).collect()
 }
 
-/// The full-detail `sphere` around `eye` in the order to load it while the
-/// player heads for `predicted`: the chunks within one chunk of the eye
-/// first (the ground underfoot), nearest first, then the rest by distance
-/// to `predicted`, so chunks ahead come before chunks behind, which the
-/// player leaves and which are evicted soonest. Ties in coordinate order.
-pub fn ahead_first(eye: VoxelPos, predicted: VoxelPos, sphere: &[ChunkCoord]) -> Vec<ChunkCoord> {
+/// The full-detail `sphere` around `eye` in the order to load it: the
+/// chunks within one chunk of the eye first (the ground underfoot), nearest
+/// first, then the rest by distance to `predicted` (where the player heads,
+/// so chunks ahead come before chunks behind, which the player leaves and
+/// which are evicted soonest) or, standing still, to the eye, each pushed
+/// back by `delay(chunk)` voxels. Ties in coordinate order.
+pub fn load_priority(
+    eye: VoxelPos,
+    predicted: Option<VoxelPos>,
+    sphere: &[ChunkCoord],
+    delay: impl Fn(ChunkCoord) -> f32,
+) -> Vec<ChunkCoord> {
     let near = CHUNK_SIZE as f32;
+    let target = predicted.unwrap_or(eye);
     let mut keyed: Vec<(bool, u32, ChunkCoord)> = sphere
         .iter()
         .map(|&c| {
@@ -106,12 +115,56 @@ pub fn ahead_first(eye: VoxelPos, predicted: VoxelPos, sphere: &[ChunkCoord]) ->
             if d <= near {
                 (false, d.to_bits(), c)
             } else {
-                (true, chunk_distance(predicted, c).to_bits(), c)
+                // Both terms are non-negative, so the bits sort like the
+                // floats.
+                let key = chunk_distance(target, c) + delay(c).max(0.0);
+                (true, key.to_bits(), c)
             }
         })
         .collect();
     keyed.sort_unstable();
     keyed.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// `chunks` by distance to `target` pushed back by `delay(chunk)` voxels,
+/// ties in coordinate order.
+pub fn delayed(
+    target: VoxelPos,
+    chunks: &[ChunkCoord],
+    delay: impl Fn(ChunkCoord) -> f32,
+) -> Vec<ChunkCoord> {
+    let mut keyed: Vec<(u32, ChunkCoord)> = chunks
+        .iter()
+        .map(|&c| ((chunk_distance(target, c) + delay(c).max(0.0)).to_bits(), c))
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, c)| c).collect()
+}
+
+/// What the residency knows of a chunk column's terrain: the lowest and
+/// highest column of its footprint, exact (from a full-detail load) or from
+/// coarse samples, which may miss the true extremes a little.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heights {
+    pub lo: i32,
+    pub hi: i32,
+    pub exact: bool,
+}
+
+/// How far coarse samples are trusted to bound the true lowest column, in
+/// voxels: a quarter chunk (4 m).
+const SAMPLE_MARGIN: i64 = CHUNK_SIZE as i64 / 4;
+
+/// Whether `chunk` lies entirely below the lowest column of its footprint,
+/// so nothing of it shows until the player digs in. Unknown columns are not
+/// buried.
+pub fn is_buried(chunk: ChunkCoord, heights: Option<Heights>) -> bool {
+    let Some(h) = heights else {
+        return false;
+    };
+    let margin = if h.exact { 0 } else { SAMPLE_MARGIN };
+    let top = i64::from(chunk.min_voxel().y) + i64::from(CHUNK_SIZE);
+    top <= i64::from(h.lo) - margin
 }
 
 /// The chunks within `radius_m` of `predicted` that lie outside the
@@ -284,7 +337,7 @@ mod tests {
             .predicted(eye, 2.0, voxels(96.0))
             .unwrap();
         let full = sphere(eye, 64.0);
-        let order = ahead_first(eye, predicted, &full);
+        let order = load_priority(eye, Some(predicted), &full, |_| 0.0);
         // The same chunks, each once.
         let mut a = order.clone();
         let mut b = full.clone();
@@ -319,8 +372,86 @@ mod tests {
             assert!(c.x() > eye_chunk.x(), "{c:?}");
         }
         // Deterministic: the same inputs give the same order.
-        assert_eq!(order, ahead_first(eye, predicted, &full));
+        assert_eq!(order, load_priority(eye, Some(predicted), &full, |_| 0.0));
         assert_eq!(extra, lookahead(eye, predicted, 64.0, 64.0, 96.0));
+    }
+
+    #[test]
+    fn buried_chunks_wait_but_never_pass_the_lookahead_or_the_ground_underfoot() {
+        let eye = VoxelPos::new(512, 300, 512);
+        let full = sphere(eye, 64.0);
+        let eye_chunk = ChunkCoord::containing(eye).unwrap();
+        // Flat terrain at the eye's chunk floor: every chunk below the eye's
+        // is buried.
+        let floor = eye_chunk.min_voxel().y;
+        let heights = Some(Heights {
+            lo: floor,
+            hi: floor + 1,
+            exact: true,
+        });
+        let buried = |c: ChunkCoord| is_buried(c, heights);
+        let delay = voxels(32.0);
+        let plain = load_priority(eye, None, &full, |_| 0.0);
+        assert_eq!(plain, full, "standing still with no delay is nearest first");
+        let order = load_priority(eye, None, &full, |c| if buried(c) { delay } else { 0.0 });
+        let mut a = order.clone();
+        a.sort_unstable();
+        let mut b = full.clone();
+        b.sort_unstable();
+        assert_eq!(a, b, "the same chunks, each once");
+        // The ground underfoot still comes first, buried or not.
+        let below = ChunkCoord::new(eye_chunk.x(), eye_chunk.y() - 1, eye_chunk.z()).unwrap();
+        assert!(buried(below));
+        let near = order
+            .iter()
+            .take_while(|&&c| chunk_distance(eye, c) <= CHUNK_SIZE as f32)
+            .count();
+        assert!(order[..near].contains(&below));
+        // Beyond it, a buried chunk comes after every surface chunk up to
+        // `delay` farther.
+        for (i, &c) in order.iter().enumerate().skip(near) {
+            if !buried(c) {
+                continue;
+            }
+            let d = chunk_distance(eye, c);
+            for &later in &order[i + 1..] {
+                if !buried(later) {
+                    assert!(
+                        chunk_distance(eye, later) >= d + delay - 1.0,
+                        "{c:?} {later:?}"
+                    );
+                }
+            }
+        }
+        // Moving, the lookahead still follows the whole sphere: it is
+        // appended after it whatever the delay.
+        let predicted = VoxelPos::new(512 + 3000, 300, 512);
+        let ahead = load_priority(eye, Some(predicted), &full, |c| {
+            if buried(c) { delay } else { 0.0 }
+        });
+        assert_eq!(ahead.len(), full.len());
+        let extra = lookahead(eye, predicted, 64.0, 64.0, 96.0);
+        let extra = delayed(predicted, &extra, |c| if buried(c) { delay } else { 0.0 });
+        assert!(extra.iter().all(|c| !ahead.contains(c)));
+        // Deterministic.
+        assert_eq!(
+            ahead,
+            load_priority(eye, Some(predicted), &full, |c| {
+                if buried(c) { delay } else { 0.0 }
+            })
+        );
+        // Coarse samples are trusted only with a margin.
+        let sampled = Some(Heights {
+            lo: floor,
+            hi: floor + 1,
+            exact: false,
+        });
+        assert!(!is_buried(below, sampled));
+        assert!(is_buried(
+            ChunkCoord::new(eye_chunk.x(), eye_chunk.y() - 2, eye_chunk.z()).unwrap(),
+            sampled
+        ));
+        assert!(!is_buried(below, None));
     }
 
     #[test]

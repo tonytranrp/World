@@ -14,6 +14,7 @@ use world_core::serialize::region::RecordKind;
 use world_core::tree::ChunkData;
 use world_gen::ChunkCoord;
 
+use super::columns::ColumnCache;
 use super::jobs::{self, Generators, LoadSource, WarmChunk};
 use super::store::{RegionStore, SavedChunk};
 
@@ -58,6 +59,12 @@ pub enum Done {
         refused: bool,
         error: Option<String>,
         source: LoadSource,
+        /// How long the worker spent on it, in microseconds.
+        micros: u64,
+        /// The lowest and highest column of its footprint, when learned.
+        heights: Option<(i32, i32)>,
+        /// Generated as one material without building.
+        uniform: bool,
     },
     Saved {
         coord: ChunkCoord,
@@ -70,6 +77,9 @@ pub enum Done {
         x: u32,
         z: u32,
         chunks: Vec<(ChunkCoord, ChunkData)>,
+        /// The lowest and highest coarse sample of the column's footprint
+        /// (the true columns may reach a little beyond).
+        heights: Option<(i32, i32)>,
     },
     Compressed {
         coord: ChunkCoord,
@@ -83,6 +93,8 @@ pub enum Done {
 pub struct Shared {
     pub generators: Arc<Generators>,
     pub coarse_level: u32,
+    /// Column footprints shared by the workers.
+    pub columns: Arc<ColumnCache>,
 }
 
 /// An encoded chunk on its way to the I/O thread.
@@ -359,9 +371,16 @@ enum Ran {
 fn run(shared: &Shared, job: WorkJob) -> Ran {
     match job {
         WorkJob::Load(coord, warm, saved) => {
+            let start = std::time::Instant::now();
             let loaded = match &saved {
-                Ok(saved) => jobs::load(&shared.generators, coord, warm.as_ref(), saved),
-                Err(e) => jobs::unreadable(&shared.generators, coord, e),
+                Ok(saved) => jobs::load(
+                    &shared.generators,
+                    &shared.columns,
+                    coord,
+                    warm.as_ref(),
+                    saved,
+                ),
+                Err(e) => jobs::unreadable(&shared.generators, &shared.columns, coord, e),
             };
             Ran::Done(Done::Loaded {
                 coord,
@@ -369,10 +388,19 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 refused: loaded.refused,
                 error: loaded.error,
                 source: loaded.source,
+                micros: start.elapsed().as_micros() as u64,
+                heights: loaded.heights,
+                uniform: loaded.uniform,
             })
         }
         WorkJob::Save(coord, data, set_aside) => {
-            let e = jobs::encode_chunk(&shared.generators, coord, data, shared.coarse_level);
+            let e = jobs::encode_chunk(
+                &shared.generators,
+                &shared.columns,
+                coord,
+                data,
+                shared.coarse_level,
+            );
             Ran::Write(Write {
                 coord,
                 records: e.records,
@@ -381,17 +409,21 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 set_aside,
             })
         }
-        WorkJob::Coarse(x, z, saved) => Ran::Done(Done::Coarse {
-            x,
-            z,
-            chunks: jobs::coarse_column(
+        WorkJob::Coarse(x, z, saved) => {
+            let (chunks, heights) = jobs::coarse_column(
                 shared.generators.current(),
                 x,
                 z,
                 shared.coarse_level,
                 &saved,
-            ),
-        }),
+            );
+            Ran::Done(Done::Coarse {
+                x,
+                z,
+                chunks,
+                heights,
+            })
+        }
         WorkJob::Compress(coord, data, ticket) => Ran::Done(Done::Compressed {
             coord,
             warm: jobs::compress(coord, data),
