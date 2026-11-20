@@ -22,6 +22,9 @@ pub struct VoxelWorldFeed {
     snapshot: Option<Arc<TreeSnapshot>>,
     dirty: Vec<BrickPos>,
     refresh: bool,
+    /// Counts [`replace`](Self::replace) and [`clear`](Self::clear) calls:
+    /// a publisher that remembers it can tell when another one took over.
+    generation: u64,
 }
 
 /// What the render world takes from the feed in one extraction.
@@ -45,6 +48,7 @@ impl VoxelWorldFeed {
         self.snapshot = Some(snapshot);
         self.dirty.clear();
         self.refresh = true;
+        self.generation += 1;
     }
 
     /// Stops rendering any world.
@@ -52,6 +56,14 @@ impl VoxelWorldFeed {
         self.snapshot = None;
         self.dirty.clear();
         self.refresh = true;
+        self.generation += 1;
+    }
+
+    /// Which world the feed holds: it changes on every
+    /// [`replace`](Self::replace) and [`clear`](Self::clear), never on a
+    /// [`publish`](Self::publish).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn snapshot(&self) -> Option<&Arc<TreeSnapshot>> {
@@ -85,6 +97,21 @@ impl FeedFrame {
 mod tests {
     use super::*;
     use world_core::{Edit, MaterialId, VoxelPos, VoxelTree};
+
+    #[test]
+    fn generation_changes_on_replace_and_clear_only() {
+        let tree = VoxelTree::new();
+        let mut feed = VoxelWorldFeed::default();
+        let g0 = feed.generation();
+        feed.replace(Arc::new(tree.snapshot()));
+        let g1 = feed.generation();
+        assert_ne!(g0, g1);
+        feed.publish(Arc::new(tree.snapshot()), &DirtyBricks::default());
+        let _ = feed.take();
+        assert_eq!(feed.generation(), g1, "publish and take keep the world");
+        feed.clear();
+        assert_ne!(feed.generation(), g1);
+    }
 
     #[test]
     fn changes_are_taken_exactly_once() {
