@@ -23,6 +23,9 @@ impl Edit {
 pub enum EditError {
     /// The voxel lies outside the fixed world.
     OutOfWorld { pos: VoxelPos },
+    /// A whole-node operation was given a position that is not the lowest
+    /// voxel of a node at `level`.
+    Misaligned { pos: VoxelPos, level: u32 },
 }
 
 impl fmt::Display for EditError {
@@ -31,6 +34,11 @@ impl fmt::Display for EditError {
             Self::OutOfWorld { pos } => write!(
                 f,
                 "voxel ({}, {}, {}) is outside the world",
+                pos.x, pos.y, pos.z
+            ),
+            Self::Misaligned { pos, level } => write!(
+                f,
+                "voxel ({}, {}, {}) is not the lowest corner of a level-{level} node",
                 pos.x, pos.y, pos.z
             ),
         }

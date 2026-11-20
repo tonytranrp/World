@@ -101,11 +101,9 @@ pub fn encode(tree: &impl TreeRead) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Result<VoxelTree, DecodeError> {
     let body = unseal(bytes)?;
     read::body(body, &mut read::Validate)?;
-    // A faster bulk build can replace the per-voxel writes later; the body is
-    // already known to be valid, so this pass cannot fail.
-    let mut tree = VoxelTree::new();
-    read::body(body, &mut tree)?;
-    Ok(tree)
+    // The body is known to be valid, so the build pass cannot fail; it
+    // writes each leaf and node once, bottom-up.
+    VoxelTree::build_with(|builder| read::body(body, &mut read::TreeBuild { builder }))
 }
 
 /// A hash of the tree's content, stable across machines and versions of this

@@ -20,9 +20,11 @@
 
 mod branch;
 mod brick;
+mod build;
 mod fill;
 mod voxel;
 
+pub(crate) use build::{Builder, graft};
 pub(crate) use fill::LocalBox;
 pub(crate) use voxel::LocalEdit;
 

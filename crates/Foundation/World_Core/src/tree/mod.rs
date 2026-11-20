@@ -13,6 +13,7 @@
 //! point lookups, `cursor` the cached lookups, `grid` the dense grids.
 
 mod alloc;
+mod build;
 mod cursor;
 mod grid;
 mod mutate;
@@ -25,6 +26,7 @@ mod tests;
 use std::fmt;
 
 pub use alloc::{NODE_PAGE_LEN, WORD_PAGE_LEN};
+pub use build::RegionSource;
 pub use cursor::TreeCursor;
 pub use grid::{DenseGrid, GridNode, MAX_GRID_LEVELS};
 pub use node::{Node, RECORD_WORDS, UNIFORM_BIT};
@@ -33,6 +35,7 @@ pub use read::{
 };
 
 use alloc::{Storage, Store};
+pub(crate) use mutate::Builder;
 use mutate::{LocalBox, LocalEdit};
 use node::{Child, path_key};
 use read::TreeView;
@@ -151,6 +154,51 @@ impl VoxelTree {
         Ok(DirtyBricks::from_unsorted(bricks))
     }
 
+    /// A tree holding exactly what `source` describes for the whole world,
+    /// built bottom-up (see [`RegionSource`]).
+    pub fn from_source(source: &impl RegionSource) -> Self {
+        let built: Result<Self, std::convert::Infallible> =
+            Self::build_with(|builder| Ok(build::child(builder, source, ROOT_LEVEL, [0; 3])));
+        match built {
+            Ok(tree) => tree,
+        }
+    }
+
+    /// Replaces the whole region of the node at `level` (1 to
+    /// `TREE_DEPTH - 1`) whose lowest voxel is `min` with what `source`
+    /// describes, built bottom-up and swapped in along one path. Returns
+    /// whether the stored region was replaced: false only when it was and
+    /// stays air or one uniform material. Fails, changing nothing, if `min` is
+    /// outside the world or not the lowest voxel of such a node.
+    pub fn build_region(
+        &mut self,
+        level: u32,
+        min: VoxelPos,
+        source: &impl RegionSource,
+    ) -> Result<bool, EditError> {
+        let local = node_origin(level, min)?;
+        let mut builder = mutate::Builder::new(&mut self.store);
+        let new = build::child(&mut builder, source, level, local);
+        Ok(mutate::graft(
+            &mut self.store,
+            &mut self.root,
+            ROOT_LEVEL,
+            level,
+            local,
+            new,
+        ))
+    }
+
+    /// Builds a tree bottom-up: `build` writes canonical content through the
+    /// builder and returns the root child.
+    pub(crate) fn build_with<E>(
+        build: impl FnOnce(&mut Builder<'_>) -> Result<Child, E>,
+    ) -> Result<Self, E> {
+        let mut store = Store::default();
+        let root = build(&mut Builder::new(&mut store))?;
+        Ok(Self { store, root })
+    }
+
     /// An immutable view of the tree as it is now. O(1).
     pub fn snapshot(&self) -> TreeSnapshot {
         TreeSnapshot {
@@ -186,6 +234,21 @@ impl VoxelTree {
             root: self.root,
         }
     }
+}
+
+/// The world-local lowest voxel of the node at `level` whose lowest voxel is
+/// `min`, checking that `min` is one.
+fn node_origin(level: u32, min: VoxelPos) -> Result<[u32; 3], EditError> {
+    let misaligned = EditError::Misaligned { pos: min, level };
+    if !(1..=ROOT_LEVEL).contains(&level) {
+        return Err(misaligned);
+    }
+    let local = path::world_local(min).ok_or(EditError::OutOfWorld { pos: min })?;
+    let size = path::child_span(level + 1);
+    if local.iter().any(|&v| v % size != 0) {
+        return Err(misaligned);
+    }
+    Ok(local)
 }
 
 impl TreeRead for VoxelTree {
