@@ -93,19 +93,25 @@ pub fn disc(eye: VoxelPos, radius_m: f32) -> Vec<(u32, u32)> {
 }
 
 /// The full-detail `sphere` around `eye` in the order to load it while the
-/// player heads for `predicted`: by distance to the nearer of the two, so
-/// chunks ahead come before chunks behind at the same distance and chunks
-/// right around the player still come early. Ties in coordinate order.
+/// player heads for `predicted`: the chunks within one chunk of the eye
+/// first (the ground underfoot), nearest first, then the rest by distance
+/// to `predicted`, so chunks ahead come before chunks behind, which the
+/// player leaves and which are evicted soonest. Ties in coordinate order.
 pub fn ahead_first(eye: VoxelPos, predicted: VoxelPos, sphere: &[ChunkCoord]) -> Vec<ChunkCoord> {
-    let mut keyed: Vec<(u32, ChunkCoord)> = sphere
+    let near = CHUNK_SIZE as f32;
+    let mut keyed: Vec<(bool, u32, ChunkCoord)> = sphere
         .iter()
         .map(|&c| {
-            let d = chunk_distance(eye, c).min(chunk_distance(predicted, c));
-            (d.to_bits(), c)
+            let d = chunk_distance(eye, c);
+            if d <= near {
+                (false, d.to_bits(), c)
+            } else {
+                (true, chunk_distance(predicted, c).to_bits(), c)
+            }
         })
         .collect();
     keyed.sort_unstable();
-    keyed.into_iter().map(|(_, c)| c).collect()
+    keyed.into_iter().map(|(_, _, c)| c).collect()
 }
 
 /// The chunks within `radius_m` of `predicted` that lie outside the
@@ -285,9 +291,9 @@ mod tests {
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
-        // Most of the first quarter lies ahead (chunks right behind the
-        // player keep their place); nearest first alone would put as many
-        // behind as ahead.
+        // Most of the first quarter lies ahead (the few right around the
+        // player come first wherever they are); nearest first alone would
+        // put as many behind as ahead.
         let quarter = &order[..order.len() / 4];
         let eye_chunk = ChunkCoord::containing(eye).unwrap();
         let ahead = quarter.iter().filter(|c| c.x() > eye_chunk.x()).count();
