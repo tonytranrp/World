@@ -50,9 +50,31 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                     "a branch of one material must be a uniform child"
                 );
                 found.0 += 1;
-                // One child word each, or one leaf record each at level 1.
-                let per_child = if level == 1 { RECORD_WORDS } else { 1 };
-                found.2 += per_child * children.len();
+                if let Some((header, stored)) = b.brick_layout() {
+                    // A header, and a record for every leaf but the full ones
+                    // of the default material: the most common full material.
+                    let mut counts = std::collections::BTreeMap::new();
+                    for (_, c) in &children {
+                        if let NodeRef::Uniform(m) = c {
+                            *counts.entry(*m).or_insert(0usize) += 1;
+                        }
+                    }
+                    let best = counts
+                        .iter()
+                        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                        .map(|(&m, &n)| (m, n));
+                    match best {
+                        Some((m, n)) => {
+                            assert_eq!(header.default, m, "the most common full leaf");
+                            assert_eq!(header.full.count_ones() as usize, n);
+                        }
+                        None => assert_eq!(header, Default::default()),
+                    }
+                    assert_eq!(stored, children.len() - header.full.count_ones() as usize);
+                    found.2 += 3 + RECORD_WORDS * stored;
+                } else {
+                    found.2 += children.len();
+                }
                 for (slot, child) in children {
                     assert!(b.mask() & (1 << slot) != 0);
                     assert!(!matches!(child, NodeRef::Air));
@@ -414,7 +436,8 @@ fn a_single_material_leaf_is_one_three_word_record() {
     tree.set(pos(4, 0, 0), STONE).unwrap();
     tree.set(pos(5, 1, 0), STONE).unwrap();
     assert_eq!(live_bytes(&tree) - one, 12);
-    assert_eq!(live(&tree), (9, 2, 8 + 2 * RECORD_WORDS));
+    // Level 2 and up: eight child words; the brick: a header and two records.
+    assert_eq!(live(&tree), (9, 2, 8 + 3 + 2 * RECORD_WORDS));
 
     let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
         panic!("a partly solid leaf");

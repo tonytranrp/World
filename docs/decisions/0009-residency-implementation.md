@@ -29,6 +29,14 @@ Records are append-only, so the corrections and choices are recorded here.
   returning `None`, `is_resident`); edits there fail with
   `EditError::NotResident` and the game layer queues them. The encoding
   gains tag 4 for it in version 1, since no save existed before.
+- **Compact bricks.** The byte breakdown decision 0006 asked for showed full
+  single-material leaves at 42 to 62% of a generated chunk's live bytes, far
+  above the 15% bar. A level-1 block now starts with a three-word header (a
+  default mask and a default material, the most common material among its
+  full leaves); those leaves have no record, and `Node::info` counts the
+  records that remain. Generated chunks shrink 37 to 57% (for example 4.09
+  to 2.07 MiB and 8.69 to 5.37 MiB). The save format and the GPU format are
+  unchanged, since both are written through the read interface.
 - **Building.** `RegionSource` (exact `uniform` answers plus `leaf`) feeds a
   bottom-up builder that writes each leaf and node once. Decoding, terrain,
   compaction, copies, coarse summaries and overlay merges all use it.

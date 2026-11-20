@@ -19,7 +19,8 @@ use super::forest::ChunkLookup;
 use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
 use super::node::{
-    CHUNK_LEVEL, Child, NOT_RESIDENT, RECORD_WORDS, UNIFORM_BIT, bit, rank, slot_at, slots,
+    BRICK_HEADER_WORDS, BrickHeader, CHUNK_LEVEL, Child, NOT_RESIDENT, RECORD_WORDS, UNIFORM_BIT,
+    bit, rank, slot_at, slots,
 };
 use super::{ROOT_LEVEL, WORLD_ORIGIN};
 use crate::consts::{TREE_DEPTH, TREE_FANOUT};
@@ -401,36 +402,55 @@ impl<'a> BranchRef<'a> {
         if self.mask & bit(slot) == 0 {
             return NodeRef::Air;
         }
+        if self.level == 1 {
+            let header = BrickHeader::read(self.block);
+            if header.full & bit(slot) != 0 {
+                return NodeRef::Uniform(header.default);
+            }
+            let at = header.record_offset(self.mask, slot);
+            return NodeRef::leaf(
+                self.storage,
+                Record::read(&self.block[at..at + RECORD_WORDS]),
+            );
+        }
         self.child_at(rank(self.mask, slot))
     }
 
     /// The children that are not air, in ascending slot order.
     pub fn children(&self) -> impl Iterator<Item = (u32, NodeRef<'a>)> + 'a + use<'a> {
         let branch = *self;
-        slots(self.mask)
-            .enumerate()
-            .map(move |(k, slot)| (slot, branch.child_at(k)))
+        slots(self.mask).enumerate().map(move |(k, slot)| {
+            let child = if branch.level == 1 {
+                branch.child(slot)
+            } else {
+                branch.child_at(k)
+            };
+            (slot, child)
+        })
     }
 
-    /// The `k`-th non-air child.
-    fn child_at(&self, k: usize) -> NodeRef<'a> {
-        if self.level == 1 {
-            let at = k * RECORD_WORDS;
-            NodeRef::leaf(
-                self.storage,
-                Record::read(&self.block[at..at + RECORD_WORDS]),
+    /// For a level-1 node: its header and the number of stored records, for
+    /// storage accounting.
+    pub(crate) fn brick_layout(&self) -> Option<(BrickHeader, usize)> {
+        (self.level == 1).then(|| {
+            (
+                BrickHeader::read(self.block),
+                (self.block.len() - BRICK_HEADER_WORDS) / RECORD_WORDS,
             )
-        } else {
-            let child = Child::from_word(self.block[k]);
-            if self.level == CHUNK_LEVEL + 1
-                && let Child::Node(id) = child
-            {
-                // The children of a level-5 node root chunks.
-                let (storage, root) = self.chunks.chunk_root(id);
-                return NodeRef::new(storage, self.chunks, Child::Node(root), CHUNK_LEVEL);
-            }
-            NodeRef::new(self.storage, self.chunks, child, self.level - 1)
+        })
+    }
+
+    /// The `k`-th non-air child of a node of level 2 or higher.
+    fn child_at(&self, k: usize) -> NodeRef<'a> {
+        let child = Child::from_word(self.block[k]);
+        if self.level == CHUNK_LEVEL + 1
+            && let Child::Node(id) = child
+        {
+            // The children of a level-5 node root chunks.
+            let (storage, root) = self.chunks.chunk_root(id);
+            return NodeRef::new(storage, self.chunks, Child::Node(root), CHUNK_LEVEL);
         }
+        NodeRef::new(self.storage, self.chunks, child, self.level - 1)
     }
 }
 
@@ -675,10 +695,14 @@ pub(crate) fn step(
     if node.mask & bit(slot) == 0 {
         return Step::Filled(MaterialId::AIR);
     }
-    let k = rank(node.mask, slot) as u32;
     if level == 1 {
-        return Step::Record(node.base + RECORD_WORDS as u32 * k);
+        let header = BrickHeader::read(storage.block(node.base, BRICK_HEADER_WORDS));
+        if header.full & bit(slot) != 0 {
+            return Step::Filled(header.default);
+        }
+        return Step::Record(node.base + header.record_offset(node.mask, slot) as u32);
     }
+    let k = rank(node.mask, slot) as u32;
     let word = storage.word(node.base + k);
     if word == NOT_RESIDENT {
         Step::NotResident

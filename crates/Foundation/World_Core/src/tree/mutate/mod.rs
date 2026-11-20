@@ -186,7 +186,7 @@ impl Writer<'_> {
                 Child::NotResident
             }
             (Packed::Node(p), Some((index, old))) => {
-                self.rewrite(index, old, level, p.mask, p.words());
+                self.rewrite(index, old, level, p.mask, p.info, p.words());
                 Child::Node(index)
             }
             (Packed::Node(p), None) => {
@@ -194,7 +194,7 @@ impl Writer<'_> {
                 let node = Node {
                     mask: p.mask,
                     base,
-                    info: 0,
+                    info: p.info,
                 };
                 Child::Node(self.store_mut().alloc_node(node))
             }
@@ -204,7 +204,7 @@ impl Writer<'_> {
     /// Updates node `index` from `old` to `mask` and `words`, writing only
     /// what differs. A block of the same length is overwritten in place;
     /// otherwise a new block replaces it.
-    fn rewrite(&mut self, index: u32, old: Node, level: u32, mask: u64, words: &[u32]) {
+    fn rewrite(&mut self, index: u32, old: Node, level: u32, mask: u64, info: u32, words: &[u32]) {
         let old_len = old.block_len(level);
         let base = if old_len == words.len() {
             if self.store().block(old.base, old_len) != words {
@@ -216,11 +216,7 @@ impl Writer<'_> {
             self.store_mut().free_block(old.base, old_len);
             base
         };
-        let node = Node {
-            mask,
-            base,
-            info: 0,
-        };
+        let node = Node { mask, base, info };
         if node != old {
             self.store_mut().set_node(index, node);
         }

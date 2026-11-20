@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "1 to 192 words")]
+    #[should_panic(expected = "1 to 195 words")]
     fn oversized_blocks_are_refused() {
         let (mut blocks, mut pages) = arena();
         blocks.alloc(MAX_BLOCK_LEN + 1, &mut pages);

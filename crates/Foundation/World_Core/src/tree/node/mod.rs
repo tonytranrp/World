@@ -29,7 +29,7 @@
 //! | ------ | ----- | ---------------------------------------------------- |
 //! | `mask` | `u64` | bit `i` is set when child slot `i` is not all air    |
 //! | `base` | `u32` | first word of the node's block                       |
-//! | `info` | `u32` | reserved, always 0                                   |
+//! | `info` | `u32` | level 1: stored leaf records; otherwise 0            |
 //!
 //! Every node is a branch of level 1 to `TREE_DEPTH - 1`; the root is level
 //! `TREE_DEPTH - 1`. There are no leaf nodes: the 4x4x4-voxel leaves live in
@@ -58,10 +58,21 @@
 //! shared top. Node indices and word offsets inside a chunk refer to that
 //! chunk's arenas.
 //!
-//! # Leaf records, level 1: block of `3n` words
+//! # Bricks, level 1: a header, then `3 * info` words
 //!
-//! A level-1 node covers one brick (16x16x16 voxels). Child slot `i` is the
-//! leaf record at `words[base + 3 * rank(i)]`, [`RECORD_WORDS`] words:
+//! A level-1 node covers one brick (16x16x16 voxels). Its block starts with a
+//! [`BRICK_HEADER_WORDS`]-word header: a 64-bit *default mask* (two words, low
+//! first) and a *default material*. A leaf whose slot is set in the default
+//! mask is full and of the default material, and has no words at all; most
+//! leaves under a terrain surface are such leaves. Every other non-air leaf
+//! `i` is a record at `words[base + 3 + 3 * rank'(i)]`, where `rank'` counts
+//! the set bits of `mask & !default_mask` below `i`, [`RECORD_WORDS`] words
+//! each; `info` is how many there are. The default material is the most
+//! common material among the brick's full single-material leaves (ties to
+//! the lower id), and the default mask is exactly those leaves of it; a
+//! brick without such leaves has a zero header.
+//!
+//! A record is:
 //!
 //! | Word | Meaning                                                    |
 //! | ---- | ---------------------------------------------------------- |
@@ -116,7 +127,8 @@ pub struct Node {
     pub mask: u64,
     /// First word of the node's block in the word arena.
     pub base: u32,
-    /// Reserved, always 0. It keeps the node padding-free at 16 bytes.
+    /// At level 1, the number of stored leaf records; 0 above. It also keeps
+    /// the node padding-free at 16 bytes.
     pub info: u32,
 }
 
@@ -139,27 +151,56 @@ pub const CHUNK_LEVEL: u32 = 4;
 /// Words in one leaf record of a level-1 node's block.
 pub const RECORD_WORDS: usize = 3;
 
-/// Node indices are below this, so they never collide with uniform words.
-pub(crate) const MAX_NODES: u32 = UNIFORM_BIT;
+/// Words in the header of a level-1 node's block: the default mask and the
+/// default material.
+pub const BRICK_HEADER_WORDS: usize = 3;
 
-/// The longest node block: a level-1 node with 64 leaf records.
-pub(crate) const MAX_BLOCK_LEN: usize = RECORD_WORDS * TREE_FANOUT as usize;
+/// The header of a level-1 node's block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BrickHeader {
+    /// Leaves that are full and of `default`, with no record.
+    pub full: u64,
+    pub default: MaterialId,
+}
 
-impl Node {
-    /// Words in the block of this node at `level`: one per child at level 2
-    /// and up, one record per child at level 1.
-    pub(crate) const fn block_len(self, level: u32) -> usize {
-        block_len(self.mask, level)
+impl BrickHeader {
+    pub fn read(words: &[u32]) -> Self {
+        Self {
+            full: u64::from(words[0]) | u64::from(words[1]) << 32,
+            default: MaterialId(words[2] as u16),
+        }
+    }
+
+    pub const fn words(self) -> [u32; BRICK_HEADER_WORDS] {
+        [
+            self.full as u32,
+            (self.full >> 32) as u32,
+            self.default.0 as u32,
+        ]
+    }
+
+    /// The word offset, from the block start, of leaf `slot`'s record in a
+    /// node with `mask`. Only meaningful for a stored (non-default) leaf.
+    pub const fn record_offset(self, mask: u64, slot: u32) -> usize {
+        BRICK_HEADER_WORDS + RECORD_WORDS * rank(mask & !self.full, slot)
     }
 }
 
-/// Words in the block of a node with this mask at `level`.
-pub(crate) const fn block_len(mask: u64, level: u32) -> usize {
-    let children = mask.count_ones() as usize;
-    if level == 1 {
-        RECORD_WORDS * children
-    } else {
-        children
+/// Node indices are below this, so they never collide with uniform words.
+pub(crate) const MAX_NODES: u32 = UNIFORM_BIT;
+
+/// The longest node block: a level-1 node with a header and 64 records.
+pub(crate) const MAX_BLOCK_LEN: usize = BRICK_HEADER_WORDS + RECORD_WORDS * TREE_FANOUT as usize;
+
+impl Node {
+    /// Words in the block of this node at `level`: one per child at level 2
+    /// and up; the header and `info` records at level 1.
+    pub(crate) const fn block_len(self, level: u32) -> usize {
+        if level == 1 {
+            BRICK_HEADER_WORDS + RECORD_WORDS * self.info as usize
+        } else {
+            self.mask.count_ones() as usize
+        }
     }
 }
 
@@ -261,17 +302,19 @@ pub(crate) fn path_key(local: [u32; 3], levels: u32) -> u64 {
     })
 }
 
-/// A node's content ready to store: its mask and a block of up to `N` words.
+/// A node's content ready to store: its mask, its `info` and a block of up
+/// to `N` words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PackedNode<const N: usize> {
     pub mask: u64,
+    pub info: u32,
     words: [u32; N],
     len: usize,
 }
 
 impl<const N: usize> PackedNode<N> {
     /// Panics if `words` is empty or longer than `N`.
-    pub fn new(mask: u64, words: &[u32]) -> Self {
+    pub fn new(mask: u64, info: u32, words: &[u32]) -> Self {
         assert!(
             (1..=N).contains(&words.len()),
             "a node block holds 1 to {N} words, not {}",
@@ -281,6 +324,7 @@ impl<const N: usize> PackedNode<N> {
         block[..words.len()].copy_from_slice(words);
         Self {
             mask,
+            info,
             words: block,
             len: words.len(),
         }
@@ -366,12 +410,29 @@ mod tests {
         let node = Node {
             mask: bit(1) | bit(9) | bit(40),
             base: 0,
-            info: 0,
+            info: 2,
         };
         assert_eq!(node.block_len(2), 3);
         assert_eq!(node.block_len(9), 3);
-        assert_eq!(node.block_len(1), 9, "three words per leaf record");
-        assert_eq!(block_len(u64::MAX, 1), MAX_BLOCK_LEN);
+        assert_eq!(node.block_len(1), 9, "a header and two records");
+        let full = Node {
+            mask: u64::MAX,
+            base: 0,
+            info: 64,
+        };
+        assert_eq!(full.block_len(1), MAX_BLOCK_LEN);
+    }
+
+    #[test]
+    fn brick_headers_round_trip_and_skip_default_leaves() {
+        let h = BrickHeader {
+            full: bit(2) | bit(63),
+            default: MaterialId(7),
+        };
+        assert_eq!(BrickHeader::read(&h.words()), h);
+        let mask = bit(0) | bit(2) | bit(5) | bit(63);
+        assert_eq!(h.record_offset(mask, 0), 3);
+        assert_eq!(h.record_offset(mask, 5), 6, "slot 2 has no record");
     }
 
     #[test]
@@ -406,6 +467,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "1 to 64 words")]
     fn packed_nodes_are_never_empty() {
-        PackedNode::<64>::new(0, &[]);
+        PackedNode::<64>::new(0, 0, &[]);
     }
 }

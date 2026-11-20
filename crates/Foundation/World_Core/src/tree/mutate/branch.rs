@@ -78,7 +78,7 @@ pub(super) fn pack(children: &Children) -> Packed<{ TREE_FANOUT as usize }> {
             Child::Air | Child::Node(_) => {}
         }
     }
-    Packed::Node(PackedNode::new(mask, &words[..len]))
+    Packed::Node(PackedNode::new(mask, 0, &words[..len]))
 }
 
 #[cfg(test)]

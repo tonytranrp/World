@@ -30,6 +30,7 @@ fn tree_of(world: &DenseWorld) -> VoxelTree {
 /// The words a tree's breakdown accounts for, which must be its live words.
 fn breakdown_words(b: &MemoryBreakdown) -> usize {
     b.child_words
+        + 3 * b.bricks
         + 3 * (b.full_records + b.single_records + b.palette_records)
         + b.palette_words.iter().sum::<usize>()
 }

@@ -3,7 +3,7 @@
 //! a comparison for any voxel source (live tree, snapshot or dense grid), and
 //! a walk that checks the canonical form of decision 0004 node by node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use world_core::tree::{CHUNK_LEVEL, NodeKind, NodeView, TreeRead, TreeStats, VoxelSource};
 use world_core::{DenseGrid, MaterialId, VoxelBox, VoxelPos, VoxelTree};
@@ -152,8 +152,24 @@ impl Walk {
             }
         }
         self.counts.branches += 1;
-        // A child word per child, or a three-word leaf record at level 1.
-        self.counts.words += listed.len() * if level == 1 { 3 } else { 1 };
+        if level == 1 {
+            // A three-word header, then a three-word record per leaf except
+            // the full leaves of the default material: the most common
+            // material among full leaves, ties to the lower id.
+            let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+            for (_, n) in &listed {
+                if let NodeKind::Uniform(m) = n.kind() {
+                    *counts.entry(m.0).or_default() += 1;
+                }
+            }
+            let defaults = counts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                .map_or(0, |(_, &n)| n);
+            self.counts.words += 3 + 3 * (listed.len() - defaults);
+        } else {
+            self.counts.words += listed.len();
+        }
         for (slot, node) in listed {
             if node.kind() == NodeKind::Air {
                 return Err(self.fail("children() lists an air child"));
