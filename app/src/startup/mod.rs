@@ -9,6 +9,7 @@
 //!
 //! The device and tier are decided once; changing them needs a restart.
 
+mod frame_stats;
 #[cfg(feature = "hotpatch")]
 mod hot_probe;
 mod select;
@@ -121,7 +122,8 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
 
     if let Some(frames) = config.exit_after_frames {
         app.insert_resource(ExitAfter(frames))
-            .add_systems(Update, exit_after_frames);
+            .init_resource::<frame_stats::FrameTimes>()
+            .add_systems(Update, (frame_stats::record, exit_after_frames).chain());
         if let Some(path) = &config.screenshot {
             app.insert_resource(ScreenshotAt {
                 frame: frames.saturating_sub(SCREENSHOT_LEAD_FRAMES).max(1),
@@ -180,9 +182,13 @@ struct ExitAfter(u32);
 fn exit_after_frames(
     limit: Res<ExitAfter>,
     mut frames: Local<u32>,
+    times: Res<frame_stats::FrameTimes>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frames += 1;
+    if *frames == limit.0 {
+        frame_stats::report(&times);
+    }
     if *frames >= limit.0 {
         exit.write(AppExit::Success);
     }
