@@ -40,8 +40,7 @@ pub fn content<N: NodeView>(node: &N) -> Content {
         NodeKind::Uniform(m) => Content::Uniform(m),
         NodeKind::Branch => Content::Branch,
         NodeKind::Leaf => Content::Leaf,
-        // TODO(decision 0006): `NodeKind::NotResident => Content::Unloaded,`
-        // when World_Core adds the variant.
+        NodeKind::NotResident => Content::Unloaded,
     }
 }
 
