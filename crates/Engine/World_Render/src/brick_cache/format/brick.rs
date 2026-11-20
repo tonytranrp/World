@@ -1,9 +1,9 @@
 //! The brick block encoder: one level-1 node into its GPU block.
 
 use world_core::MaterialId;
-use world_core::tree::{NodeView, Palette};
+use world_core::tree::NodeView;
 
-use super::summary::{Content, Summary, Tally, content, count_voxels};
+use super::summary::{Content, Summary, Tally, content};
 use super::{
     BLOCK_ALIGN_WORDS, BLOCK_FLAG_EDITED, BLOCK_FLAGS_SHIFT, BLOCK_HEADER_WORDS,
     BLOCK_PALETTE_WORDS_SHIFT, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT, PAYLOAD_UNIFORM_BIT,
@@ -44,11 +44,54 @@ pub const fn palette_block_words(len: u32, solid: u32) -> u32 {
     1 + len.div_ceil(2) + (solid * index_bits(len)).div_ceil(32)
 }
 
+/// One leaf's solid voxels and their distinct materials, read once.
+struct LeafScan {
+    /// Solid voxels in slot order.
+    voxels: [MaterialId; 64],
+    solid: usize,
+    /// Distinct materials, ascending, with their voxel counts.
+    palette: [MaterialId; 64],
+    counts: [u64; 64],
+    len: usize,
+}
+
+impl LeafScan {
+    fn of<N: NodeView>(leaf: &N, mask: u64) -> Self {
+        let mut scan = Self {
+            voxels: [MaterialId::AIR; 64],
+            solid: 0,
+            palette: [MaterialId::AIR; 64],
+            counts: [0; 64],
+            len: 0,
+        };
+        let mut bits = mask;
+        while bits != 0 {
+            let slot = bits.trailing_zeros();
+            bits &= bits - 1;
+            let m = leaf.voxel(slot);
+            scan.voxels[scan.solid] = m;
+            scan.solid += 1;
+            match scan.palette[..scan.len].binary_search(&m) {
+                Ok(i) => scan.counts[i] += 1,
+                Err(i) => {
+                    scan.palette.copy_within(i..scan.len, i + 1);
+                    scan.counts.copy_within(i..scan.len, i + 1);
+                    scan.palette[i] = m;
+                    scan.counts[i] = 1;
+                    scan.len += 1;
+                }
+            }
+        }
+        scan
+    }
+}
+
 /// Appends the block of a level-1 node to `out` and reports it.
 ///
 /// `node` must be a branch whose children are leaves (a level-1 node of a
 /// `VoxelSource`); air and uniform level-1 nodes have no block, their record
-/// says everything. `scratch` is reused between calls.
+/// says everything. `scratch` is reused between calls. Every voxel is read
+/// once; the representative material is counted from the same reads.
 pub fn encode_brick<N: NodeView>(
     node: N,
     brick_id: u32,
@@ -60,13 +103,10 @@ pub fn encode_brick<N: NodeView>(
     let start = out.len();
     let mask = node.mask();
     let n = mask.count_ones();
-
     scratch.clear();
-    count_voxels(node, 1, scratch);
-    let summary = scratch.summary();
 
     // Header, then room for masks and payloads, filled below.
-    out.extend_from_slice(&[brick_id, 0, u32::from(summary.material.0), 0]);
+    out.extend_from_slice(&[brick_id, 0, 0, 0]);
     out.resize(
         start + (BLOCK_HEADER_WORDS + n * (LEAF_MASK_WORDS + 1)) as usize,
         0,
@@ -79,21 +119,34 @@ pub fn encode_brick<N: NodeView>(
         out[masks_at + 2 * k] = leaf_mask as u32;
         out[masks_at + 2 * k + 1] = (leaf_mask >> 32) as u32;
         out[payloads_at + k] = match content(&leaf) {
-            Content::Uniform(m) => PAYLOAD_UNIFORM_BIT | u32::from(m.0),
+            Content::Uniform(m) => {
+                scratch.add(m, 64);
+                PAYLOAD_UNIFORM_BIT | u32::from(m.0)
+            }
+            // Most surface leaves hold one material: the stored palette says
+            // so without reading voxels (the world tree keeps it exact).
+            _ if let [m] = leaf.palette().as_slice() => {
+                scratch.add(*m, u64::from(leaf_mask.count_ones()));
+                PAYLOAD_UNIFORM_BIT | u32::from(m.0)
+            }
             _ => {
-                let palette = Palette::from_voxels((0..64).map(|slot| leaf.voxel(slot)));
-                match palette.as_slice() {
-                    [only] => PAYLOAD_UNIFORM_BIT | u32::from(only.0),
-                    entries => {
-                        let offset = (out.len() - start) as u32;
-                        append_palette_block(&leaf, leaf_mask, entries, out);
-                        offset
-                    }
+                let scan = LeafScan::of(&leaf, leaf_mask);
+                for i in 0..scan.len {
+                    scratch.add(scan.palette[i], scan.counts[i]);
+                }
+                if scan.len == 1 {
+                    PAYLOAD_UNIFORM_BIT | u32::from(scan.palette[0].0)
+                } else {
+                    let offset = (out.len() - start) as u32;
+                    append_palette_block(&scan, out);
+                    offset
                 }
             }
         };
     }
 
+    let summary = scratch.summary();
+    out[start + 2] = u32::from(summary.material.0);
     let palette_words = (out.len() - payloads_at - n as usize) as u32;
     let flags = if edited { BLOCK_FLAG_EDITED } else { 0 };
     out[start + 1] = n | palette_words << BLOCK_PALETTE_WORDS_SHIFT | flags << BLOCK_FLAGS_SHIFT;
@@ -108,13 +161,9 @@ pub fn encode_brick<N: NodeView>(
 }
 
 /// Appends one leaf's palette block: header, palette, packed indices.
-fn append_palette_block<N: NodeView>(
-    leaf: &N,
-    leaf_mask: u64,
-    palette: &[MaterialId],
-    out: &mut Vec<u32>,
-) {
-    let len = palette.len() as u32;
+fn append_palette_block(scan: &LeafScan, out: &mut Vec<u32>) {
+    let palette = &scan.palette[..scan.len];
+    let len = scan.len as u32;
     let bits = index_bits(len);
     out.push(len | bits << PALETTE_BITS_SHIFT);
     for pair in palette.chunks(2) {
@@ -123,20 +172,13 @@ fn append_palette_block<N: NodeView>(
         out.push(lo | hi << 16);
     }
     let first = out.len();
-    let solid = leaf_mask.count_ones();
-    out.resize(first + (solid * bits).div_ceil(32) as usize, 0);
-    let mut k = 0u32;
-    for slot in 0..64u32 {
-        if leaf_mask & (1u64 << slot) == 0 {
-            continue;
-        }
-        let m = leaf.voxel(slot);
+    out.resize(first + (scan.solid as u32 * bits).div_ceil(32) as usize, 0);
+    for (k, m) in scan.voxels[..scan.solid].iter().enumerate() {
         // The palette holds every solid material of the leaf, so the search
         // succeeds; 0 is a safe fallback that keeps encoding total.
-        let index = palette.binary_search(&m).unwrap_or(0) as u32;
-        let bit = k * bits;
+        let index = palette.binary_search(m).unwrap_or(0) as u32;
+        let bit = k as u32 * bits;
         out[first + (bit / 32) as usize] |= index << (bit % 32);
-        k += 1;
     }
 }
 
