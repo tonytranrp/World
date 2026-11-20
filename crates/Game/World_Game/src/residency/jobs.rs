@@ -12,8 +12,10 @@ use world_core::serialize::region::RecordKind;
 use world_core::serialize::{decode, encode};
 use world_core::tree::{CHUNK_LEVEL, ChunkData};
 use world_core::{MaterialId, VoxelTree};
-use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator, GeneratorVersion};
+use world_core::{RegionSource, VoxelPos};
+use world_gen::{CHUNK_SIZE, ChunkCoord, ChunkSource, CoarseSource, Generator, GeneratorVersion};
 
+use super::columns::ColumnCache;
 use super::store::SavedChunk;
 
 /// A chunk kept compressed in RAM after eviction: the LZ4 of the full
@@ -106,16 +108,100 @@ pub struct Loaded {
     pub refused: bool,
     pub error: Option<String>,
     pub source: LoadSource,
+    /// The lowest and highest column of the chunk's footprint, when the
+    /// load learned them.
+    pub heights: Option<(i32, i32)>,
+    /// Generated as one material without building.
+    pub uniform: bool,
 }
 
-/// Generates the chunk at `coord` into detached data.
+/// Generates the chunk at `coord` into detached data, computing everything
+/// itself: the reference [`generate_cached`] must equal.
+#[cfg(test)]
 pub fn generate(generator: &Generator, coord: ChunkCoord) -> ChunkData {
-    let source = generator.chunk_source(coord);
+    build(coord, &generator.chunk_source(coord))
+}
+
+/// Builds the chunk at `coord` from `source`.
+fn build(coord: ChunkCoord, source: &impl RegionSource) -> ChunkData {
     let mut tree = VoxelTree::new();
     let min = coord.min_voxel();
     // The coordinate names a chunk inside the world, so both calls succeed.
-    let _ = tree.build_region(CHUNK_LEVEL, min, &source);
+    let _ = tree.build_region(CHUNK_LEVEL, min, source);
     tree.take_chunk(min).unwrap_or_else(|_| empty())
+}
+
+/// One material everywhere.
+struct Filled(MaterialId);
+
+impl RegionSource for Filled {
+    fn uniform(&self, _: VoxelPos, _: u32) -> Option<MaterialId> {
+        Some(self.0)
+    }
+
+    fn leaf(&self, _: VoxelPos, voxels: &mut [MaterialId; 64]) {
+        voxels.fill(self.0);
+    }
+}
+
+/// A generated chunk and what its load learned.
+pub struct Generated {
+    pub data: ChunkData,
+    /// The footprint's lowest and highest column.
+    pub heights: (i32, i32),
+    /// Proven one material from the footprint's bounds, not built.
+    pub uniform: bool,
+}
+
+/// Generates the chunk at `coord` with its footprint's columns from
+/// `cache`, so chunks stacked in a column compute them once. A chunk the
+/// footprint's bounds prove uniform (air above the terrain, bedrock below
+/// the caves) is not built at all, and once a footprint's bounds are known
+/// such a chunk needs no columns either. Equals [`generate`].
+pub fn generate_cached(generator: &Generator, cache: &ColumnCache, coord: ChunkCoord) -> Generated {
+    let uniform = |bounds: &world_gen::FootprintBounds| {
+        generator
+            .uniform_chunk(bounds, coord)
+            .map(|material| Generated {
+                data: build(coord, &Filled(material)),
+                heights: bounds.height_range,
+                uniform: true,
+            })
+    };
+    if let Some(done) = cache.bounds(generator, coord).as_ref().and_then(uniform) {
+        return done;
+    }
+    let (columns, bounds) = cache.columns(generator, coord);
+    if let Some(done) = uniform(&bounds) {
+        return done;
+    }
+    let source = source_from(generator, &columns, coord);
+    drop(columns);
+    Generated {
+        data: build(coord, &source),
+        heights: bounds.height_range,
+        uniform: false,
+    }
+}
+
+/// `generator.chunk_source(coord)` from shared columns.
+fn source_from(
+    generator: &Generator,
+    columns: &world_gen::ChunkColumns,
+    coord: ChunkCoord,
+) -> ChunkSource {
+    // The cache hands out columns of this footprint and generator, so the
+    // fallback never runs; it would only cost time.
+    generator
+        .chunk_source_from(columns, coord)
+        .unwrap_or_else(|| generator.chunk_source(coord))
+}
+
+/// `generator.chunk_source(coord)`, with the footprint's columns from
+/// `cache`.
+pub fn cached_source(generator: &Generator, cache: &ColumnCache, coord: ChunkCoord) -> ChunkSource {
+    let (columns, _) = cache.columns(generator, coord);
+    source_from(generator, &columns, coord)
 }
 
 /// Detached all-air content, for impossible fallbacks.
@@ -128,12 +214,20 @@ fn empty() -> ChunkData {
 /// A chunk whose region file could not be read: the generated chunk stands
 /// in, refused, so the file is set aside before anything replaces it and
 /// the saved edits it may hold are not overwritten.
-pub fn unreadable(generators: &Generators, coord: ChunkCoord, error: &str) -> Loaded {
+pub fn unreadable(
+    generators: &Generators,
+    cache: &ColumnCache,
+    coord: ChunkCoord,
+    error: &str,
+) -> Loaded {
+    let generated = generate_cached(generators.current(), cache, coord);
     Loaded {
-        data: generate(generators.current(), coord),
+        data: generated.data,
         refused: true,
         error: Some(format!("reading saved chunk {coord:?}: {error}")),
         source: LoadSource::Generated,
+        heights: Some(generated.heights),
+        uniform: generated.uniform,
     }
 }
 
@@ -144,6 +238,7 @@ pub fn unreadable(generators: &Generators, coord: ChunkCoord, error: &str) -> Lo
 /// generator.
 pub fn load(
     generators: &Generators,
+    cache: &ColumnCache,
     coord: ChunkCoord,
     warm: Option<&WarmChunk>,
     saved: &[SavedChunk],
@@ -163,6 +258,8 @@ pub fn load(
                         refused: false,
                         error: None,
                         source: LoadSource::Warm,
+                        heights: None,
+                        uniform: false,
                     };
                 }
             }
@@ -197,7 +294,7 @@ pub fn load(
                 let mut tree = match (record.kind, base) {
                     (RecordKind::Full, _) => saved_tree,
                     (RecordKind::Overlay, Some(generator)) => {
-                        let base = generator.chunk_source(coord);
+                        let base = cached_source(generator, cache, coord);
                         let mut tree = VoxelTree::unloaded();
                         tree.apply_overlay(min, &base, &saved_tree)
                             .map_err(|e| e.to_string())?;
@@ -214,6 +311,8 @@ pub fn load(
                     refused,
                     error,
                     source: LoadSource::Saved,
+                    heights: None,
+                    uniform: false,
                 };
             }
             Err(e) => {
@@ -222,11 +321,14 @@ pub fn load(
             }
         }
     }
+    let generated = generate_cached(generators.current(), cache, coord);
     Loaded {
-        data: generate(generators.current(), coord),
+        data: generated.data,
         refused,
         error,
         source: LoadSource::Generated,
+        heights: Some(generated.heights),
+        uniform: generated.uniform,
     }
 }
 
@@ -246,6 +348,7 @@ pub struct Encoded {
 /// than twice as large, plus a coarse summary with `4^coarse_level` cells.
 pub fn encode_chunk(
     generators: &Generators,
+    cache: &ColumnCache,
     coord: ChunkCoord,
     data: ChunkData,
     coarse_level: u32,
@@ -256,7 +359,7 @@ pub fn encode_chunk(
     let _ = tree.insert_chunk(min, data);
     let full = encode(&tree);
     let generator_version = generators.version();
-    let base = generators.current().chunk_source(coord);
+    let base = cached_source(generators.current(), cache, coord);
     let overlay = tree.overlay(min, &base).map(|o| encode(&o)).ok();
     let primary = match overlay {
         Some(bytes) if bytes.len() <= 2 * full.len() => SavedChunk {
@@ -307,19 +410,20 @@ pub fn compress(coord: ChunkCoord, data: ChunkData) -> WarmChunk {
 /// The chunks of coarse column (`x`, `z`) that cross the terrain surface,
 /// one below it included, built with `4^level` cells. `saved` holds coarse
 /// summaries of edited chunks, which replace the generated ones wherever
-/// they are (a tower built far above the surface shows too).
+/// they are (a tower built far above the surface shows too). Also returns
+/// the lowest and highest sample of the footprint.
 pub fn coarse_column(
     generator: &Generator,
     x: u32,
     z: u32,
     level: u32,
     saved: &[(ChunkCoord, SavedChunk)],
-) -> Vec<(ChunkCoord, ChunkData)> {
+) -> (Vec<(ChunkCoord, ChunkData)>, Option<(i32, i32)>) {
     let Ok(probe) = ChunkCoord::new(x, 0, z) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Ok(columns) = generator.coarse_columns(probe, level) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let (lo, hi) = columns
         .columns()
@@ -332,7 +436,7 @@ pub fn coarse_column(
         |y: i32| ChunkCoord::containing(world_core::VoxelPos::new(min_voxel.x, y, min_voxel.z));
     let (Some(bottom), Some(top)) = (chunk_of(lo.saturating_sub(CHUNK_SIZE as i32)), chunk_of(hi))
     else {
-        return Vec::new();
+        return (Vec::new(), Some((lo, hi)));
     };
     let mut ys: BTreeSet<u32> = (bottom.y()..=top.y()).collect();
     ys.extend(
@@ -363,5 +467,5 @@ pub fn coarse_column(
             out.push((coord, data));
         }
     }
-    out
+    (out, Some((lo, hi)))
 }

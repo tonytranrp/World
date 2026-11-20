@@ -26,9 +26,10 @@ use world_core::tree::{CHUNK_LEVEL, ChunkData, TreeSnapshot};
 use world_core::{Edit, EditError, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_gen::{CHUNK_SIZE, ChunkCoord, Generator, GeneratorVersion, TerrainConfig};
 
+use super::columns::ColumnCache;
 use super::config::ResidencyConfig;
 use super::jobs::{Generators, LoadSource, WarmChunk};
-use super::plan::{self, Motion};
+use super::plan::{self, Heights, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
 use super::warm::Warm;
@@ -145,6 +146,12 @@ pub struct ResidencyStats {
     /// microseconds, and the longest one.
     pub generated_micros: u64,
     pub generated_max_micros: u64,
+    /// Of the generated loads, those proven one material (air above the
+    /// terrain, bedrock below the caves) and not built.
+    pub uniform_loads: usize,
+    /// Column footprints served by the shared cache, and computed.
+    pub column_hits: u64,
+    pub column_misses: u64,
 }
 
 const MIB: usize = 1 << 20;
@@ -219,7 +226,16 @@ pub struct StreamedWorld {
     motion: Motion,
     /// Load and hole figures for [`ResidencyStats`].
     counters: Counters,
+    /// Column footprints shared with the workers.
+    columns: Arc<ColumnCache>,
+    /// The terrain heights of chunk columns, from full-detail loads (exact)
+    /// and coarse columns (sampled), to put buried chunks after visible
+    /// ones.
+    heights: BTreeMap<(u32, u32), Heights>,
 }
+
+/// Column heights kept at most; beyond it the farthest are dropped.
+const MAX_HEIGHTS: usize = 8192;
 
 /// Running figures reported in [`ResidencyStats`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -234,6 +250,7 @@ struct Counters {
     disk_loads: usize,
     generated_micros: u64,
     generated_max_micros: u64,
+    uniform_loads: usize,
 }
 
 /// The chunk-aligned boxes of `region`, one per chunk it touches.
@@ -286,9 +303,11 @@ impl StreamedWorld {
         let wal_path = store.wal_path();
         let (wal, replay) = WalWriter::open(&wal_path)?;
         let wal_bytes = file_len(&wal_path);
+        let columns = Arc::new(ColumnCache::new(config.column_cache_mib));
         let shared = Shared {
             generators: Arc::new(Generators::new(Arc::clone(&generator))),
             coarse_level: config.coarse_cell_level,
+            columns: Arc::clone(&columns),
         };
         let pool = Pool::new(shared, store, config.workers);
         let checkpoint_at = config.log_checkpoint_kib as u64 * 1024;
@@ -333,6 +352,8 @@ impl StreamedWorld {
             errors: Vec::new(),
             motion: Motion::default(),
             counters: Counters::default(),
+            columns,
+            heights: BTreeMap::new(),
         };
         for record in replay {
             match record {
@@ -445,6 +466,9 @@ impl StreamedWorld {
             disk_loads: self.counters.disk_loads,
             generated_micros: self.counters.generated_micros,
             generated_max_micros: self.counters.generated_max_micros,
+            uniform_loads: self.counters.uniform_loads,
+            column_hits: self.columns.counts().hits,
+            column_misses: self.columns.counts().misses,
         }
     }
 
@@ -853,6 +877,8 @@ impl StreamedWorld {
                 error,
                 source,
                 micros,
+                heights,
+                uniform,
             } => {
                 self.loading.remove(&coord);
                 let n = &mut self.counters;
@@ -863,7 +889,11 @@ impl StreamedWorld {
                         n.generated += 1;
                         n.generated_micros += micros;
                         n.generated_max_micros = n.generated_max_micros.max(micros);
+                        n.uniform_loads += usize::from(uniform);
                     }
+                }
+                if let Some((lo, hi)) = heights {
+                    self.learn_heights(coord.x(), coord.z(), lo, hi, true, eye);
                 }
                 if let Some(e) = error {
                     self.errors.push(e);
@@ -888,8 +918,16 @@ impl StreamedWorld {
                 coarse,
                 error,
             } => self.finish_write(coord, warm, coarse, error),
-            Done::Coarse { x, z, chunks } => {
+            Done::Coarse {
+                x,
+                z,
+                chunks,
+                heights,
+            } => {
                 self.coarse_loading.remove(&(x, z));
+                if let Some((lo, hi)) = heights {
+                    self.learn_heights(x, z, lo, hi, false, eye);
+                }
                 if self.coarse_stale.remove(&(x, z)) {
                     // Built before one of its chunks was written; asked for
                     // again by the next update.
@@ -937,6 +975,41 @@ impl StreamedWorld {
                     self.config.warm_edited_weight,
                 );
             }
+        }
+    }
+
+    /// Records the terrain heights of chunk column (`x`, `z`); sampled ones
+    /// never replace exact ones. Past [`MAX_HEIGHTS`] the columns farthest
+    /// from `eye` are dropped.
+    fn learn_heights(&mut self, x: u32, z: u32, lo: i32, hi: i32, exact: bool, eye: VoxelPos) {
+        let entry = self
+            .heights
+            .entry((x, z))
+            .or_insert(Heights { lo, hi, exact });
+        if exact || !entry.exact {
+            *entry = Heights { lo, hi, exact };
+        }
+        if self.heights.len() > MAX_HEIGHTS && eye.x != i32::MIN {
+            let mut far: Vec<(u32, (u32, u32))> = self
+                .heights
+                .keys()
+                .map(|&(x, z)| (plan::column_distance(eye, x, z).to_bits(), (x, z)))
+                .collect();
+            far.sort_unstable_by(|a, b| b.cmp(a));
+            for (_, column) in far.into_iter().take(self.heights.len() - MAX_HEIGHTS / 2) {
+                self.heights.remove(&column);
+            }
+        }
+    }
+
+    /// How far `chunk`'s load is put off, in voxels: buried chunks by
+    /// `buried_delay_m`, others not at all.
+    fn load_delay(&self, chunk: ChunkCoord) -> f32 {
+        let heights = self.heights.get(&(chunk.x(), chunk.z())).copied();
+        if plan::is_buried(chunk, heights) {
+            plan::voxels(self.config.buried_delay_m)
+        } else {
+            0.0
         }
     }
 
@@ -1179,31 +1252,34 @@ impl StreamedWorld {
     }
 
     /// The order to request chunks in: the full-detail `sphere` (nearest
-    /// first) ahead of the motion first, then, once all of it is requested
-    /// and while the hot tier is under its cap, the lookahead sphere. Every
-    /// chunk of the full-detail sphere precedes every lookahead chunk, so
-    /// prefetching never starves it.
+    /// first, buried chunks put off by `buried_delay_m`) ahead of the motion
+    /// first, then, once all of it is requested and while the hot tier is
+    /// under its cap, the lookahead sphere. Every chunk of the full-detail
+    /// sphere precedes every lookahead chunk, so prefetching never starves
+    /// it.
     fn load_order(&self, eye: VoxelPos, sphere: Vec<ChunkCoord>) -> Vec<ChunkCoord> {
         let c = &self.config;
-        let Some(predicted) = self.motion.predicted(
+        let predicted = self.motion.predicted(
             eye,
             c.prefetch_lookahead_secs,
             plan::voxels(c.evict_radius_m),
-        ) else {
-            return sphere;
-        };
-        let mut order = plan::ahead_first(eye, predicted, &sphere);
-        if self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB {
+        );
+        let delay = |chunk| self.load_delay(chunk);
+        let mut order = plan::load_priority(eye, predicted, &sphere, delay);
+        if let Some(predicted) = predicted
+            && self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB
+        {
             // The predicted position is at most evict_radius_m away and
             // only chunks within that of the eye are kept, so a larger
             // radius would only add chunks to sort and drop.
-            order.extend(plan::lookahead(
+            let extra = plan::lookahead(
                 eye,
                 predicted,
                 c.prefetch_radius_m.min(2.0 * c.evict_radius_m),
                 c.full_radius_m,
                 c.evict_radius_m,
-            ));
+            );
+            order.extend(plan::delayed(predicted, &extra, delay));
         }
         order
     }
@@ -1397,6 +1473,10 @@ impl StreamedWorld {
     }
 
     /// The loaded chunks.
+    pub(super) fn column_cache(&self) -> &ColumnCache {
+        &self.columns
+    }
+
     pub(super) fn loaded_chunks(&self) -> Vec<ChunkCoord> {
         self.loaded.keys().copied().collect()
     }
