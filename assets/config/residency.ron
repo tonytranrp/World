@@ -14,8 +14,12 @@
     coarse_cell_level: 2,
     // RAM for full-detail chunks, MiB. Far chunks go first when it is exceeded.
     hot_cap_mib: 1300,
-    // RAM for compressed edited chunks after eviction, MiB.
+    // RAM for compressed chunks after eviction, MiB: edited chunks, and generated
+    // ones so walking back does not generate them again.
     warm_cap_mib: 400,
+    // Edited chunks age this many times more slowly in that cache, so they stay
+    // longer. 1.0..=64.0
+    warm_edited_weight: 4.0,
     // RAM for coarse chunks, MiB.
     coarse_cap_mib: 500,
     // Worker threads for generation and saving. 0 runs everything on the main thread.

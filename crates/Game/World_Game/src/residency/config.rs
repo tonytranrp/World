@@ -21,8 +21,12 @@ pub struct ResidencyConfig {
     pub coarse_cell_level: u32,
     /// Full-detail chunks may hold at most this much RAM, in MiB.
     pub hot_cap_mib: u32,
-    /// Compressed edited chunks kept after eviction, in MiB.
+    /// Compressed chunks kept after eviction (edited and generated), in MiB.
     pub warm_cap_mib: u32,
+    /// Edited chunks in the warm cache age this many times more slowly than
+    /// generated ones, so they stay longer (losing one costs a region file
+    /// read on top of generation).
+    pub warm_edited_weight: f32,
     /// Coarse chunks, in MiB.
     pub coarse_cap_mib: u32,
     /// Worker threads for generation and encoding.
@@ -50,6 +54,7 @@ impl Default for ResidencyConfig {
             coarse_cell_level: 2,
             hot_cap_mib: 1300,
             warm_cap_mib: 400,
+            warm_edited_weight: 4.0,
             coarse_cap_mib: 500,
             workers: 4,
             grafts_per_frame: 8,
@@ -77,6 +82,12 @@ impl ConfigAsset for ResidencyConfig {
         range("coarse_cell_level", self.coarse_cell_level.into(), 1.0, 4.0);
         range("hot_cap_mib", self.hot_cap_mib.into(), 64.0, 65536.0);
         range("warm_cap_mib", self.warm_cap_mib.into(), 0.0, 65536.0);
+        range(
+            "warm_edited_weight",
+            self.warm_edited_weight.into(),
+            1.0,
+            64.0,
+        );
         range("coarse_cap_mib", self.coarse_cap_mib.into(), 0.0, 65536.0);
         range("workers", self.workers.into(), 0.0, 64.0);
         range(

@@ -31,6 +31,7 @@ use super::jobs::{Generators, LoadSource, WarmChunk};
 use super::plan::{self, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
+use super::warm::Warm;
 
 /// What one loaded chunk is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +109,8 @@ pub struct ResidencyStats {
     /// Bytes of the loaded chunks.
     pub hot_bytes: usize,
     pub warm_chunks: usize,
+    /// Of those, the ones holding saved edits.
+    pub warm_edited: usize,
     pub warm_bytes: usize,
     pub coarse_columns: usize,
     pub coarse_bytes: usize,
@@ -132,43 +135,6 @@ pub struct ResidencyStats {
     pub generated: usize,
     pub warm_hits: usize,
     pub disk_loads: usize,
-}
-
-/// Compressed chunks as their region files hold them, kept in RAM after
-/// they were written or loaded, least recently used first out.
-#[derive(Default)]
-struct Warm {
-    entries: BTreeMap<ChunkCoord, (u64, WarmChunk)>,
-    bytes: usize,
-    tick: u64,
-}
-
-impl Warm {
-    fn insert(&mut self, coord: ChunkCoord, chunk: WarmChunk, cap: usize) {
-        self.tick += 1;
-        self.bytes += chunk.size();
-        if let Some((_, old)) = self.entries.insert(coord, (self.tick, chunk)) {
-            self.bytes -= old.size();
-        }
-        while self.bytes > cap {
-            let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, (t, _))| *t) else {
-                break;
-            };
-            if let Some((_, old)) = self.entries.remove(&oldest) {
-                self.bytes -= old.size();
-            }
-        }
-    }
-
-    /// A copy of the entry for `coord`, which becomes the most recently
-    /// used. The entry stays: it matches the region file until the chunk is
-    /// written again, which replaces it.
-    fn get(&mut self, coord: ChunkCoord) -> Option<WarmChunk> {
-        self.tick += 1;
-        let (tick, chunk) = self.entries.get_mut(&coord)?;
-        *tick = self.tick;
-        Some(chunk.clone())
-    }
 }
 
 const MIB: usize = 1 << 20;
@@ -204,6 +170,11 @@ pub struct StreamedWorld {
     /// before the chunk is written.
     refused: BTreeSet<ChunkCoord>,
     warm: Warm,
+    /// Unchanged chunks being compressed for the warm cache, with the
+    /// ticket of the newest request. A write that lands makes the requests
+    /// before it stale (their content is older than the region file).
+    compressing: BTreeMap<ChunkCoord, u64>,
+    tickets: u64,
     coarse_loaded: BTreeMap<(u32, u32), Vec<(ChunkCoord, usize)>>,
     coarse_loading: BTreeSet<(u32, u32)>,
     /// Columns being built while one of their chunks was written; their
@@ -317,6 +288,8 @@ impl StreamedWorld {
             saved,
             refused: BTreeSet::new(),
             warm: Warm::default(),
+            compressing: BTreeMap::new(),
+            tickets: 0,
             coarse_loaded: BTreeMap::new(),
             coarse_loading: BTreeSet::new(),
             coarse_stale: BTreeSet::new(),
@@ -427,8 +400,9 @@ impl StreamedWorld {
             saving_bytes: self.held_bytes,
             pending_chunks: self.pending.len(),
             hot_bytes: self.hot_bytes,
-            warm_chunks: self.warm.entries.len(),
-            warm_bytes: self.warm.bytes,
+            warm_chunks: self.warm.len(),
+            warm_edited: self.warm.edited(),
+            warm_bytes: self.warm.bytes(),
             coarse_columns: self.coarse_loaded.len(),
             coarse_bytes: self.coarse_bytes,
             saved_chunks: self.saved.len(),
@@ -867,6 +841,10 @@ impl StreamedWorld {
                     || self.pending.contains_key(&coord);
                 if wanted && !self.loaded.contains_key(&coord) {
                     self.ready.push_back((coord, data, false));
+                } else if !wanted {
+                    // The player moved on before it arrived: keep it warm
+                    // for a return.
+                    self.keep_warm(coord, data);
                 }
             }
             Done::Saved {
@@ -905,7 +883,45 @@ impl StreamedWorld {
                 self.coarse_loaded.insert((x, z), entry);
                 self.changes.coarse = true;
             }
+            Done::Compressed {
+                coord,
+                warm,
+                ticket,
+            } => {
+                if self.compressing.get(&coord) != Some(&ticket) {
+                    return;
+                }
+                self.compressing.remove(&coord);
+                let edited = self.saved.contains(&coord);
+                self.warm.insert(
+                    coord,
+                    warm,
+                    edited,
+                    self.warm_cap(),
+                    self.config.warm_edited_weight,
+                );
+            }
         }
+    }
+
+    fn warm_cap(&self) -> usize {
+        self.config.warm_cap_mib as usize * MIB
+    }
+
+    /// Keeps the unchanged chunk `data` at `coord` in the warm cache: its
+    /// entry is marked used if it has one (still exact: an entry is replaced
+    /// whenever the chunk is written), else a worker compresses it.
+    fn keep_warm(&mut self, coord: ChunkCoord, data: ChunkData) {
+        if self.warm_cap() == 0 || self.warm.touch(coord) {
+            return;
+        }
+        self.tickets += 1;
+        self.compressing.insert(coord, self.tickets);
+        self.pool.submit(Request::Compress {
+            coord,
+            data,
+            ticket: self.tickets,
+        });
     }
 
     /// A chunk write landed (or failed).
@@ -954,8 +970,11 @@ impl StreamedWorld {
         if let Some(checkpoint) = &mut self.checkpoint {
             checkpoint.waiting.remove(&coord);
         }
+        // The region file changed: compressions of older content are stale.
+        self.compressing.remove(&coord);
+        let cap = self.warm_cap();
         self.warm
-            .insert(coord, warm, self.config.warm_cap_mib as usize * MIB);
+            .insert(coord, warm, true, cap, self.config.warm_edited_weight);
         if let Some(coarse) = coarse {
             self.replace_coarse(coord, coarse);
         }
@@ -1162,6 +1181,10 @@ impl StreamedWorld {
                 self.held_bytes -= old;
             }
             self.held_bytes += bytes;
+        } else {
+            // What the region file or the generator gives: kept compressed,
+            // so a return does not generate it again.
+            self.keep_warm(coord, data);
         }
         self.changes.unloaded.push(coord);
         self.refresh_render(coord);
@@ -1232,6 +1255,29 @@ impl StreamedWorld {
     /// RAM the hot cap is checked against.
     pub(super) fn hot_bytes_counted(&self) -> usize {
         self.hot_bytes_in_use()
+    }
+
+    /// The warm cache's bytes, summed afresh from its entries.
+    pub(super) fn warm_bytes_walked(&self) -> usize {
+        self.warm.bytes_walked()
+    }
+
+    /// Whether the warm cache holds `coord`.
+    pub(super) fn is_warm(&self, coord: ChunkCoord) -> bool {
+        self.warm.contains(coord)
+    }
+
+    /// The loaded content of `coord`.
+    pub(super) fn chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
+        self.loaded
+            .contains_key(&coord)
+            .then(|| self.tree.chunk_data(coord.min_voxel()))
+            .flatten()
+    }
+
+    /// The loaded chunks.
+    pub(super) fn loaded_chunks(&self) -> Vec<ChunkCoord> {
+        self.loaded.keys().copied().collect()
     }
 }
 

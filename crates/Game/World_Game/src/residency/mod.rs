@@ -12,6 +12,7 @@ pub mod world;
 
 #[cfg(test)]
 mod tests;
+mod warm;
 
 use std::sync::Arc;
 
@@ -212,7 +213,7 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
     let v = world.0.velocity_m_s();
     debug!(
         "world: {} chunks loaded ({} edited, {} loading, {} saving), {:.0} MiB hot, \
-         {} warm ({:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
+         {} warm ({} edited, {:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
          interval: holes {:.1} mean ({:.1} ahead), {} now, loads {} generated / {} warm / \
          {} disk, speed {:.1} m/s",
         s.loaded,
@@ -221,6 +222,7 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
         s.saving,
         s.hot_bytes as f64 / 1048576.0,
         s.warm_chunks,
+        s.warm_edited,
         s.warm_bytes as f64 / 1048576.0,
         s.coarse_columns,
         s.coarse_bytes as f64 / 1048576.0,

@@ -805,3 +805,93 @@ fn save_all_keeps_the_log_when_a_write_fails() {
     world.save_all().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A chunk's content as a hash, for comparing loads.
+fn chunk_hash(coord: world_gen::ChunkCoord, data: world_core::tree::ChunkData) -> u64 {
+    let mut tree = world_core::VoxelTree::unloaded();
+    tree.insert_chunk(coord.min_voxel(), data).unwrap();
+    world_core::serialize::content_hash(&tree)
+}
+
+#[test]
+fn unedited_chunks_come_back_from_the_warm_cache_unchanged() {
+    let dir = temp_dir("warm_generated");
+    let mut world = open(&dir, config(0));
+    let eye = eye_at(&world, 3500, 1500);
+    settle(&mut world, eye);
+    let around = world.loaded_chunks();
+    assert_eq!(world.stats().generated, around.len(), "{:?}", world.stats());
+
+    // Away: the unedited chunks are evicted, nothing is written, and they
+    // stay compressed in RAM.
+    let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    settle(&mut world, away);
+    let s = world.stats();
+    assert_eq!(s.writes, 0);
+    assert!(around.iter().all(|&c| world.is_warm(c)), "{s:?}");
+    assert_eq!(s.warm_edited, 0);
+    assert_eq!(s.warm_bytes, world.warm_bytes_walked());
+
+    // Back: every one of them is decompressed, none generated again, and
+    // each matches the generator exactly.
+    let before = world.stats();
+    settle(&mut world, eye);
+    let after = world.stats();
+    assert_eq!(after.warm_hits - before.warm_hits, around.len());
+    assert_eq!(after.generated, before.generated);
+    for &c in &around {
+        let fresh = super::jobs::generate(world.generator(), c);
+        let back = world.chunk_data(c).unwrap();
+        assert_eq!(chunk_hash(c, back), chunk_hash(c, fresh), "{c:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Digs near (`x`, `z`), then walks away in 40 m steps with a small warm
+/// cache. Returns whether the edited chunk is still warm at the end, after
+/// checking the warm bytes against the budget at every step.
+fn edited_chunk_stays_warm(name: &str, x: i32, z: i32, edited_weight: f32) -> bool {
+    let dir = temp_dir(name);
+    let cap_mib = 2;
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            warm_cap_mib: cap_mib,
+            warm_edited_weight: edited_weight,
+            ..config(0)
+        },
+    );
+    let eye = eye_at(&world, x, z);
+    settle(&mut world, eye);
+    let target = ground_below(&world, eye);
+    dig(&mut world, target);
+    let edited = world_gen::ChunkCoord::containing(target).unwrap();
+    let mut evicted = 0;
+    for step in 1..=4 {
+        let at = eye_at(&world, eye.x + step * 40 * 64, eye.z);
+        let before = world.stats().loaded;
+        settle(&mut world, at);
+        evicted += before;
+        let s = world.stats();
+        assert_eq!(s.warm_bytes, world.warm_bytes_walked(), "{s:?}");
+        assert!(s.warm_bytes <= (cap_mib as usize) << 20, "{s:?}");
+    }
+    let s = world.stats();
+    assert!(s.warm_chunks < evicted, "the budget dropped some: {s:?}");
+    let warm = world.is_warm(edited);
+    drop(world);
+    std::fs::remove_dir_all(&dir).unwrap();
+    warm
+}
+
+#[test]
+fn the_warm_cache_keeps_to_its_budget_and_prefers_edited_chunks() {
+    assert!(
+        !edited_chunk_stays_warm("warm_lru", -3500, 6500, 1.0),
+        "plain least recently used: the edited chunk is long gone"
+    );
+    assert!(
+        edited_chunk_stays_warm("warm_weighted", -3500, 6500, 64.0),
+        "weighted: it outlasts the generated chunks evicted after it"
+    );
+}
