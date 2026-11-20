@@ -917,7 +917,8 @@ impl Residency {
     /// Frees up to `max` buried entries (their groups and bricks), taking
     /// their children out of the table into the graveyard in turn. Returns
     /// how many were freed. A node is no longer burying once everything
-    /// below it is freed.
+    /// below it is freed, and stage 1 then starts a new pass, since its
+    /// passes skipped what lies below it.
     pub fn free_buried(&mut self, max: u32, batch: &mut UploadBatch) -> u32 {
         let mut freed = 0;
         while freed < max {
@@ -944,7 +945,9 @@ impl Residency {
             if let Some(left) = self.burying.get_mut(&tag) {
                 *left -= 1;
                 if *left == 0 {
+                    // Stage 1 skipped everything below it: look again.
                     self.burying.remove(&tag);
+                    self.growth.changed();
                 }
             }
             freed += 1;

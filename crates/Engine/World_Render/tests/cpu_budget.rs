@@ -1586,3 +1586,120 @@ fn collapsed_subtrees_are_freed_a_bounded_number_a_frame() {
     run(&mut res, &mut pools, near, 60);
     assert_eq!(res.stats().expanded, refined);
 }
+
+/// A rough 1024 x 1024 slab filling the chunk at `min`, with holes every
+/// `step` voxels along x.
+fn chunk_slab(min: VoxelPos, step: i32) -> world_core::tree::ChunkData {
+    let mut t = VoxelTree::new();
+    t.fill_box(
+        VoxelBox::new(
+            VoxelPos::new(min.x, -16, min.z),
+            VoxelPos::new(min.x + 1024, -2, min.z + 1024),
+        ),
+        MaterialId(3),
+    )
+    .unwrap();
+    for x in (min.x..min.x + 1024).step_by(step as usize) {
+        for z in (min.z..min.z + 1024).step_by(7) {
+            t.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    t.chunk_data(min).unwrap()
+}
+
+/// Runs `frames` frames under a still camera over the chunk at the
+/// origin, the chunks in `first` replaced in the first of them.
+fn still_frames(
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    tree: &VoxelTree,
+    frame: &mut u32,
+    frames: u32,
+    first: &[VoxelPos],
+    config: &BrickCacheConfig,
+) {
+    let view = ViewPoint {
+        eye: [512.0, 0.0, 512.0],
+        pixel_angle: 1e-3,
+    };
+    let snap = tree.snapshot();
+    for i in 0..frames {
+        let mut batch = UploadBatch::default();
+        let input = FrameInput {
+            source: &snap,
+            frame: *frame,
+            refresh: *frame == 1,
+            dirty: &[],
+            chunks: if i == 0 { first } else { &[] },
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config,
+            budget: 64 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(res, &input, &mut batch);
+        apply_cpu(pools, &batch);
+        *frame += 1;
+    }
+}
+
+/// A replaced chunk refines again under a still camera once its old
+/// subtree is freed, to exactly what a fresh cache shows: freeing the last
+/// buried entry must start a new growth pass. (Ported from the third
+/// review, which found it stayed at 6 expanded nodes.)
+#[test]
+fn a_replaced_chunk_refines_again_under_a_still_camera() {
+    let config = BrickCacheConfig {
+        max_frees_per_frame: 256,
+        ..Default::default()
+    };
+    let min = VoxelPos::new(0, -1024, 0);
+    let mut tree = VoxelTree::new();
+    tree.insert_chunk(min, chunk_slab(min, 5)).unwrap();
+    let shape = Shape::of(&tree.snapshot());
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        segments: vec![8 << 20, 8 << 20],
+        brick_ids: 1 << 16,
+        allocs_per_segment: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).unwrap();
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut frame = 1;
+    still_frames(&mut res, &mut pools, &tree, &mut frame, 200, &[], &config);
+    tree.insert_chunk(min, chunk_slab(min, 6)).unwrap();
+    still_frames(
+        &mut res,
+        &mut pools,
+        &tree,
+        &mut frame,
+        400,
+        &[min],
+        &config,
+    );
+    assert_eq!(res.buried(), 0);
+    let after = res.stats();
+
+    let mut fresh = Residency::new(shape, &layout).unwrap();
+    let mut fresh_pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut fresh_frame = 1;
+    still_frames(
+        &mut fresh,
+        &mut fresh_pools,
+        &tree,
+        &mut fresh_frame,
+        400,
+        &[],
+        &config,
+    );
+    let want = fresh.stats();
+    assert_eq!(
+        (after.expanded, after.bricks),
+        (want.expanded, want.bricks),
+        "the replaced chunk did not refine again"
+    );
+    verify(&mut res, &tree.snapshot(), &pools);
+}
