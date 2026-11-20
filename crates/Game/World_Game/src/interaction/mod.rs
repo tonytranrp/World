@@ -62,11 +62,12 @@ fn ball(centre: VoxelPos, radius: i32) -> Vec<Edit> {
 }
 
 fn dig_on_click(
-    buttons: Res<ButtonInput<MouseButton>>,
+    buttons: Option<Res<ButtonInput<MouseButton>>>,
     world: Option<ResMut<World>>,
     camera: Query<&GlobalTransform, With<PlayerCamera>>,
 ) {
-    if !buttons.just_pressed(MouseButton::Left) {
+    // Headless apps have no mouse.
+    if !buttons.is_some_and(|b| b.just_pressed(MouseButton::Left)) {
         return;
     }
     let (Some(mut world), Ok(transform)) = (world, camera.single()) else {
@@ -84,11 +85,11 @@ fn dig_on_click(
 /// Right click places a cube of stone, a metre wide, on the picked voxel:
 /// box edits through the same path as the dig.
 fn build_on_click(
-    buttons: Res<ButtonInput<MouseButton>>,
+    buttons: Option<Res<ButtonInput<MouseButton>>>,
     world: Option<ResMut<World>>,
     camera: Query<&GlobalTransform, With<PlayerCamera>>,
 ) {
-    if !buttons.just_pressed(MouseButton::Right) {
+    if !buttons.is_some_and(|b| b.just_pressed(MouseButton::Right)) {
         return;
     }
     let (Some(mut world), Ok(transform)) = (world, camera.single()) else {

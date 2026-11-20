@@ -74,11 +74,36 @@ Records are append-only, so the corrections and choices are recorded here.
   workers; zero workers runs everything inline for tests). The Bevy plugin
   opens it from `assets/config/residency.ron` and `assets/config/terrain.ron`
   and drives it from the player camera each frame.
+- The renderer reads a third tree, the *render tree*: the loaded chunks of
+  the world tree (shared through their `Arc`s, never copied) and the coarse
+  chunks wherever those are not loaded. Each frame its snapshot goes to
+  World_Render's `VoxelWorldFeed` with the edited bricks plus one brick per
+  swapped chunk, which makes the GPU cache rebuild that region. Decision
+  0007's "coarse levels stay resident" then covers the coarse ring for free.
 - An edited chunk that is evicted keeps its content in memory until its
   region file is written, so a quick return never reads a stale file.
 - `interaction` digs (left click) and builds (right click) through it, with
   picking by the CPU reference tracer until World_Core's own ray module
   exists.
+
+## Measured (RTX 4070 laptop, i7-13620H, 2026-11-20)
+
+| What | Before | After |
+|---|---|---|
+| First edit after a snapshot of a 466 MiB tree | 92.7 µs | 6.2 µs |
+| One edit, no snapshot | 0.92 µs | 1.1 µs |
+| 1,000 scattered edits after a snapshot | 1.1 ms | 1.08 ms |
+| Decoding a save | 1.2 to 1.4 MiB/s | 48 to 62 MiB/s |
+| Building one generated 16 m chunk | 490 ms | 39 ms |
+| Seed to tree for one chunk (columns and build) | | 73 ms |
+| Moving a whole chunk between trees | | 19 µs |
+| Compacting a fragmented dense chunk (128³) | | 31 ms |
+| LZ4 compress / decompress | | 836 MiB/s / 3.8 GiB/s (1.6x) |
+| zstd fastest compress / decompress | | 77 / 347 MiB/s (2.0x) |
+| Generated chunk memory | 2.2 to 8.7 MiB | 0.9 to 5.4 MiB |
+| Full-detail sphere around the player, debug build | 280 chunks, 298 MiB, 8.0 s | 276 chunks, 151 MiB, 4.8 s |
+| GPU trace at 1280x720, full / footprint detail | | 7.8 / 1.47 ms |
+| GPU encoder | | 142k bricks/s, 103 MiB/s |
 
 ## Consequences
 
@@ -86,5 +111,15 @@ Records are append-only, so the corrections and choices are recorded here.
   clones that chunk's free lists.
 - Terrain changes invalidate saved overlays; the generator version is stored
   in every record, but old generator versions are not yet kept.
-- The coarse tier is a second tree the renderer must read beyond the
-  full-detail radius.
+- Three trees share chunk data: the world tree (authoritative), the coarse
+  tree and the render tree. Only the world tree accepts edits.
+- The GPU side is decision 0007 as built in World_Render, with these
+  deviations: the representative material above bricks is the voxel-weighted
+  mode of the children (so an edit re-evaluates one path); requests carry a
+  level and a priority so stage 2 can expand nodes; victims carry their
+  block reference so a stale read-back cannot evict a reused id; request
+  stamps share the feedback buffer (8 storage buffers, the tier-B minimum);
+  the apply pass is four dispatches; the traversal keeps its ancestor stack
+  in workgroup memory because D3D12's FXC compiler cannot index a private
+  array at runtime; shader constants are mirrored by hand, guarded by a test
+  that parses the shader, until Xtask codegen exists.
