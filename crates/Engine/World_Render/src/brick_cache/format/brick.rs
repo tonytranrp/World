@@ -3,7 +3,7 @@
 use world_core::MaterialId;
 use world_core::tree::NodeView;
 
-use super::summary::{Content, Summary, Tally, content};
+use super::summary::{Content, Summary, Tally, content, count_palette_block};
 use super::{
     BLOCK_ALIGN_WORDS, BLOCK_FLAG_EDITED, BLOCK_FLAGS_SHIFT, BLOCK_HEADER_WORDS,
     BLOCK_PALETTE_WORDS_SHIFT, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT, PALETTE_LEN_MASK,
@@ -171,30 +171,6 @@ pub fn encode_brick<N: NodeView>(
 
 /// Adds the materials of a stored palette block to `tally`, one per solid
 /// voxel, from its packed indices.
-fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
-    let len = (block[0] & PALETTE_LEN_MASK) as usize;
-    let bits = (block[0] >> PALETTE_BITS_SHIFT) & 0xFF;
-    let mut counts = [0u64; 64];
-    let indices = &block[1 + len.div_ceil(2)..];
-    let index_mask = (1u32 << bits) - 1;
-    for k in 0..leaf_mask.count_ones() {
-        let at = k * bits;
-        let index = indices
-            .get((at / 32) as usize)
-            .map_or(0, |w| (w >> (at % 32)) & index_mask);
-        if let Some(c) = counts.get_mut(index as usize) {
-            *c += 1;
-        }
-    }
-    for (i, &count) in counts.iter().enumerate().take(len) {
-        let word = block.get(1 + i / 2).copied().unwrap_or(0);
-        let material = MaterialId((word >> (16 * (i % 2))) as u16);
-        if count > 0 {
-            tally.add(material, count);
-        }
-    }
-}
-
 // The world tree stores palette blocks with the same header, so they copy.
 const _: () = assert!(PALETTE_BITS_SHIFT == 8 && PALETTE_LEN_MASK == 0xFF);
 

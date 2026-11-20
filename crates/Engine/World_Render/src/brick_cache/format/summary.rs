@@ -18,6 +18,8 @@
 use world_core::MaterialId;
 use world_core::tree::{NodeKind, NodeView};
 
+use super::{PALETTE_BITS_SHIFT, PALETTE_LEN_MASK};
+
 /// What a source child is, as the GPU format sees it. The only place that
 /// matches World_Core's `NodeKind`, so a new kind is one line here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,15 +112,58 @@ pub fn count_voxels<N: NodeView>(node: N, level: u32, tally: &mut Tally) {
     match content(&node) {
         Content::Air | Content::Unloaded => {}
         Content::Uniform(m) => tally.add(m, node_volume(level)),
-        Content::Leaf => {
-            for slot in 0..64 {
-                tally.add(node.voxel(slot), 1);
-            }
-        }
+        Content::Leaf => count_leaf(&node, tally),
         Content::Branch => {
             for (_, child) in node.children() {
                 count_voxels(child, level.saturating_sub(1), tally);
             }
+        }
+    }
+}
+
+/// Counts the solid voxels of a leaf per material, reading as little as the
+/// source allows: a one-material palette is its mask's population, a
+/// packed palette block is counted from its indices, and anything else is
+/// read voxel by voxel. The world tree keeps both exact (a stored palette
+/// may hold unused entries only when the leaf is packed, and those count
+/// zero), so every path gives the voxel-by-voxel answer.
+pub fn count_leaf<N: NodeView>(leaf: &N, tally: &mut Tally) {
+    let mask = leaf.mask();
+    if let [m] = leaf.palette().as_slice() {
+        tally.add(*m, u64::from(mask.count_ones()));
+    } else if let Some(block) = leaf.palette_block() {
+        count_palette_block(block, mask, tally);
+    } else {
+        for slot in 0..64 {
+            tally.add(leaf.voxel(slot), 1);
+        }
+    }
+}
+
+/// Counts a packed palette block's solid voxels per material: one index per
+/// set bit of `leaf_mask`, in the layout of decision 0005 (header
+/// `len | bits << 8`, the palette two ids per word, then the indices
+/// LSB-first).
+pub fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
+    let len = (block[0] & PALETTE_LEN_MASK) as usize;
+    let bits = (block[0] >> PALETTE_BITS_SHIFT) & 0xFF;
+    let mut counts = [0u64; 64];
+    let indices = &block[1 + len.div_ceil(2)..];
+    let index_mask = (1u32 << bits) - 1;
+    for k in 0..leaf_mask.count_ones() {
+        let at = k * bits;
+        let index = indices
+            .get((at / 32) as usize)
+            .map_or(0, |w| (w >> (at % 32)) & index_mask);
+        if let Some(c) = counts.get_mut(index as usize) {
+            *c += 1;
+        }
+    }
+    for (i, &count) in counts.iter().enumerate().take(len) {
+        let word = block.get(1 + i / 2).copied().unwrap_or(0);
+        let material = MaterialId((word >> (16 * (i % 2))) as u16);
+        if count > 0 {
+            tally.add(material, count);
         }
     }
 }
@@ -175,6 +220,48 @@ mod tests {
                 solid: 5
             }
         );
+    }
+
+    /// Every leaf of `node`, recursively.
+    fn leaves<N: NodeView>(node: N, out: &mut Vec<N>) {
+        match content(&node) {
+            Content::Leaf => out.push(node),
+            Content::Branch => {
+                for (_, child) in node.children() {
+                    leaves(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// The fast leaf count (palette, packed indices) gives exactly the
+        /// voxel-by-voxel count, including leaves overwritten until their
+        /// stored palette holds unused entries.
+        #[test]
+        fn leaf_counts_match_reading_every_voxel(
+            ops in proptest::collection::vec((0i32..24, 0i32..24, 0i32..24, 0u16..6), 1..400),
+        ) {
+            let mut tree = world_core::VoxelTree::new();
+            for &(x, y, z, m) in &ops {
+                tree.set(VoxelPos::new(x, y, z), MaterialId(m)).unwrap();
+            }
+            let snap = tree.snapshot();
+            let mut found = Vec::new();
+            leaves(snap.root(), &mut found);
+            for leaf in found {
+                let mut fast = Tally::default();
+                count_leaf(&leaf, &mut fast);
+                let mut slow = Tally::default();
+                for slot in 0..64 {
+                    slow.add(leaf.voxel(slot), 1);
+                }
+                proptest::prop_assert_eq!(fast.summary(), slow.summary());
+                proptest::prop_assert_eq!(fast.counts, slow.counts);
+            }
+        }
     }
 
     #[test]
