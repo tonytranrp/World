@@ -180,6 +180,9 @@ pub fn gpu() -> Option<Gpu> {
     };
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = backends;
+    // Bevy compiles D3D12 shaders with FXC unless dxcompiler.dll sits next to
+    // the executable; test with the same compiler so its limits show up here.
+    descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
     let instance = wgpu::Instance::new(descriptor);
     let options = wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,

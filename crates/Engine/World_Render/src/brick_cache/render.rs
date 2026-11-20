@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bevy::render::MainWorld;
+use bevy::render::camera::ExtractedCamera;
 use bevy::render::render_resource::{
     BindGroupLayoutDescriptor, CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache,
 };
@@ -83,9 +84,17 @@ pub fn extract_feed(
 /// Voxels per metre: Bevy's world unit is the metre.
 pub const VOXELS_PER_METER: f32 = world_core::consts::VOXELS_PER_METER as f32;
 
-/// The first view's camera as a stage-1 view point.
-pub fn update_view_point(views: Query<&ExtractedView>, mut point: ResMut<CacheViewPoint>) {
-    point.0 = views.iter().next().map(|v| {
+/// The first perspective camera (the lowest order) as a stage-1 view point.
+/// Orthographic views (UI, debug overlays) are skipped.
+pub fn update_view_point(
+    views: Query<(&ExtractedView, &ExtractedCamera)>,
+    mut point: ResMut<CacheViewPoint>,
+) {
+    let main = views
+        .iter()
+        .filter(|(v, _)| v.clip_from_view.w_axis.w == 0.0)
+        .min_by_key(|(_, c)| c.order);
+    point.0 = main.map(|(v, _)| {
         let eye = v.world_from_view.translation() * VOXELS_PER_METER;
         let height = v.viewport.w.max(1) as f32;
         // clip_from_view[1][1] is 1 / tan(fov / 2) for a perspective view.
@@ -405,10 +414,12 @@ pub fn log_cache_stats(state: Option<Res<BrickCacheState>>, mut last: Local<u32>
     let Some(state) = state else {
         return;
     };
-    if state.frame < *last + 300 && *last != 0 {
+    // Frames 1 and 100, then every 1000.
+    let due = state.frame == 1 || state.frame == 100 || state.frame.is_multiple_of(1000);
+    if !due || state.frame == *last {
         return;
     }
-    *last = state.frame.max(1);
+    *last = state.frame;
     let s = state.residency.stats();
     let r = state.last_report;
     info!(

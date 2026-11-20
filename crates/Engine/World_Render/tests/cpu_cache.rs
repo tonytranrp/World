@@ -392,6 +392,43 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
     assert!(select(&res, &far, &lod).evict.contains(&brick));
 }
 
+/// From the default camera, stage 1 refines the debug scene down to resident
+/// bricks within a few frames and the result stays consistent.
+#[test]
+fn stage_one_refines_the_debug_scene_from_the_default_camera() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    // 1280x720, 45 degree vertical field of view, at the origin.
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let mut batch = UploadBatch::default();
+    for frame in 1..=20 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+        apply_cpu(&mut pools, &batch);
+    }
+    let stats = res.stats();
+    assert!(stats.bricks > 500, "{stats:?}");
+    let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+    assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+}
+
 #[test]
 fn stage_two_loads_what_rays_request() {
     let snap = slab().snapshot();

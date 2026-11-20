@@ -55,6 +55,8 @@ pub struct VoxelViewTargets {
     pub params: wgpu::Buffer,
     pub size: UVec2,
     pub bind_group: wgpu::BindGroup,
+    /// Changes whenever `hits` is replaced, so dependents rebuild.
+    pub generation: u64,
 }
 
 fn hits_buffer(device: &wgpu::Device, size: UVec2) -> wgpu::Buffer {
@@ -76,6 +78,7 @@ pub fn prepare_view_targets(
     config: Res<ExtractedCacheConfig>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    mut generation: Local<u64>,
 ) {
     let (Some(state), Some(pipeline)) = (state, pipeline) else {
         return;
@@ -125,11 +128,13 @@ pub fn prepare_view_targets(
                 let bind_layout = cache.get_bind_group_layout(&pipeline.layout);
                 let bind_group =
                     trace_bind_group(wgpu_device, &bind_layout, &state.pools, &hits, &params_buf);
+                *generation += 1;
                 commands.entity(entity).insert(VoxelViewTargets {
                     hits,
                     params: params_buf,
                     size,
                     bind_group,
+                    generation: *generation,
                 });
             }
         }

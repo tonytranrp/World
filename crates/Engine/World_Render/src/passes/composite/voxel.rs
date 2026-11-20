@@ -145,6 +145,8 @@ pub fn extract_material_colors(main_world: Res<MainWorld>, mut colors: ResMut<Ma
 pub struct MaterialColorBuffer {
     pub buffer: wgpu::Buffer,
     pub count: u32,
+    /// Changes whenever `buffer` is replaced.
+    pub generation: u64,
     uploaded: Vec<[f32; 4]>,
 }
 
@@ -154,6 +156,7 @@ pub fn prepare_material_colors(
     existing: Option<ResMut<MaterialColorBuffer>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    mut generation: Local<u64>,
 ) {
     let mut data = colors.0.clone();
     if data.is_empty() {
@@ -174,26 +177,36 @@ pub fn prepare_material_colors(
                 mapped_at_creation: false,
             });
             queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&data));
+            *generation += 1;
             commands.insert_resource(MaterialColorBuffer {
                 buffer,
                 count: data.len() as u32,
+                generation: *generation,
                 uploaded: data,
             });
         }
     }
 }
 
-/// One view's composite pipeline and bind group.
+/// One view's composite pipeline and bind group, rebuilt only when what
+/// they refer to changes.
 #[derive(Component)]
 pub struct VoxelCompositeView {
     pipeline: CachedRenderPipelineId,
     bind_group: wgpu::BindGroup,
+    key: (u64, u64, u32),
     _params: wgpu::Buffer,
 }
 
 pub fn prepare_composite(
     mut commands: Commands,
-    views: Query<(Entity, &ExtractedView, &VoxelViewTargets, Option<&Msaa>)>,
+    views: Query<(
+        Entity,
+        &ExtractedView,
+        &VoxelViewTargets,
+        Option<&Msaa>,
+        Option<&VoxelCompositeView>,
+    )>,
     pipeline: Option<ResMut<VoxelCompositePipeline>>,
     colors: Option<Res<MaterialColorBuffer>>,
     cache: Res<PipelineCache>,
@@ -204,10 +217,16 @@ pub fn prepare_composite(
         return;
     };
     let wgpu_device = device.wgpu_device();
-    let layout = cache.get_bind_group_layout(&pipeline.layout);
-    for (entity, view, targets, msaa) in &views {
+    for (entity, view, targets, msaa, existing) in &views {
         let samples = msaa.map_or(1, Msaa::samples);
         let id = pipeline.variant(&cache, view.target_format, samples);
+        let key = (targets.generation, colors.generation, colors.count);
+        if let Some(e) = existing
+            && e.key == key
+            && e.pipeline == id
+        {
+            continue;
+        }
         let params = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite.voxel_params"),
             size: 16,
@@ -216,6 +235,7 @@ pub fn prepare_composite(
         });
         let p = [targets.size.x, targets.size.y, colors.count, 0u32];
         queue.write_buffer(&params, 0, bytemuck::cast_slice(&p));
+        let layout = cache.get_bind_group_layout(&pipeline.layout);
         let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite.voxel"),
             layout: &layout,
@@ -237,6 +257,7 @@ pub fn prepare_composite(
         commands.entity(entity).insert(VoxelCompositeView {
             pipeline: id,
             bind_group,
+            key,
             _params: params,
         });
     }

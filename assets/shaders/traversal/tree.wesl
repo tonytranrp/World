@@ -82,7 +82,8 @@ fn trace_hit(
     if face_axis < 3u {
         // A +1 step in the mirrored frame is a -1 step on a mirrored axis,
         // which enters through the + face.
-        face = 2u * face_axis + select(0u, 1u, m[face_axis]);
+        let mirrored = select(select(m.z, m.y, face_axis == 1u), m.x, face_axis == 0u);
+        face = 2u * face_axis + select(0u, 1u, mirrored);
     }
     let voxel = select(v, -v - vec3<i32>(1), m);
     return Hit(voxel, material, level, face, flags, t, steps);
@@ -174,40 +175,71 @@ fn leaf_material(
     return (entry >> (16u * (index & 1u))) & 0xFFFFu;
 }
 
+// Component `k` (0 to 2) of a vector. Dynamic indexing is avoided on purpose:
+// D3D's FXC cannot address vector components or private arrays by a
+// runtime index and gives up unrolling the loops around them.
+fn pick_f(v: vec3<f32>, k: u32) -> f32 {
+    return select(select(v.z, v.y, k == 1u), v.x, k == 0u);
+}
+
+fn pick_i(v: vec3<i32>, k: u32) -> i32 {
+    return select(select(v.z, v.y, k == 1u), v.x, k == 0u);
+}
+
+// The voxel after a step on axis `k` into voxel `bk` (on that axis) at
+// distance `t`: the other axes have crossed every boundary below `t`, and
+// those of lower axes also the ones at exactly `t` (the reference's order).
+fn step_voxel(v: vec3<i32>, k: u32, bk: i32, od: vec3<f32>, dd: vec3<f32>, t: f32) -> vec3<i32> {
+    let x = select(axis_voxel(v.x, od.x, dd.x, t, k > 0u), bk, k == 0u);
+    let y = select(axis_voxel(v.y, od.y, dd.y, t, k > 1u), bk, k == 1u);
+    let z = select(axis_voxel(v.z, od.z, dd.z, t, false), bk, k == 2u);
+    return vec3<i32>(x, y, z);
+}
+
+// Levels of the ancestor stack: enough for the world tree (TREE_DEPTH).
+const STACK_LEVELS: u32 = 10u;
+// Threads per tracing workgroup (8x8).
+const STACK_LANES: u32 = 64u;
+// The ancestor stack, one row per thread, in workgroup memory because FXC
+// cannot write a private array at a runtime index.
+var<workgroup> trace_stack: array<u32, 640>;
+
 // The first solid cell along the ray `o + t d` (voxel units, world frame).
-fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings) -> Hit {
-    if all(d == vec3<f32>(0.0)) {
+// `lane` is the caller's local invocation index (below 64): it picks the
+// thread's row of the ancestor stack.
+fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
+    if all(d == vec3<f32>(0.0)) || s.root_level >= STACK_LEVELS || lane >= STACK_LANES {
         return trace_miss(0u, 0u);
     }
+    let row = lane * STACK_LEVELS;
     let size = 1u << (2u * (s.root_level + 1u));
     let size_i = i32(size);
     let lo = vec3<f32>(s.origin);
     let hi = lo + vec3<f32>(f32(size));
 
-    // Clip to the tree's box like the reference does.
-    var t_enter = -T_FAR;
-    var t_exit = T_FAR;
-    var enter_axis = 0u;
-    for (var a = 0u; a < 3u; a++) {
-        if d[a] == 0.0 {
-            if o[a] < lo[a] || o[a] > hi[a] {
-                return trace_miss(0u, 0u);
-            }
-        } else {
-            let t1 = (lo[a] - o[a]) / d[a];
-            let t2 = (hi[a] - o[a]) / d[a];
-            let near = min(t1, t2);
-            // `>=`: on ties the box is entered by the highest axis, the
-            // last one the reference steps at that distance.
-            if near >= t_enter {
-                t_enter = near;
-                enter_axis = a;
-            }
-            t_exit = min(t_exit, max(t1, t2));
-        }
+    // Clip to the tree's box like the reference does. Axes with a zero
+    // direction must hold the origin inside their slab.
+    let zero = d == vec3<f32>(0.0);
+    if any(zero & ((o < lo) | (o > hi))) {
+        return trace_miss(0u, 0u);
     }
+    let t1 = select((lo - o) / d, vec3<f32>(-T_FAR), zero);
+    let t2 = select((hi - o) / d, vec3<f32>(T_FAR), zero);
+    let near = select(min(t1, t2), vec3<f32>(-T_FAR), zero);
+    let far = select(max(t1, t2), vec3<f32>(T_FAR), zero);
+    let t_enter = max(near.x, max(near.y, near.z));
+    let t_exit = min(far.x, min(far.y, far.z));
     if t_exit < 0.0 || t_enter > t_exit {
         return trace_miss(0u, 0u);
+    }
+    // On ties the box is entered by the highest axis: the last one the
+    // reference steps at that distance.
+    var enter_axis = 0u;
+    if near.y >= near.x {
+        enter_axis = 1u;
+    }
+    if near.z >= max(near.x, near.y) {
+        enter_axis = 2u;
     }
 
     let m = d < vec3<f32>(0.0);
@@ -224,22 +256,12 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings) -> Hit {
     let rel0 = v - mo;
     if any(rel0 < vec3<i32>(0)) || any(rel0 >= box_size) {
         // Outside: enter through the plane crossed last.
-        let k = enter_axis;
-        var nv = v;
-        for (var a = 0u; a < 3u; a++) {
-            if a == k {
-                nv[a] = mo[a];
-            } else {
-                nv[a] = axis_voxel(v[a], od[a], dd[a], t_enter, a < k);
-            }
-        }
-        v = nv;
+        v = step_voxel(v, enter_axis, pick_i(mo, enter_axis), od, dd, t_enter);
         t = t_enter;
-        face_axis = k;
+        face_axis = enter_axis;
     }
 
-    var stack: array<u32, 12>;
-    stack[s.root_level] = ROOT_NODE;
+    trace_stack[row + s.root_level] = ROOT_NODE;
     var top = s.root_level;
     var steps = 0u;
     let mirror_max = vec3<u32>(size - 1u);
@@ -256,7 +278,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings) -> Hit {
         let local = select(ml, mirror_max - ml, m);
 
         var level = top;
-        var index = stack[level];
+        var index = trace_stack[row + level];
         var node = load_node(index);
         var cell_level = 0u;
         loop {
@@ -305,7 +327,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings) -> Hit {
             }
             // Internal: one dependent load per level.
             let child = node.reference + mask_rank(node.mask_lo, node.mask_hi, slot);
-            if coarse_enough || level == 0u {
+            if coarse_enough || level <= 1u {
                 let c = load_node(child);
                 if node_kind(c) == KIND_UNIFORM {
                     return trace_hit(v, m, c.reference & 0xFFFFu, 0u, face_axis, HIT_FLAG_HIT, t, steps);
@@ -318,37 +340,25 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings) -> Hit {
             level -= 1u;
             index = child;
             node = load_node(index);
-            stack[level] = index;
+            trace_stack[row + level] = index;
         }
 
         // Jump over the empty cell of 4^cell_level voxels containing v.
         let span = 1u << (2u * cell_level);
         let cell_end = (ml | vec3<u32>(span - 1u)) + vec3<u32>(1u);
         let b = vec3<i32>(cell_end) + mo;
-        var tn = vec3<f32>(T_FAR);
-        for (var a = 0u; a < 3u; a++) {
-            if dd[a] > 0.0 {
-                tn[a] = (f32(b[a]) - od[a]) / dd[a];
-            }
-        }
+        let tn = select(vec3<f32>(T_FAR), (vec3<f32>(b) - od) / dd, dd > vec3<f32>(0.0));
         var k = 2u;
         if tn.x <= tn.y && tn.x <= tn.z {
             k = 0u;
         } else if tn.y <= tn.z {
             k = 1u;
         }
-        let tk = tn[k];
+        let tk = pick_f(tn, k);
         if tk > t_exit {
             return trace_miss(steps, 0u);
         }
-        var nv = v;
-        for (var a = 0u; a < 3u; a++) {
-            if a == k {
-                nv[a] = b[a];
-            } else {
-                nv[a] = axis_voxel(v[a], od[a], dd[a], tk, a < k);
-            }
-        }
+        let nv = step_voxel(v, k, pick_i(b, k), od, dd, tk);
         // Restart at the deepest node holding both voxels.
         let nrel = nv - mo;
         if any(nrel < vec3<i32>(0)) || any(nrel >= box_size) {

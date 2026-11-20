@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(layout.segments.len(), 2);
         assert_eq!(layout.brick_pool_bytes(), 2048 * MIB);
         assert_eq!(layout.node_pool_bytes(), 128 * MIB);
-        assert!(layout.feedback_words() * 4 <= (1 << 31) - 1);
+        assert!(layout.feedback_words() * 4 < (1 << 31));
     }
 
     #[test]

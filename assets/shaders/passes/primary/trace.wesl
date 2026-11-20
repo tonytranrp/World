@@ -33,7 +33,10 @@ fn camera_dir(pixel: vec2<u32>) -> vec3<f32> {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn trace(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
     if gid.x >= params.size.x || gid.y >= params.size.y {
         return;
     }
@@ -57,12 +60,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         params.limits.y,
         params.limits.z,
     );
-    let h = cast_ray(o, d, s);
+    let h = cast_ray(o, d, s, lane);
     var depth = 0.0;
     if (h.flags & HIT_FLAG_HIT) != 0u {
         let p = (o + d * h.t) / params.lod.z;
         let clip = params.clip_from_world * vec4<f32>(p, 1.0);
-        depth = clamp(clip.z / clip.w, 0.0, 1.0);
+        // A hit at the eye (a ray starting inside a voxel) is as near as it gets.
+        depth = select(1.0, clamp(clip.z / clip.w, 0.0, 1.0), clip.w > 1e-6);
     }
     hits[i] = bitcast<u32>(h.voxel.x);
     hits[i + 1u] = bitcast<u32>(h.voxel.y);
