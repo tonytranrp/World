@@ -734,12 +734,14 @@ pub(crate) fn step<const TOP: bool>(
     }
     let k = rank(node.mask, slot) as u32;
     let word = storage.word(node.base + k);
-    if TOP && word == NOT_RESIDENT {
-        Step::NotResident
-    } else if word & UNIFORM_BIT != 0 {
-        Step::Filled(MaterialId(word as u16))
-    } else {
+    // Most words name a node; the not-resident word is one of the uniform
+    // ones, so the common path tests a single bit.
+    if word & UNIFORM_BIT == 0 {
         Step::Node(word)
+    } else if TOP && word == NOT_RESIDENT {
+        Step::NotResident
+    } else {
+        Step::Filled(MaterialId(word as u16))
     }
 }
 

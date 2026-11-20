@@ -157,8 +157,11 @@ impl Writer<'_> {
 /// full leaves, ties to the lower id) and its leaves, and one record per
 /// other non-air leaf.
 pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
-    // One pass: the mask, the full single-material leaves, and whether they
-    // are all one material (then that is the default, or the whole brick).
+    // One pass: mixed leaves are stored as they come; full single-material
+    // leaves are noted, and when they are all one material (the usual case)
+    // that material is the default and they need no records.
+    let mut words = [0; MAX_BLOCK_LEN];
+    let mut len = BRICK_HEADER_WORDS;
     let mut mask = 0u64;
     let mut full = 0u64;
     let mut first: Option<MaterialId> = None;
@@ -168,11 +171,17 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
             continue;
         }
         mask |= bit(slot);
-        if let Some(m) = r.uniform() {
-            full |= bit(slot);
-            match first {
-                None => first = Some(m),
-                Some(f) => mixed |= f != m,
+        match r.uniform() {
+            Some(m) => {
+                full |= bit(slot);
+                match first {
+                    None => first = Some(m),
+                    Some(f) => mixed |= f != m,
+                }
+            }
+            None => {
+                words[len..len + RECORD_WORDS].copy_from_slice(&r.words());
+                len += RECORD_WORDS;
             }
         }
     }
@@ -182,9 +191,19 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
     let header = match first {
         Some(material) if !mixed && full == u64::MAX => return Packed::Filled(material),
         Some(default) if !mixed => BrickHeader { full, default },
-        Some(_) => default_leaves(records),
+        // Full leaves of several materials: the most common is the default.
+        Some(_) => return pack_counted(mask, records),
         None => BrickHeader::default(),
     };
+    words[..BRICK_HEADER_WORDS].copy_from_slice(&header.words());
+    let stored = ((len - BRICK_HEADER_WORDS) / RECORD_WORDS) as u32;
+    Packed::Node(PackedNode::from_array(mask, stored, words, len))
+}
+
+/// [`pack`] for a brick whose full leaves are of several materials: counts
+/// them for the default, then stores every other non-air leaf.
+fn pack_counted(mask: u64, records: &Records) -> Packed<MAX_BLOCK_LEN> {
+    let header = default_leaves(records);
     let mut words = [0; MAX_BLOCK_LEN];
     words[..BRICK_HEADER_WORDS].copy_from_slice(&header.words());
     let mut len = BRICK_HEADER_WORDS;
