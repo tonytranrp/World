@@ -103,7 +103,8 @@ Records are append-only, so the corrections and choices are recorded here.
 | Generated chunk memory | 2.2 to 8.7 MiB | 0.9 to 5.4 MiB |
 | Full-detail sphere around the player, debug build | 280 chunks, 298 MiB, 8.0 s | 276 chunks, 151 MiB, 4.8 s |
 | GPU trace at 1280x720, full / footprint detail | | 7.8 / 1.47 ms |
-| GPU encoder | | 142k bricks/s, 103 MiB/s |
+| GPU brick encoder, one thread | 103 MiB/s | 326 MiB/s (stored palette blocks copied) |
+| Loading bricks into the GPU pools, 1 / 8 threads | | 153 / 245 MiB/s |
 
 ## Consequences
 

@@ -107,6 +107,15 @@ pub trait NodeView: Copy {
         let node = *self;
         slots(self.mask()).map(move |slot| (slot, node.child(slot)))
     }
+
+    /// For a leaf of two or more materials stored packed: its palette block
+    /// exactly as decision 0005 lays it out (a header `p | b << 8`, the
+    /// palette two ids per word, then the indices LSB-first), so a consumer
+    /// can copy it instead of reading 64 voxels. `None` when the source does
+    /// not store leaves that way.
+    fn palette_block(&self) -> Option<&[u32]> {
+        None
+    }
 }
 
 /// The materials of a leaf, as [`NodeView::palette`] returns them.
@@ -359,6 +368,16 @@ impl NodeView for NodeRef<'_> {
             Self::Uniform(m) => *m,
             Self::Leaf(l) => l.voxel(slot),
             Self::Branch(_) => panic!("a branch has children, not voxels"),
+        }
+    }
+
+    fn palette_block(&self) -> Option<&[u32]> {
+        match self {
+            Self::Leaf(LeafRef {
+                content: LeafContent::Palette(block),
+                ..
+            }) => Some(block),
+            _ => None,
         }
     }
 

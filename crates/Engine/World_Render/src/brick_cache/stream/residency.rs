@@ -519,6 +519,76 @@ impl Residency {
         Ok(u64::from(slot.alloc.units) * 16)
     }
 
+    /// Loads several bricks, encoding them on up to `threads` threads, in
+    /// the order given, while `budget_left` says the batch has room. Ids are
+    /// handed out in order before encoding, so the result is exactly what
+    /// calling [`load_brick`](Self::load_brick) for each key gives. Returns
+    /// how many bricks were loaded and whether the pools filled up.
+    pub fn load_bricks<S: VoxelSource + Sync>(
+        &mut self,
+        source: &S,
+        keys: &[NodeKey],
+        threads: usize,
+        mut budget_left: impl FnMut(&UploadBatch) -> bool,
+        batch: &mut UploadBatch,
+    ) -> (u32, bool) {
+        // What may load: level-1 records without a brick. Whether the content
+        // is mixed is decided by the encoder threads, which read it anyway.
+        let mut jobs: Vec<(NodeKey, u32, bool)> = Vec::new();
+        for &key in keys {
+            let ok = key.level == 1 && self.entries.get(&key).is_some_and(|e| e.brick.is_none());
+            if !ok {
+                continue;
+            }
+            let Some(id) = self.ids.allocate() else {
+                break;
+            };
+            jobs.push((key, id, self.edited_bit(key)));
+        }
+        let encoded = encode_parallel(source, &jobs, threads.max(1));
+
+        let mut loaded = 0;
+        let mut full = false;
+        let mut used = 0;
+        for ((key, id, edited), block) in jobs.iter().zip(encoded) {
+            if full || !budget_left(batch) {
+                break;
+            }
+            used += 1;
+            let Some((words, encoded)) = block else {
+                // Air or one material: no block, the record says it all.
+                self.ids.free(*id);
+                continue;
+            };
+            let Some(alloc) = self.bricks.allocate(encoded.words) else {
+                full = true;
+                self.ids.free(*id);
+                continue;
+            };
+            let start = batch.data_mut().len();
+            batch.data_mut().extend_from_slice(&words);
+            self.summaries.insert(*key, encoded.summary);
+            batch.scatter(start as u32, alloc.block, encoded.words);
+            batch.write_table(*id, Some(alloc.block), self.frame);
+            if let Some(k) = self.id_keys.get_mut(*id as usize) {
+                *k = Some(*key);
+            }
+            let slot = BrickSlot { id: *id, alloc };
+            let record =
+                GpuNode::brick(encoded.mask, alloc.block, encoded.summary.material, *edited);
+            if let Some(e) = self.entries.get_mut(key) {
+                e.brick = Some(slot);
+            }
+            self.write_record(*key, record, batch);
+            loaded += 1;
+        }
+        // Ids handed out for bricks the budget or the pool turned away.
+        for (_, id, _) in &jobs[used..] {
+            self.ids.free(*id);
+        }
+        (loaded, full)
+    }
+
     /// Encodes the brick into the batch, allocates its block and id, and
     /// records the scatter and table write. The record is the caller's job.
     fn place_brick<N: NodeView>(
@@ -718,4 +788,42 @@ impl Residency {
         }
         Ok(())
     }
+}
+
+/// Encodes `jobs` (key, brick id, edited) on up to `threads` scoped threads,
+/// each into its own buffer, and returns the blocks in job order.
+fn encode_parallel<S: VoxelSource + Sync>(
+    source: &S,
+    jobs: &[(NodeKey, u32, bool)],
+    threads: usize,
+) -> Vec<Option<(Vec<u32>, crate::brick_cache::format::brick::EncodedBrick)>> {
+    let encode = |chunk: &[(NodeKey, u32, bool)]| {
+        let mut tally = Tally::default();
+        chunk
+            .iter()
+            .map(|&(key, id, edited)| {
+                let view = view_at(source, key);
+                (content(&view) == Content::Branch).then(|| {
+                    let mut words = Vec::new();
+                    let encoded = encode_brick(view, id, edited, &mut words, &mut tally);
+                    (words, encoded)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    // Small batches are not worth a thread.
+    if threads <= 1 || jobs.len() < 32 {
+        return encode(jobs);
+    }
+    let per = jobs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(per)
+            .map(|chunk| scope.spawn(move || encode(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
 }

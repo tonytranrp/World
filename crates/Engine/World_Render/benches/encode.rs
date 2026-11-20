@@ -8,8 +8,10 @@
 //! - `residency`: making a whole scene resident (expand + load), the work
 //!   of the first frames and of a fast camera turn.
 //!
-//! Deterministic input; single-threaded (the encoder runs on the render
-//! thread).
+//! - `load_bricks`: loading every brick of the terrain into pools, with the
+//!   encoder on 1 and on 8 threads, the path a frame takes.
+//!
+//! Deterministic input.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use world_core::tree::{NodeView, VoxelSource};
@@ -185,6 +187,67 @@ fn residency(c: &mut Criterion) {
     group.finish();
 }
 
+fn load_bricks(c: &mut Criterion) {
+    use criterion::BatchSize;
+    let tree = terrain();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = PoolLayout {
+        node_count: 1 << 20,
+        segments: vec![256 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 18,
+        upload_budget: 1 << 30,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    // Every node expanded, no brick loaded: what a frame starts from.
+    let expanded = || {
+        let mut res = Residency::new(shape, &layout).unwrap();
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        loop {
+            let todo: Vec<NodeKey> = res
+                .keys()
+                .into_iter()
+                .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+                .collect();
+            if todo.is_empty() {
+                break;
+            }
+            for k in todo {
+                let _ = res.expand(&snap, k, &mut batch);
+            }
+        }
+        let keys: Vec<NodeKey> = res.keys().into_iter().filter(|k| k.level == 1).collect();
+        (res, keys)
+    };
+    let bytes = {
+        let (mut res, keys) = expanded();
+        let mut batch = UploadBatch::default();
+        res.load_bricks(&snap, &keys, 1, |_| true, &mut batch);
+        batch.data_bytes()
+    };
+    let mut group = c.benchmark_group("load_bricks");
+    group.sample_size(10);
+    group.throughput(Throughput::Bytes(bytes));
+    for threads in [1usize, 8] {
+        group.bench_function(format!("terrain_{threads}_threads"), |b| {
+            b.iter_batched(
+                expanded,
+                |(mut res, keys)| {
+                    let mut batch = UploadBatch::default();
+                    res.load_bricks(&snap, &keys, threads, |_| true, &mut batch);
+                    batch.data_bytes()
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(std::time::Duration::from_millis(500))
@@ -194,6 +257,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = encode, allocators, residency
+    targets = encode, allocators, residency, load_bricks
 }
 criterion_main!(benches);

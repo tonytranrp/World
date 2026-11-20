@@ -542,3 +542,57 @@ fn the_shipped_config_is_valid_and_matches_the_defaults() {
         world_reload::parse_config(&text).unwrap_or_else(|e| panic!("brick_cache.ron: {e}"));
     assert_eq!(parsed, BrickCacheConfig::default());
 }
+
+/// Loading bricks in parallel gives exactly the pools that loading them one
+/// by one gives: ids are handed out in order before encoding.
+#[test]
+fn parallel_brick_loading_matches_sequential_loading() {
+    let mut tree = VoxelTree::new();
+    for i in 0..3000i32 {
+        let p = VoxelPos::new((i * 37) % 120 - 60, (i * 11) % 40 - 20, (i * 53) % 120 - 60);
+        tree.set(p, MaterialId(1 + (i % 7) as u16)).unwrap();
+    }
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let run = |parallel: bool| {
+        let (mut res, mut pools) = cpu_cache(shape);
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        loop {
+            let unexpanded: Vec<NodeKey> = res
+                .keys()
+                .into_iter()
+                .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+                .collect();
+            if unexpanded.is_empty() {
+                break;
+            }
+            for k in unexpanded {
+                let _ = res.expand(&snap, k, &mut batch);
+            }
+        }
+        let mut bricks: Vec<NodeKey> = res.keys().into_iter().filter(|k| k.level == 1).collect();
+        bricks.sort_unstable();
+        if parallel {
+            let (loaded, full) = res.load_bricks(&snap, &bricks, 8, |_| true, &mut batch);
+            assert!(!full);
+            assert!(loaded > 100, "{loaded}");
+        } else {
+            for &k in &bricks {
+                let _ = res.load_brick(&snap, k, &mut batch);
+            }
+        }
+        apply_cpu(&mut pools, &batch);
+        let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+        (
+            pools.nodes.clone(),
+            pools.segments.clone(),
+            pools.table.clone(),
+        )
+    };
+    assert!(
+        run(true) == run(false),
+        "parallel and sequential pools differ"
+    );
+}

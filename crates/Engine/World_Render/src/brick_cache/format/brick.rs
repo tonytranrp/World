@@ -6,7 +6,8 @@ use world_core::tree::NodeView;
 use super::summary::{Content, Summary, Tally, content};
 use super::{
     BLOCK_ALIGN_WORDS, BLOCK_FLAG_EDITED, BLOCK_FLAGS_SHIFT, BLOCK_HEADER_WORDS,
-    BLOCK_PALETTE_WORDS_SHIFT, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT, PAYLOAD_UNIFORM_BIT,
+    BLOCK_PALETTE_WORDS_SHIFT, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT, PALETTE_LEN_MASK,
+    PAYLOAD_UNIFORM_BIT,
 };
 
 /// The largest block a brick can need, in words: header, 64 leaves with a
@@ -129,6 +130,14 @@ pub fn encode_brick<N: NodeView>(
                 scratch.add(*m, u64::from(leaf_mask.count_ones()));
                 PAYLOAD_UNIFORM_BIT | u32::from(m.0)
             }
+            // A leaf stored packed already has the GPU's palette block
+            // layout (decision 0005): copy it and count from its indices.
+            _ if let Some(block) = leaf.palette_block() => {
+                count_palette_block(block, leaf_mask, scratch);
+                let offset = (out.len() - start) as u32;
+                out.extend_from_slice(block);
+                offset
+            }
             _ => {
                 let scan = LeafScan::of(&leaf, leaf_mask);
                 for i in 0..scan.len {
@@ -159,6 +168,35 @@ pub fn encode_brick<N: NodeView>(
         words: padded as u32,
     }
 }
+
+/// Adds the materials of a stored palette block to `tally`, one per solid
+/// voxel, from its packed indices.
+fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
+    let len = (block[0] & PALETTE_LEN_MASK) as usize;
+    let bits = (block[0] >> PALETTE_BITS_SHIFT) & 0xFF;
+    let mut counts = [0u64; 64];
+    let indices = &block[1 + len.div_ceil(2)..];
+    let index_mask = (1u32 << bits) - 1;
+    for k in 0..leaf_mask.count_ones() {
+        let at = k * bits;
+        let index = indices
+            .get((at / 32) as usize)
+            .map_or(0, |w| (w >> (at % 32)) & index_mask);
+        if let Some(c) = counts.get_mut(index as usize) {
+            *c += 1;
+        }
+    }
+    for (i, &count) in counts.iter().enumerate().take(len) {
+        let word = block.get(1 + i / 2).copied().unwrap_or(0);
+        let material = MaterialId((word >> (16 * (i % 2))) as u16);
+        if count > 0 {
+            tally.add(material, count);
+        }
+    }
+}
+
+// The world tree stores palette blocks with the same header, so they copy.
+const _: () = assert!(PALETTE_BITS_SHIFT == 8 && PALETTE_LEN_MASK == 0xFF);
 
 /// Appends one leaf's palette block: header, palette, packed indices.
 fn append_palette_block(scan: &LeafScan, out: &mut Vec<u32>) {

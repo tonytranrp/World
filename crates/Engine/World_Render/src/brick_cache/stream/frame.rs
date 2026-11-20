@@ -57,7 +57,7 @@ pub struct FrameReport {
 }
 
 /// Runs one frame of streaming into `batch` (cleared first).
-pub fn run_frame<S: VoxelSource>(
+pub fn run_frame<S: VoxelSource + Sync>(
     res: &mut Residency,
     input: &FrameInput<'_, S>,
     batch: &mut UploadBatch,
@@ -169,18 +169,16 @@ pub fn run_frame<S: VoxelSource>(
             Err(_) => {}
         }
     }
-    let mut node_full = false;
-    for k in loads {
-        if cost(batch) >= budget || node_full {
-            break;
-        }
-        match res.load_brick(source, k, batch) {
-            Ok(_) => report.loaded += 1,
-            Err(Refused::PoolFull) => {
-                report.refused_full += 1;
-                node_full = true;
-            }
-            Err(_) => {}
+    // Encode about as many bricks as the budget left can take, in parallel.
+    if cost(batch) < budget && !loads.is_empty() {
+        let room = (budget - cost(batch)) / mean.max(1) + 1;
+        let take = loads.len().min((room as usize).saturating_mul(5) / 4 + 8);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
+        let (loaded, full) =
+            res.load_bricks(source, &loads[..take], threads, |b| cost(b) < budget, batch);
+        report.loaded += loaded;
+        if full {
+            report.refused_full += 1;
         }
     }
 
