@@ -1331,3 +1331,59 @@ fn verify_still_checks_the_siblings_of_a_waiting_change() {
         "the corrupted sibling went unnoticed"
     );
 }
+
+/// The residency table is split into small maps: with tens of thousands of
+/// records, no single map holds more than a level-3 node's worth (64 + 64^2
+/// entries), so no insertion ever grows or rehashes the whole table (once
+/// 282 ms on the floor Mac, after a node pool pressure collapse).
+#[test]
+fn the_residency_table_never_rehashes_much_at_once() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    // Every node expanded, no brick loaded: a record per mixed brick.
+    loop {
+        let todo: Vec<NodeKey> = res
+            .keys()
+            .into_iter()
+            .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+            .collect();
+        if todo
+            .iter()
+            .all(|&k| res.expand(&snap, k, &mut batch).is_err())
+        {
+            break;
+        }
+    }
+    let entries = res.stats().entries;
+    assert!(entries > 10_000, "{entries} entries");
+    let largest = res.largest_table_part();
+    assert!(
+        largest <= 64 + 64 * 64,
+        "{largest} of {entries} entries in one map"
+    );
+}
+
+/// A rough slab like `rough_slab`, `size` voxels square from the origin.
+fn rough_slab_wide(size: i32) -> VoxelTree {
+    let mut tree = VoxelTree::new();
+    tree.fill_box(
+        VoxelBox::new(VoxelPos::new(0, -16, 0), VoxelPos::new(size, -2, size)),
+        MaterialId(3),
+    )
+    .unwrap();
+    for x in (0..size).step_by(5) {
+        for z in (0..size).step_by(7) {
+            tree.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    tree
+}

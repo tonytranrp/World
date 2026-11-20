@@ -28,6 +28,7 @@ use world_core::tree::{NodeView, VoxelSource};
 use super::batch::UploadBatch;
 use super::key::{NodeKey, Shape, view_at};
 use super::select::GrowthState;
+use super::table::Table;
 use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
     Content, Summary, Tally, content, count_voxels, exact_summary, node_volume,
@@ -108,7 +109,7 @@ pub struct ResidencyStats {
 /// The residency table and the slot bookkeeping of the pools.
 pub struct Residency {
     shape: Shape,
-    entries: HashMap<NodeKey, Entry>,
+    entries: Table<Entry>,
     /// Cached summaries of nodes at and above the chunk level.
     summaries: HashMap<NodeKey, Summary>,
     /// Cached summaries below the chunk level, by chunk, so a replaced
@@ -200,14 +201,9 @@ impl Residency {
     pub fn new(shape: Shape, layout: &PoolLayout) -> Option<Self> {
         Some(Self {
             shape,
-            // Growing a table of a million entries rehashes it in one go,
-            // over 100 ms on the floor Mac: reserve what a full node pool
-            // typically holds (entries are the mixed records, about a third
-            // of them) so that never happens mid-walk.
-            entries: HashMap::with_capacity_and_hasher(
-                (layout.node_count as usize).saturating_mul(7) / 16,
-                Default::default(),
-            ),
+            // Levels 1 and 2 grouped by their level-3 ancestor: at most 4160
+            // entries per small map.
+            entries: Table::new(3),
             summaries: HashMap::default(),
             chunk_summaries: HashMap::default(),
             edited: HashSet::default(),
@@ -255,6 +251,12 @@ impl Residency {
             brick_fill: self.bricks.fill(),
             brick_bytes: self.bricks.used_bytes(),
         }
+    }
+
+    /// Entries in the largest of the maps the table is split into: what one
+    /// insertion may have to rehash at worst.
+    pub fn largest_table_part(&self) -> usize {
+        self.entries.largest_part()
     }
 
     /// Resident bricks: each holds exactly one brick id. O(1), unlike
@@ -573,13 +575,15 @@ impl Residency {
 
     /// Adds or updates the entry of `key`, keeping its parent's child mask.
     fn put_entry(&mut self, key: NodeKey, index: u32, record: GpuNode) {
-        self.entries
-            .entry(key)
-            .and_modify(|e| {
+        match self.entries.get_mut(&key) {
+            Some(e) => {
                 e.index = index;
                 e.record = record;
-            })
-            .or_insert_with(|| Entry::new(index, record));
+            }
+            None => {
+                self.entries.insert(key, Entry::new(index, record));
+            }
+        }
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
@@ -794,10 +798,12 @@ impl Residency {
                 false,
             )),
         };
-        self.entries
-            .entry(root)
-            .and_modify(|e| e.record = record)
-            .or_insert_with(|| Entry::new(ROOT_NODE, record));
+        match self.entries.get_mut(&root) {
+            Some(e) => e.record = record,
+            None => {
+                self.entries.insert(root, Entry::new(ROOT_NODE, record));
+            }
+        }
         batch.write_node(ROOT_NODE, record);
     }
 

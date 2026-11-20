@@ -97,9 +97,17 @@ and tests stay deterministic.
   `lod.max_collapses_per_frame` collapses (256), resuming there. A
   pressure change restarts it at the growth budget and holds the pressure
   until that pass is done, instead of walking the whole table at once.
-- The residency table reserves what a full node pool typically holds
-  (7/16 of its records), so it never rehashes mid-walk; `stats` counts
-  node groups and brick ids instead of scanning.
+- **The residency table is split into small maps**: levels 1 and 2 by
+  their level-3 ancestor (at most 4,160 entries each), the rest in a top
+  map, and a small map that empties is dropped. A single table first
+  rehashed a million entries mid-walk (over 100 ms); reserving it up front
+  (7/16 of the node pool's records) then failed on long walks: the
+  collapses of a node pool pressure change left about 450,000 tombstones,
+  and the next insertion that found no room resized 1.38 million entries
+  to 3.67 million buckets in one go (282 ms; 296 and 310 ms frames at
+  frames 3145 and 3201 of two 6,000-frame 8 m/s walks). Growing or
+  rehashing one small map costs at most its own few thousand entries.
+  `stats` counts node groups and brick ids instead of scanning.
 
 ## Alternatives considered
 
@@ -144,12 +152,9 @@ and tests stay deterministic.
   expansions. Fewer visits trade refinement latency for time, as in 0010;
   a CPU mirror of the pool walked by index remains the option for the
   per-visit cost.
-- Reserving the residency table costs its full size at startup: 2^21
-  buckets of 113 bytes (a 16-byte key, a 96-byte entry, a control byte),
-  about 237 MB, on the floor tier and 2^22, about 474 MB, on the PC tier.
-  macOS only maps pages as they are touched, but Windows counts the whole
-  allocation as committed memory. 2^21 is the smallest power of two that
-  held the floor walks (up to 1.45 million entries; 2^20 buckets hold
-  917,000), so the floor reserve is what the table grew to anyway; the PC
-  reserve follows its larger node pool and is untested by a walk. A
-  smaller entry would shrink both.
+- The split table reserves nothing up front: it grows with the entries
+  (113 bytes a slot: a 16-byte key, a 96-byte entry, a control byte),
+  about 160 to 230 MB at the floor walks' 1.3 to 1.45 million entries,
+  instead of a fixed 237 MB (floor) or 474 MB (PC) reservation that
+  Windows would count as committed. Lookups of levels 1 and 2 hash twice,
+  once into a map of small maps that stays in cache.

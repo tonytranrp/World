@@ -5,6 +5,7 @@
 //! - `key`: names of nodes in the mirrored tree
 //! - `residency`: the residency table and every operation on it
 //! - `select`: stage 1, distance-driven selection with hysteresis
+//! - `table`: the residency table's map, split so no part rehashes much at once
 //! - `frame`: one frame's work under the byte budget, edited bricks first
 //! - `batch`: the upload buffer the apply pass reads, and a CPU model of the pass
 //! - `upload`: recording the upload and the apply pass on the GPU
@@ -15,4 +16,5 @@ pub mod frame;
 pub mod key;
 pub mod residency;
 pub mod select;
+mod table;
 pub mod upload;
