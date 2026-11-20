@@ -140,9 +140,9 @@ from the CI artifact, compared function by function, found the causes:
   itself refuses at an unloaded child. Lookups test for not-resident words
   only above the chunk level.
 
-After the fixes the gate measures, against main: random reads +27%,
-single-voxel writes into an empty tree +26% and into a dense block +7%, box
-fills +10%, an edit after a snapshot +15% (the chunk's free lists are
+After the fixes the gate measures, against main: random reads +29%,
+single-voxel writes into an empty tree +23% and into a dense block +7%, box
+fills +9%, an edit after a snapshot +15% (the chunk's free lists are
 copied), batched edits +3%, encoding 0%, decoding -97%. What remains is the
 price of chunk-owned arenas: a lookup starts a second
 page reader (two more page lookups and its setup) when it enters a chunk,
@@ -151,7 +151,8 @@ chunk is freed, moved or snapshotted whole, decoding is 97% cheaper, and
 generated chunks are 37 to 57% smaller. Wall time on Windows (Criterion)
 after these changes, against main: random reads 4.6 against 6.0 ms per
 100k, coherent cursor reads 0.46 against 0.45 ms per 64k, single-voxel
-writes 5.5 to 5.7 against 4.3 ms per 10k, box fills 0.59 against 0.49 ms.
+writes 5.05 against 4.3 ms per 10k, batched edits 1.41 against 1.32 ms,
+box fills 0.57 against 0.49 ms.
 
 ## Measured (RTX 4070 laptop, i7-13620H, 2026-11-20)
 
