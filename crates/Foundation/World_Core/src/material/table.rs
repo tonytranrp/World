@@ -18,6 +18,8 @@ pub enum MaterialError {
     },
     DuplicateId(u16),
     DuplicateName(String),
+    /// An id reserved by the engine, such as [`MaterialId::KEEP`].
+    ReservedId(u16),
 }
 
 impl fmt::Display for MaterialError {
@@ -31,6 +33,7 @@ impl fmt::Display for MaterialError {
             } => write!(f, "material {id} ({name:?}): {field} {problem}"),
             Self::DuplicateId(id) => write!(f, "material id {id} is used more than once"),
             Self::DuplicateName(name) => write!(f, "material name {name:?} is used more than once"),
+            Self::ReservedId(id) => write!(f, "material id {id} is reserved"),
         }
     }
 }
@@ -83,6 +86,11 @@ impl MaterialTable {
                     field,
                     problem,
                 });
+            }
+        }
+        for m in &materials {
+            if m.id == MaterialId::KEEP || m.id.is_air() {
+                errors.push(MaterialError::ReservedId(m.id.0));
             }
         }
         let mut names: Vec<&str> = materials.iter().map(|m| m.name.as_str()).collect();

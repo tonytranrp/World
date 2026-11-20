@@ -1,4 +1,4 @@
-use world_core::{Edit, MaterialId, VoxelBox, VoxelPos};
+use world_core::{Edit, MaterialId, RegionSource, VoxelBox, VoxelPos};
 
 use crate::hash::{HashState, StateHasher};
 
@@ -143,6 +143,48 @@ impl VoxelModel for DenseWorld {
             )
         });
         self.cells[i] = material;
+    }
+}
+
+/// The dense model as a bulk-building source: exact, by scanning. Cubes
+/// outside the bounds are air.
+impl RegionSource for DenseWorld {
+    fn uniform(&self, min: VoxelPos, size: u32) -> Option<MaterialId> {
+        let lo = self.bounds.min.to_array();
+        let m = min.to_array();
+        let span: [(i64, i64); 3] = std::array::from_fn(|a| {
+            let start = i64::from(m[a]).max(i64::from(lo[a]));
+            let end = (i64::from(m[a]) + i64::from(size))
+                .min(i64::from(lo[a]) + i64::from(self.bounds.size[a]));
+            (start, end)
+        });
+        if span.iter().any(|&(s, e)| s >= e) {
+            return Some(MaterialId::AIR);
+        }
+        let inside = span.iter().all(|&(s, e)| e - s == i64::from(size));
+        let at = |x: i64, y: i64, z: i64| self.get(VoxelPos::new(x as i32, y as i32, z as i32));
+        let first = at(span[0].0, span[1].0, span[2].0);
+        // Part of the cube is outside, which is air.
+        if !inside && !first.is_air() {
+            return None;
+        }
+        for z in span[2].0..span[2].1 {
+            for y in span[1].0..span[1].1 {
+                for x in span[0].0..span[0].1 {
+                    if at(x, y, z) != first {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(first)
+    }
+
+    fn leaf(&self, min: VoxelPos, voxels: &mut [MaterialId; 64]) {
+        for (slot, voxel) in (0..).zip(voxels.iter_mut()) {
+            let offset = VoxelPos::new(min.x + slot % 4, min.y + slot / 4 % 4, min.z + slot / 16);
+            *voxel = self.get(offset);
+        }
     }
 }
 

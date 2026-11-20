@@ -12,6 +12,10 @@ pub struct MaterialId(pub u16);
 impl MaterialId {
     pub const AIR: Self = Self(0);
 
+    /// Never a real material: in an edit overlay it means "keep the
+    /// generated base here" (decision 0006). The material table refuses it.
+    pub const KEEP: Self = Self(u16::MAX);
+
     pub const fn is_air(self) -> bool {
         self.0 == 0
     }

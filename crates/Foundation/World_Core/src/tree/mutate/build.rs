@@ -51,6 +51,11 @@ impl<'a> Builder<'a> {
         self.writer.write(None, level, branch::pack(children))
     }
 
+    /// Whether a chunk is open.
+    pub fn in_chunk(&self) -> bool {
+        self.writer.chunk.is_some()
+    }
+
     /// Whether a node built at `level` now roots a new chunk.
     pub fn enters_chunk(&self, level: u32) -> bool {
         self.writer.at_chunk_boundary(level)

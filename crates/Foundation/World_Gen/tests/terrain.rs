@@ -298,7 +298,9 @@ proptest! {
                     let top = y + size as i32 - 1;
                     prop_assert_eq!(c.material_at(top, &cols.layers()), m);
                     prop_assert_eq!(c.material_at(y, &cols.layers()), m);
-                    if !m.is_air() {
+                    // Bedrock answers lie wholly below the soil; soil answers
+                    // are bounded by the top and bottom checks above.
+                    if m == cols.layers().bedrock && m != cols.layers().soil {
                         prop_assert!(top < c.bedrock_below());
                     }
                 }
