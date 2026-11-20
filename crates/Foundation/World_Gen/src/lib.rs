@@ -16,8 +16,9 @@
 //!
 //! Version 1 terrain is a heightfield: continental elevation, mountains and
 //! hills on a one-metre lattice, regional relief on a 4-voxel lattice, and
-//! surface layers (grass, dirt, stone) by slope, altitude and moisture. See
-//! the module docs for the order of operations.
+//! surface layers (grass, dirt, stone) by slope, altitude and moisture.
+//! Version 2 carves caves out of it ([`regional::caves`]). See the module
+//! docs for the order of operations.
 
 pub mod chunk;
 pub mod config;
@@ -39,6 +40,8 @@ pub use surface::{Column, Layers};
 use chunk::Stages;
 use continental::Continental;
 use regional::Regional;
+use regional::caves::Caves;
+use std::sync::Arc;
 use surface::Surface;
 use world_core::{MaterialId, VoxelPos};
 
@@ -53,11 +56,15 @@ impl GeneratorVersion {
     /// relief, and grass, dirt and stone layers.
     pub const V1: Self = Self(1);
 
+    /// Version 1 with caves: tunnels and caverns from 3D noise, carved below
+    /// the surface cover.
+    pub const V2: Self = Self(2);
+
     /// The version new worlds are made with.
-    pub const CURRENT: Self = Self::V1;
+    pub const CURRENT: Self = Self::V2;
 
     /// Every version this build can generate.
-    pub const SUPPORTED: &'static [Self] = &[Self::V1];
+    pub const SUPPORTED: &'static [Self] = &[Self::V1, Self::V2];
 }
 
 /// What produced a piece of output: the seed, the generator version and a
@@ -67,7 +74,7 @@ impl GeneratorVersion {
 pub struct GeneratorId {
     pub seed: u64,
     pub version: GeneratorVersion,
-    /// [`TerrainConfig::fingerprint`] of the parameters.
+    /// [`TerrainConfig::fingerprint_for`] the version.
     pub config: u64,
 }
 
@@ -122,6 +129,8 @@ pub struct Generator {
     id: GeneratorId,
     config: TerrainConfig,
     stages: Stages,
+    /// The cave fields (version 2 with caves enabled).
+    caves: Option<Arc<Caves>>,
 }
 
 impl Generator {
@@ -145,12 +154,18 @@ impl Generator {
             regional: Regional::new(seed, &config.regional),
             surface: Surface::new(seed, &config.surface),
         };
+        let caves = if version >= GeneratorVersion::V2 {
+            Caves::new(seed, &config.caves).map(Arc::new)
+        } else {
+            None
+        };
         Ok(Self {
             id: GeneratorId {
                 seed,
                 version,
-                config: config.fingerprint(),
+                config: config.fingerprint_for(version),
             },
+            caves,
             config,
             stages,
         })
@@ -175,9 +190,22 @@ impl Generator {
         self.stages.surface.layers()
     }
 
-    /// Every column of `chunk`'s footprint (its `y` is ignored).
+    /// Every column of `chunk`'s footprint (its `y` is ignored). Columns are
+    /// the heightfield alone; [`chunk_source`](Self::chunk_source) adds the
+    /// caves.
     pub fn columns(&self, chunk: ChunkCoord) -> ChunkColumns {
         self.stages.columns(self.id, chunk)
+    }
+
+    /// Everything needed to build `chunk` into a tree: its columns and, from
+    /// version 2, its cave grid. Its voxels equal [`material`](Self::material).
+    pub fn chunk_source(&self, chunk: ChunkCoord) -> ChunkSource {
+        ChunkSource::with_caves(self.columns(chunk), self.caves.clone())
+    }
+
+    /// Whether this generator carves caves.
+    pub fn has_caves(&self) -> bool {
+        self.caves.is_some()
     }
 
     /// `chunk`'s footprint sampled every `4^level` voxels, `level` in
@@ -209,10 +237,12 @@ impl Generator {
                 z: pos.z,
             });
         }
-        Ok(self
-            .stages
-            .column(pos.x, pos.z)
-            .material_at(pos.y, &self.layers()))
+        let column = self.stages.column(pos.x, pos.z);
+        let material = column.material_at(pos.y, &self.layers());
+        match &self.caves {
+            Some(caves) if !material.is_air() && caves.carved(pos, &column) => Ok(MaterialId::AIR),
+            _ => Ok(material),
+        }
     }
 }
 
@@ -235,7 +265,7 @@ mod tests {
             Generator::new(1, GeneratorVersion(0), config.clone()).unwrap_err(),
             GenError::UnsupportedVersion(GeneratorVersion(0))
         );
-        assert!(Generator::new(1, GeneratorVersion(2), config.clone()).is_err());
+        assert!(Generator::new(1, GeneratorVersion(3), config.clone()).is_err());
         let mut bad = config;
         bad.regional.relief_height_m = f32::NAN;
         assert!(matches!(

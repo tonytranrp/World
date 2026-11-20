@@ -135,6 +135,7 @@ Design and reasons: decisions 0006 to 0009.
 - World_Game's `residency` domain owns the world (`StreamedWorld`): loading around the player, saving edited chunks as overlays in region files, the edit log, the warm and coarse tiers. Gameplay edits go through it, never straight to a tree. Tune it in `assets/config/residency.ron`; terrain lives in `assets/config/terrain.ron`.
 - Saves are in `saves/` (git-ignored). Deleting it resets the world to the seed.
 - Terrain generation is bit-exact on every platform (decision 0008): plain `f32`, no `mul_add`, no platform math functions, no runtime SIMD dispatch. World_Gen's golden hashes run on Windows, macOS arm64 and macOS x86_64.
+- Generator version 2 carves caves (`regional::caves`). Build chunks with `Generator::chunk_source`, which includes them; `ChunkSource::new(columns)` is the heightfield alone. A change to generated output needs a new `GeneratorVersion` and new golden hashes.
 
 ## Building and running
 

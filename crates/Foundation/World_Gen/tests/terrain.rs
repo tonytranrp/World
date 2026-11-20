@@ -198,6 +198,16 @@ fn the_default_config_round_trips_through_ron_and_validates() {
 }
 
 #[test]
+fn the_shipped_config_is_the_default() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../assets/config/terrain.ron"
+    );
+    let shipped: TerrainConfig = ron::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(shipped, TerrainConfig::default());
+}
+
+#[test]
 fn default_materials_exist_in_the_shipped_table() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

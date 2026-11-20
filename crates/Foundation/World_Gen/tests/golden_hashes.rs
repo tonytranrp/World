@@ -10,10 +10,11 @@
 //! Each hash is xxh3-64 (World_Testkit's `StateHasher`, little-endian) over
 //! the generator id (seed, version, config fingerprint), the chunk coordinate
 //! and every column's height, surface material, surface depth and soil depth
-//! in index order.
+//! in index order. Version 2 adds caves, which columns do not show, so its
+//! cases hash materials of voxels inside the cave band.
 
 use world_core::VoxelPos;
-use world_gen::noise::{Fractal, FractalParams, Perlin};
+use world_gen::noise::{Fractal, Fractal3, FractalParams, Perlin};
 use world_gen::{ChunkCoord, Column, Generator, GeneratorId, GeneratorVersion, TerrainConfig};
 use world_testkit::hash::StateHasher;
 
@@ -158,4 +159,39 @@ fn noise_primitives_match_recorded_values() {
             .write_f32(fractal.ridged(x * 97.0, y * 31.0));
     }
     check(&[("noise primitives", h.finish(), 0x01ED_282B_FE8E_B0F3)]);
+}
+
+#[test]
+fn version_2_caves_match_recorded_hashes() {
+    let g = Generator::new(0x5EED, GeneratorVersion::V2, TerrainConfig::default())
+        .expect("valid default");
+    assert!(g.has_caves());
+    let mut h = StateHasher::new();
+    h.write_u64(g.id().config);
+    let mut carved = 0;
+    for i in 0..512i32 {
+        let x = i.wrapping_mul(40_503) % 524_288;
+        let z = -(i.wrapping_mul(9_973) % 524_288);
+        let column = g.column(x, z).expect("inside the world");
+        // A vertical run of voxels 4 to 20 m down, one every 16 cm.
+        for k in 0..100 {
+            let y = column.height - 256 - k * 10;
+            let m = g
+                .material(VoxelPos::new(x, y, z))
+                .expect("inside the world");
+            carved += u32::from(m.is_air());
+            h.write_u16(m.0);
+        }
+    }
+    assert!(carved > 0, "the probes cross caves");
+    let fractal = Fractal3::new(2, &FractalParams::new(16.0, 3), 1.75);
+    for i in 0..64 {
+        let x = i as f32 * 977.0 - 40_000.0;
+        h.write_f32(fractal.fbm(x, x * -0.37, x * 0.61));
+    }
+    check(&[(
+        "seed 0x5EED, version 2 cave band",
+        h.finish(),
+        0xB452_794E_995B_7C87,
+    )]);
 }

@@ -9,7 +9,7 @@ use world_core::serialize::region::RecordKind;
 use world_core::serialize::{decode, encode};
 use world_core::tree::{CHUNK_LEVEL, ChunkData};
 use world_core::{MaterialId, VoxelTree};
-use world_gen::{CHUNK_SIZE, ChunkCoord, ChunkSource, CoarseSource, Generator};
+use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator};
 
 use super::store::SavedChunk;
 
@@ -40,7 +40,7 @@ pub struct Loaded {
 
 /// Generates the chunk at `coord` into detached data.
 pub fn generate(generator: &Generator, coord: ChunkCoord) -> ChunkData {
-    let source = ChunkSource::new(generator.columns(coord));
+    let source = generator.chunk_source(coord);
     let mut tree = VoxelTree::new();
     let min = coord.min_voxel();
     // The coordinate names a chunk inside the world, so both calls succeed.
@@ -99,7 +99,7 @@ pub fn load(
                 let mut tree = match record.kind {
                     RecordKind::Full => saved_tree,
                     RecordKind::Overlay => {
-                        let base = ChunkSource::new(generator.columns(coord));
+                        let base = generator.chunk_source(coord);
                         let mut tree = VoxelTree::unloaded();
                         tree.apply_overlay(min, &base, &saved_tree)
                             .map_err(|e| e.to_string())?;
@@ -152,7 +152,7 @@ pub fn encode_chunk(
     // An aligned chunk position always inserts.
     let _ = tree.insert_chunk(min, data);
     let full = encode(&tree);
-    let base = ChunkSource::new(generator.columns(coord));
+    let base = generator.chunk_source(coord);
     let overlay = tree.overlay(min, &base).map(|o| encode(&o)).ok();
     let primary = match overlay {
         Some(bytes) if bytes.len() <= 2 * full.len() => SavedChunk {

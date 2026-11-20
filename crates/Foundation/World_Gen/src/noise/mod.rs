@@ -3,7 +3,7 @@
 //! - [`hash`]: SplitMix64 mixing, FNV-1a stage tags, per-column hashes and
 //!   random streams, all integer arithmetic.
 //! - [`perlin`]: Ken Perlin's improved noise (2002), ported to plain `f32`.
-//! - [`fractal`]: fBm and ridged sums of seeded octaves.
+//! - [`fractal`]: fBm and ridged sums of seeded octaves, in 2D and 3D.
 //! - [`curve`]: smoothstep, bilinear interpolation, piecewise-linear maps.
 //!
 //! Decision 0008's rules hold throughout: plain `f32` add, subtract, multiply,
@@ -17,6 +17,6 @@ pub mod hash;
 pub mod perlin;
 
 pub use curve::{PiecewiseLinear, bilerp, smoothstep};
-pub use fractal::{Fractal, FractalParams, MAX_OCTAVES};
+pub use fractal::{Fractal, Fractal3, FractalParams, MAX_OCTAVES};
 pub use hash::{Stream, derive, hash_column, splitmix64};
 pub use perlin::Perlin;

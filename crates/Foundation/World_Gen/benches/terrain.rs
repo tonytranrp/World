@@ -85,7 +85,8 @@ fn material_queries(c: &mut Criterion) {
 }
 
 /// A whole surface chunk from seed to tree: columns, then a bottom-up build
-/// through `ChunkSource` (decision 0006).
+/// through `ChunkSource` (decision 0006); the heightfield alone, then with
+/// version 2's caves.
 fn chunk_to_tree(c: &mut Criterion) {
     let g = generator();
     let probe = g.columns(chunk());
@@ -114,6 +115,51 @@ fn chunk_to_tree(c: &mut Criterion) {
             tree
         })
     });
+    // Version 2: the same chunk and the first chunk under it that holds
+    // caves (not every one does).
+    let build = |at: ChunkCoord| {
+        let mut tree = world_core::VoxelTree::new();
+        tree.build_region(
+            world_core::tree::CHUNK_LEVEL,
+            at.min_voxel(),
+            &g.chunk_source(at),
+        )
+        .expect("an aligned chunk");
+        tree
+    };
+    let deep = (1..16)
+        .map(|d| ChunkCoord::new(coord.x(), coord.y() - d, coord.z()).expect("inside the world"))
+        .find(|&at| build(at).stats().leaves > 0)
+        .expect("caves within 256 m of the surface");
+    for (name, at) in [("surface", coord), ("underground", deep)] {
+        group.bench_function(format!("caves_{name}_columns_grid_and_build"), |b| {
+            b.iter(|| {
+                let source = g.chunk_source(black_box(at));
+                let mut tree = world_core::VoxelTree::new();
+                tree.build_region(world_core::tree::CHUNK_LEVEL, at.min_voxel(), &source)
+                    .expect("an aligned chunk");
+                tree
+            })
+        });
+    }
+    let source = g.chunk_source(deep);
+    group.bench_function("caves_underground_build_only", |b| {
+        b.iter(|| {
+            let mut tree = world_core::VoxelTree::new();
+            tree.build_region(world_core::tree::CHUNK_LEVEL, deep.min_voxel(), &source)
+                .expect("an aligned chunk");
+            tree
+        })
+    });
+    let mut tree = world_core::VoxelTree::new();
+    tree.build_region(world_core::tree::CHUNK_LEVEL, deep.min_voxel(), &source)
+        .expect("an aligned chunk");
+    let stats = tree.stats();
+    println!(
+        "underground chunk with caves: {} leaves, {:.2} MiB",
+        stats.leaves,
+        stats.bytes as f64 / (1024.0 * 1024.0)
+    );
     group.finish();
 }
 

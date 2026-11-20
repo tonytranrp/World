@@ -16,15 +16,24 @@
 //! min/max pyramid over the chunk's columns, so cubes aligned to the tree
 //! (side `4^k`, `k <= 5`, at a multiple of their side) cost one lookup.
 //! Other cubes are answered by scanning their columns.
+//!
+//! With caves (generator version 2), a cube the heightfield calls solid is
+//! also checked against the chunk's [`CaveGrid`]: untouched cubes keep their
+//! answer, cubes carved entirely are air, and the rest are refined. Leaves
+//! carve their solid voxels from the eight corners of their cell (a leaf
+//! never spans two cells).
 
 use super::columns::ChunkColumns;
 use super::coord::CHUNK_SIZE;
+use crate::regional::caves::{CaveGrid, Caves, CubeCaves, trilinear};
 use crate::surface::Column;
+use std::sync::Arc;
 use world_core::{MaterialId, RegionSource, VoxelPos};
 
 /// Footprint summary: the highest column and the lowest bedrock boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Span {
+    min_height: i32,
     max_height: i32,
     min_bedrock: i32,
     /// The lowest first voxel above a column's soil, over the footprint: the
@@ -36,6 +45,7 @@ struct Span {
 
 impl Span {
     const EMPTY: Self = Self {
+        min_height: i32::MAX,
         max_height: i32::MIN,
         min_bedrock: i32::MAX,
         min_soil_end: i32::MAX,
@@ -50,6 +60,7 @@ impl Span {
         let soil_end = clamp(height - i64::from(column.surface_depth));
         let soil_start = clamp(height - i64::from(column.soil_depth.max(column.surface_depth)));
         Self {
+            min_height: column.height,
             max_height: column.height,
             min_bedrock: column.bedrock_below(),
             min_soil_end: soil_end,
@@ -59,6 +70,7 @@ impl Span {
 
     fn merge(self, other: Self) -> Self {
         Self {
+            min_height: self.min_height.min(other.min_height),
             max_height: self.max_height.max(other.max_height),
             min_bedrock: self.min_bedrock.min(other.min_bedrock),
             min_soil_end: self.min_soil_end.min(other.min_soil_end),
@@ -76,11 +88,21 @@ pub struct ChunkSource {
     /// `pyramid[k - 1]` summarizes the aligned `4^k x 4^k` footprints, `k` in
     /// `1..=5`, `x` fastest.
     pyramid: Vec<Vec<Span>>,
+    /// The cave fields and this chunk's grid (`None` inside when no voxel
+    /// of the chunk can be carved).
+    caves: Option<(Arc<Caves>, Option<CaveGrid>)>,
 }
 
 impl ChunkSource {
-    /// Builds the pyramid (about 1.4 M merges for a chunk).
+    /// The heightfield alone: builds the pyramid (about 1.4 M merges for a
+    /// chunk).
     pub fn new(columns: ChunkColumns) -> Self {
+        Self::with_caves(columns, None)
+    }
+
+    /// The heightfield with `caves` carved out of it; computes the chunk's
+    /// cave grid when any voxel can be carved.
+    pub fn with_caves(columns: ChunkColumns, caves: Option<Arc<Caves>>) -> Self {
         let mut pyramid: Vec<Vec<Span>> = Vec::new();
         let mut below: Vec<Span> = columns.columns().iter().map(Span::of).collect();
         let mut n = CHUNK_SIZE as usize;
@@ -97,7 +119,21 @@ impl ChunkSource {
             below = level;
             n = m;
         }
-        Self { columns, pyramid }
+        let caves = caves.map(|caves| {
+            let max_height = below.first().map_or(i32::MIN, |s| s.max_height);
+            let grid = caves.grid(columns.chunk(), max_height);
+            (caves, grid)
+        });
+        Self {
+            columns,
+            pyramid,
+            caves,
+        }
+    }
+
+    /// Whether this source carves caves.
+    pub fn has_caves(&self) -> bool {
+        self.caves.is_some()
     }
 
     pub fn columns(&self) -> &ChunkColumns {
@@ -116,8 +152,24 @@ impl ChunkSource {
         let bottom = i64::from(min.y);
         let top = bottom + i64::from(size) - 1;
         if bottom >= i64::from(span.max_height) {
-            Some(MaterialId::AIR)
-        } else if top < i64::from(span.min_bedrock) {
+            return Some(MaterialId::AIR);
+        }
+        let caves = match &self.caves {
+            Some((caves, grid)) => caves.cube(
+                self.columns.chunk(),
+                grid.as_ref(),
+                min,
+                size,
+                (span.min_height, span.max_height),
+            ),
+            None => CubeCaves::None,
+        };
+        match caves {
+            CubeCaves::All => return Some(MaterialId::AIR),
+            CubeCaves::Mixed => return None,
+            CubeCaves::None => {}
+        }
+        if top < i64::from(span.min_bedrock) {
             Some(self.columns.layers().bedrock)
         } else if bottom >= i64::from(span.max_soil_start) && top < i64::from(span.min_soil_end) {
             Some(self.columns.layers().soil)
@@ -131,6 +183,7 @@ impl ChunkSource {
     pub fn leaf(&self, min: VoxelPos, voxels: &mut [MaterialId; 64]) {
         let chunk_min = self.columns.chunk().min_voxel();
         let layers = self.columns.layers();
+        let carving = self.leaf_caves(min);
         // Each of the leaf's 16 columns is read once for its 4 voxels.
         for z in 0..4 {
             for x in 0..4 {
@@ -147,8 +200,31 @@ impl ChunkSource {
                         None => MaterialId::AIR,
                     };
                 }
+                if let (Some(column), Some(carving)) = (column, &carving) {
+                    carving.carve_column(column, min, x, z, voxels);
+                }
             }
         }
+    }
+
+    /// How the leaf at `min` is carved: `None` when no voxel can be.
+    fn leaf_caves(&self, min: VoxelPos) -> Option<LeafCaves<'_>> {
+        let (caves, grid) = self.caves.as_ref()?;
+        let chunk_min = self.columns.chunk().min_voxel();
+        let in_chunk = i64::from(min.y) >= i64::from(chunk_min.y)
+            && i64::from(min.y) + 4 <= i64::from(chunk_min.y) + i64::from(CHUNK_SIZE);
+        // Inside the chunk the grid's corners serve the whole leaf (one
+        // cell); outside it, each voxel computes its own.
+        let corners = if in_chunk {
+            let grid = grid.as_ref()?;
+            if grid.cell_bounds(min).0 >= 0.0 {
+                return None;
+            }
+            Some(grid.corners(min)?)
+        } else {
+            None
+        };
+        Some(LeafCaves { caves, corners })
     }
 
     /// The summary of the footprint `[min.x, min.x + size) x [min.z, ...)`,
@@ -187,6 +263,44 @@ impl ChunkSource {
             }
         }
         Some(span)
+    }
+}
+
+/// The cave context of one leaf.
+struct LeafCaves<'a> {
+    caves: &'a Caves,
+    /// The corners of the leaf's cell, or `None` to compute per voxel.
+    corners: Option<[f32; 8]>,
+}
+
+impl LeafCaves<'_> {
+    /// Carves the cave voxels of column `(x, z)` of the leaf at `min`.
+    fn carve_column(
+        &self,
+        column: &Column,
+        min: VoxelPos,
+        x: i32,
+        z: i32,
+        voxels: &mut [MaterialId; 64],
+    ) {
+        for y in 0..4 {
+            let slot = (x + 4 * y + 16 * z) as usize;
+            if voxels[slot].is_air() {
+                continue;
+            }
+            let pos = VoxelPos::new(
+                min.x.wrapping_add(x),
+                min.y.wrapping_add(y),
+                min.z.wrapping_add(z),
+            );
+            let carved = match &self.corners {
+                Some(c) => self.caves.carvable(pos.y, column) && trilinear(c, pos) < 0.0,
+                None => self.caves.carved(pos, column),
+            };
+            if carved {
+                voxels[slot] = MaterialId::AIR;
+            }
+        }
     }
 }
 

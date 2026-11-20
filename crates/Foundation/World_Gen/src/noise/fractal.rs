@@ -178,6 +178,80 @@ impl Fractal {
     }
 }
 
+/// One octave of a 3D field: a noise field, its frequencies in cycles per
+/// voxel (the vertical one scaled), its weight and its lattice offset.
+#[derive(Clone)]
+struct Octave3 {
+    noise: Perlin,
+    frequency: f32,
+    frequency_y: f32,
+    amplitude: f32,
+    offset: [f32; 3],
+}
+
+/// A 3D fractal field over world voxels `(x, y, z)`, for volumes such as
+/// caves. Built like [`Fractal`], with a third offset per octave and the
+/// vertical frequency multiplied by `y_scale` (above 1 flattens features).
+#[derive(Clone)]
+pub struct Fractal3 {
+    octaves: Vec<Octave3>,
+    norm: f32,
+}
+
+impl Fractal3 {
+    /// The field for validated `params`, seeded by `seed`. Octave `k` takes
+    /// the `k`-th permutation seed and three offset fractions from a
+    /// SplitMix64 stream on `seed`; its vertical frequency is
+    /// `f_k * y_scale`.
+    pub fn new(seed: u64, params: &FractalParams, y_scale: f32) -> Self {
+        let mut stream = Stream::new(seed);
+        let mut frequency = 1.0 / (params.wavelength_m * VOXELS_PER_METER as f32);
+        let mut amplitude = 1.0f32;
+        let mut sum = 0.0f32;
+        let mut octaves = Vec::with_capacity(params.octaves as usize);
+        for _ in 0..params.octaves {
+            let noise = Perlin::from_seed(splitmix64(stream.next_u64()));
+            let offset = [
+                stream.unit_f32() * 256.0,
+                stream.unit_f32() * 256.0,
+                stream.unit_f32() * 256.0,
+            ];
+            octaves.push(Octave3 {
+                noise,
+                frequency,
+                frequency_y: frequency * y_scale,
+                amplitude,
+                offset,
+            });
+            sum += amplitude;
+            frequency *= params.lacunarity;
+            amplitude *= params.persistence;
+        }
+        Self {
+            octaves,
+            norm: 1.0 / sum,
+        }
+    }
+
+    /// Fractal Brownian motion at a voxel position: `norm * sum(a_k * n_k)`
+    /// with every octave clamped to `[-1, 1]`. In `[-1, 1]`.
+    pub fn fbm(&self, x: f32, y: f32, z: f32) -> f32 {
+        let mut sum = 0.0f32;
+        for o in &self.octaves {
+            let n = o
+                .noise
+                .noise3(
+                    x * o.frequency + o.offset[0],
+                    y * o.frequency_y + o.offset[1],
+                    z * o.frequency + o.offset[2],
+                )
+                .clamp(-1.0, 1.0);
+            sum += o.amplitude * n;
+        }
+        sum * self.norm
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +292,18 @@ mod tests {
         assert_eq!(bad.problems("x", 0.0).len(), 4);
         assert!(params().problems("x", 1.0).is_empty());
         assert_eq!(params().problems("x", 4.0).len(), 1, "finest octave is 2 m");
+    }
+
+    #[test]
+    fn the_3d_field_stays_in_range_and_is_seeded() {
+        let f = Fractal3::new(3, &params(), 2.0);
+        let mut s = Stream::new(8);
+        for _ in 0..5_000 {
+            let mut c = || (s.next_u64() % 1_000_000) as f32 - 500_000.0;
+            let (x, y, z) = (c(), c(), c());
+            assert!((-1.0..=1.0).contains(&f.fbm(x, y, z)));
+        }
+        let g = Fractal3::new(4, &params(), 2.0);
+        assert_ne!(f.fbm(10.5, 3.25, -7.0), g.fbm(10.5, 3.25, -7.0));
     }
 }

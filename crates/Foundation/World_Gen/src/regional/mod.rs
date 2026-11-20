@@ -3,13 +3,15 @@
 //! Version 1 terrain is a heightfield. The field combines the continental
 //! elevation (interpolated from its one-metre lattice) with regional relief
 //! (metre-to-decimetre bumps) sampled on a finer [`DETAIL_SPACING`] lattice,
-//! and derives the slope the surface rules need. Caves, overhangs and rivers
-//! will join here as signed distance fields in a later generator version.
+//! and derives the slope the surface rules need. Version 2 adds [`caves`],
+//! a 3D field carved out of that heightfield; overhangs and rivers will join
+//! here in later versions.
 //!
 //! [`field`] holds the lattice grids. Their values depend only on the lattice
 //! index, never on which rectangle of columns asked for them, so a column is
 //! identical whether it is generated in a whole chunk, a coarse pass or alone.
 
+pub mod caves;
 pub mod field;
 
 use serde::{Deserialize, Serialize};

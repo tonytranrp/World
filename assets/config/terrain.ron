@@ -45,4 +45,24 @@
         dry_moisture: -0.3,
         grass_depth_voxels: (2, 5),
     ),
+    caves: (
+        // Caves (generator version 2): tunnels where two 3D fields both
+        // cross zero, caverns where a third is high. Noise is sampled every
+        // metre (finest octave at least 8 m) and carved at quarter-metre
+        // resolution.
+        enabled: true,
+        tunnels: (wavelength_m: 40.0, octaves: 2, lacunarity: 2.0, persistence: 0.5),
+        // How far from zero both tunnel fields may be, 0..=1; wider tunnels.
+        tunnel_radius: 0.06,
+        caverns: (wavelength_m: 64.0, octaves: 2, lacunarity: 2.0, persistence: 0.5),
+        // Caverns open above this, -1..=2 (above 1 turns them off).
+        cavern_threshold: 0.6,
+        // Vertical frequency multiplier, 0.25..=4; above 1 flattens caves.
+        y_scale: 1.75,
+        // Caves stay within bottom_m <= y < top_m.
+        bottom_m: -256.0,
+        top_m: 320.0,
+        // Rock kept under every surface; 0 lets caves open to the sky.
+        cover_m: 3.0,
+    ),
 )

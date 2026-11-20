@@ -4,7 +4,7 @@
 
 use world_core::tree::CHUNK_LEVEL;
 use world_core::{MaterialId, VoxelPos, VoxelTree};
-use world_gen::{CHUNK_SIZE, ChunkCoord, ChunkSource, Generator, GeneratorVersion, TerrainConfig};
+use world_gen::{CHUNK_SIZE, ChunkCoord, Generator, GeneratorVersion, TerrainConfig};
 use world_testkit::dense::check_canonical;
 
 fn generator() -> Generator {
@@ -29,7 +29,7 @@ fn surface_chunk(g: &Generator, x: u32, z: u32) -> ChunkCoord {
 fn a_generated_chunk_builds_into_the_tree_exactly() {
     let g = generator();
     let coord = surface_chunk(&g, 511, 518);
-    let source = ChunkSource::new(g.columns(coord));
+    let source = g.chunk_source(coord);
     let min = coord.min_voxel();
 
     let mut tree = VoxelTree::new();
@@ -59,7 +59,7 @@ fn a_generated_chunk_builds_into_the_tree_exactly() {
 fn a_loaded_chunk_replaces_a_not_resident_region() {
     let g = generator();
     let coord = surface_chunk(&g, 300, 700);
-    let source = ChunkSource::new(g.columns(coord));
+    let source = g.chunk_source(coord);
     let min = coord.min_voxel();
 
     let mut tree = VoxelTree::unloaded();
@@ -105,7 +105,86 @@ fn a_coarse_chunk_is_uniform_cells_matching_its_samples() {
     }
     // Far less storage than the same chunk at full detail.
     let mut full = VoxelTree::new();
-    full.build_region(CHUNK_LEVEL, min, &ChunkSource::new(g.columns(coord)))
+    full.build_region(CHUNK_LEVEL, min, &g.chunk_source(coord))
         .unwrap();
     assert!(tree.stats().bytes * 8 < full.stats().bytes);
+}
+
+/// Builds `coord` with caves and checks columns of voxels against the
+/// generator's point queries; returns the tree and how many solid voxels the
+/// checked columns lost to caves.
+fn check_cave_chunk(g: &Generator, coord: ChunkCoord) -> (VoxelTree, usize) {
+    let source = g.chunk_source(coord);
+    assert!(source.has_caves());
+    let min = coord.min_voxel();
+    let mut tree = VoxelTree::new();
+    tree.build_region(CHUNK_LEVEL, min, &source).unwrap();
+    check_canonical(&tree).unwrap();
+    let layers = g.layers();
+    let size = CHUNK_SIZE as i32;
+    let mut carved = 0;
+    for z in (0..size).step_by(53) {
+        for x in (0..size).step_by(47) {
+            let column = *source.columns().column(x as u32, z as u32).unwrap();
+            for y in 0..size {
+                let p = VoxelPos::new(min.x + x, min.y + y, min.z + z);
+                let want = g.material(p).unwrap();
+                assert_eq!(tree.get(p), want, "at {p:?}");
+                if want.is_air() && !column.material_at(p.y, &layers).is_air() {
+                    carved += 1;
+                }
+            }
+        }
+    }
+    (tree, carved)
+}
+
+#[test]
+fn caves_carve_underground_chunks_exactly() {
+    let g = generator();
+    assert!(g.has_caves());
+    // Well below the surface, inside the cave band.
+    let surface = surface_chunk(&g, 511, 518);
+    let deep = ChunkCoord::new(surface.x(), surface.y() - 4, surface.z()).unwrap();
+    let (tree, carved) = check_cave_chunk(&g, deep);
+    assert!(carved > 0, "the checked columns cross a cave");
+    let stats = tree.stats();
+    assert!(stats.leaves > 0);
+    // Rock and open caves stay whole subtrees: far fewer leaves than a
+    // leaf per brick.
+    assert!(stats.leaves < 64 * 64 * 64 * 64 / 4, "{stats:?}");
+}
+
+#[test]
+fn caves_keep_the_surface_cover_on_surface_chunks() {
+    let g = generator();
+    let coord = surface_chunk(&g, 300, 700);
+    let (tree, _) = check_cave_chunk(&g, coord);
+    // The top `cover_m` of every column is untouched.
+    let min = coord.min_voxel();
+    let cover = (g.config().caves.cover_m * 64.0) as i32;
+    let columns = g.columns(coord);
+    for (x, z) in [(0u32, 0u32), (500, 600), (1023, 17)] {
+        let c = columns.column(x, z).unwrap();
+        for d in 1..=cover.min(64) {
+            let p = VoxelPos::new(min.x + x as i32, c.height - d, min.z + z as i32);
+            if ChunkCoord::containing(p) == Some(coord) {
+                assert!(!tree.get(p).is_air(), "cover carved at {p:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn version_1_has_no_caves() {
+    let g = Generator::new(0xC0FFEE, GeneratorVersion::V1, TerrainConfig::default()).unwrap();
+    assert!(!g.has_caves());
+    let coord = surface_chunk(&g, 511, 518);
+    assert!(!g.chunk_source(coord).has_caves());
+    let v2 = generator();
+    assert_ne!(
+        g.id().config,
+        v2.id().config,
+        "caves are part of v2's identity"
+    );
 }

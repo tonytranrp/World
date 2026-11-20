@@ -7,9 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::GeneratorVersion;
 use crate::continental::ContinentalParams;
 use crate::fingerprint::Fingerprint;
 use crate::regional::RegionalParams;
+use crate::regional::caves::CaveParams;
 use crate::surface::SurfaceParams;
 use world_core::consts::{VOXELS_PER_METER, WORLD_END_VOXEL};
 use world_core::{ConfigAsset, MaterialTable};
@@ -21,6 +23,10 @@ pub struct TerrainConfig {
     pub continental: ContinentalParams,
     pub regional: RegionalParams,
     pub surface: SurfaceParams,
+    /// Caves, used from generator version 2. Missing from older files means
+    /// the defaults.
+    #[serde(default)]
+    pub caves: CaveParams,
 }
 
 /// The lowest and highest column height a config can produce, in voxels.
@@ -37,12 +43,25 @@ pub struct HeightBounds {
 pub const MAX_ELEVATION_M: f64 = 4096.0;
 
 impl TerrainConfig {
-    /// A hash of every value in a fixed order, part of [`crate::GeneratorId`].
+    /// A hash of every value version 1 reads (the heightfield), in a fixed
+    /// order.
     pub fn fingerprint(&self) -> u64 {
         let mut f = Fingerprint::new();
         self.continental.fingerprint(&mut f);
         self.regional.fingerprint(&mut f);
         self.surface.fingerprint(&mut f);
+        f.finish()
+    }
+
+    /// A hash of every value `version` reads, part of [`crate::GeneratorId`]:
+    /// version 1 ignores the caves, so they do not change its identity.
+    pub fn fingerprint_for(&self, version: GeneratorVersion) -> u64 {
+        if version < GeneratorVersion::V2 {
+            return self.fingerprint();
+        }
+        let mut f = Fingerprint::new();
+        f.u64(self.fingerprint());
+        self.caves.fingerprint(&mut f);
         f.finish()
     }
 
@@ -75,6 +94,7 @@ impl TerrainConfig {
         let mut out = self.continental.problems();
         out.extend(self.regional.problems());
         out.extend(self.surface.problems());
+        out.extend(self.caves.problems());
         if out.is_empty() {
             let (lo, hi) = self.elevation_range_m();
             if lo < -MAX_ELEVATION_M || hi > MAX_ELEVATION_M {
