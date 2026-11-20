@@ -1,62 +1,128 @@
 //! Reading the body. One walk does both jobs: with [`Validate`] it checks
-//! every byte against the format and builds nothing; with a [`VoxelTree`] it
-//! builds the tree from a body that has already passed.
+//! every byte against the format and builds nothing; with [`TreeBuild`] it
+//! writes the tree bottom-up, children before parents, each leaf and node
+//! packed once at its final size (decision 0006), from a body that has
+//! already passed.
 
-use super::{DecodeError, HEADER_LEN, TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_UNIFORM, index_bits};
-use crate::consts::TREE_DEPTH;
-use crate::coords::{VoxelBox, VoxelPos, path};
+use super::{
+    DecodeError, HEADER_LEN, TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_NOT_RESIDENT, TAG_UNIFORM,
+    index_bits,
+};
+use crate::consts::{TREE_DEPTH, TREE_FANOUT};
 use crate::material::MaterialId;
-use crate::tree::VoxelTree;
+use crate::tree::Builder;
+use crate::tree::node::leaf::{Record, Voxels};
+use crate::tree::node::{CHUNK_LEVEL, Child};
 
-/// What the walk produces: whole regions and single voxels of the content.
-pub(super) trait Sink {
-    /// Every voxel of `region` is `material`.
-    fn uniform(&mut self, region: VoxelBox, material: MaterialId);
-    /// One solid voxel.
-    fn voxel(&mut self, pos: VoxelPos, material: MaterialId);
+/// The children of one branch, in slot order.
+type Slots<T> = [T; TREE_FANOUT as usize];
+
+/// What the walk produces from each child it reads.
+pub(super) trait Build {
+    /// A child of a level-1 branch: one 4x4x4 leaf.
+    type Leaf: Copy;
+    /// A child at level 1 or above, or the root.
+    type Child: Copy;
+    const AIR_LEAF: Self::Leaf;
+    const AIR_CHILD: Self::Child;
+    /// A leaf whose every voxel is `material`, never air.
+    fn uniform_leaf(&mut self, material: MaterialId) -> Self::Leaf;
+    /// A leaf of two or more materials, or of one with some air.
+    fn mixed_leaf(&mut self, voxels: &Voxels) -> Self::Leaf;
+    /// A child whose every voxel is `material`, never air.
+    fn uniform(&mut self, material: MaterialId) -> Self::Child;
+    /// A child at the chunk level or above whose content is not loaded.
+    fn not_resident(&mut self) -> Self::Child;
+    /// Called before the children of a branch at the chunk level are read:
+    /// they belong to a new chunk.
+    fn begin_chunk(&mut self);
+    /// A level-1 branch made of these leaves (air where the mask is clear).
+    fn brick(&mut self, leaves: &Slots<Self::Leaf>) -> Self::Child;
+    /// A branch at `level` (2 and up) made of these children.
+    fn branch(&mut self, level: u32, children: &Slots<Self::Child>) -> Self::Child;
 }
 
 /// Checks the body and builds nothing.
 pub(super) struct Validate;
 
-impl Sink for Validate {
-    fn uniform(&mut self, _: VoxelBox, _: MaterialId) {}
-    fn voxel(&mut self, _: VoxelPos, _: MaterialId) {}
+impl Build for Validate {
+    type Leaf = ();
+    type Child = ();
+    const AIR_LEAF: () = ();
+    const AIR_CHILD: () = ();
+    fn uniform_leaf(&mut self, _: MaterialId) {}
+    fn mixed_leaf(&mut self, _: &Voxels) {}
+    fn uniform(&mut self, _: MaterialId) {}
+    fn not_resident(&mut self) {}
+    fn begin_chunk(&mut self) {}
+    fn brick(&mut self, _: &Slots<()>) {}
+    fn branch(&mut self, _: u32, _: &Slots<()>) {}
 }
 
-/// Regions and voxels come from slot paths below the root, so they always lie
-/// inside the world and the tree cannot refuse them.
-impl Sink for VoxelTree {
-    fn uniform(&mut self, region: VoxelBox, material: MaterialId) {
-        self.fill_box(region, material)
-            .expect("a decoded region lies inside the world");
-    }
-
-    fn voxel(&mut self, pos: VoxelPos, material: MaterialId) {
-        self.set(pos, material)
-            .expect("a decoded voxel lies inside the world");
-    }
+/// Writes the tree. Used only on a body [`Validate`] accepted, so every child
+/// is canonical and nothing collapses.
+pub(super) struct TreeBuild<'a, 'b> {
+    pub builder: &'a mut Builder<'b>,
 }
 
-/// Walks a whole body: the root child, then nothing.
-pub(super) fn body(bytes: &[u8], sink: &mut impl Sink) -> Result<(), DecodeError> {
-    let mut r = Reader { bytes, pos: 0 };
-    match r.u8()? {
-        TAG_AIR => {}
-        tag => {
-            r.child(tag, 0, TREE_DEPTH - 1, [0; 3], sink)?;
+impl Build for TreeBuild<'_, '_> {
+    type Leaf = Record;
+    type Child = Child;
+    const AIR_LEAF: Record = Record::AIR;
+    const AIR_CHILD: Child = Child::Air;
+
+    fn uniform_leaf(&mut self, material: MaterialId) -> Record {
+        Record::filled(material)
+    }
+
+    fn mixed_leaf(&mut self, voxels: &Voxels) -> Record {
+        self.builder.leaf(voxels)
+    }
+
+    fn uniform(&mut self, material: MaterialId) -> Child {
+        Child::filled(material)
+    }
+
+    fn not_resident(&mut self) -> Child {
+        Child::NotResident
+    }
+
+    fn begin_chunk(&mut self) {
+        self.builder.begin_chunk();
+    }
+
+    fn brick(&mut self, leaves: &Slots<Record>) -> Child {
+        self.builder.brick(leaves)
+    }
+
+    fn branch(&mut self, level: u32, children: &Slots<Child>) -> Child {
+        let child = self.builder.branch(level, children);
+        if level == CHUNK_LEVEL {
+            self.builder.end_chunk(child)
+        } else {
+            child
         }
     }
+}
+
+/// Walks a whole body: the root child, then nothing. Returns the root.
+pub(super) fn body<B: Build>(bytes: &[u8], build: &mut B) -> Result<B::Child, DecodeError> {
+    let mut r = Reader { bytes, pos: 0 };
+    let root = match r.u8()? {
+        TAG_AIR => B::AIR_CHILD,
+        tag => r.node_child(tag, 0, TREE_DEPTH - 1, build)?.1,
+    };
     if r.pos != bytes.len() {
         return Err(malformed(r.pos, "the body continues after the root"));
     }
-    Ok(())
+    Ok(root)
 }
 
 /// What a child turned out to be, for its parent's canonical check.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Uniform(u16),
+    NotResident,
     Node,
 }
 
@@ -100,73 +166,115 @@ impl<'a> Reader<'a> {
         self.array().map(u64::from_le_bytes)
     }
 
-    /// The child whose tag (at body offset `at`) was just read. `level` is the
-    /// level a node in its place would have; `origin` is the world-local
-    /// lowest voxel of its region.
-    fn child(
+    /// A uniform child's material, refusing air; its tag is at `at`.
+    fn uniform_id(&mut self, at: usize) -> Result<u16, DecodeError> {
+        let id = self.u16()?;
+        if id == 0 {
+            return Err(malformed(at, "a uniform child of air"));
+        }
+        Ok(id)
+    }
+
+    /// The child at `level` (1 and up) whose tag, at body offset `at`, was
+    /// just read.
+    fn node_child<B: Build>(
         &mut self,
         tag: u8,
         at: usize,
         level: u32,
-        origin: [u32; 3],
-        sink: &mut impl Sink,
-    ) -> Result<Kind, DecodeError> {
+        build: &mut B,
+    ) -> Result<(Kind, B::Child), DecodeError> {
         match tag {
             TAG_UNIFORM => {
-                let id = self.u16()?;
-                if id == 0 {
-                    return Err(malformed(at, "a uniform child of air"));
-                }
-                let span = path::child_span(level + 1);
-                let region = VoxelBox::from_min_size(path::from_world_local(origin), [span; 3]);
-                sink.uniform(region, MaterialId(id));
-                Ok(Kind::Uniform(id))
+                let id = self.uniform_id(at)?;
+                Ok((Kind::Uniform(id), build.uniform(MaterialId(id))))
             }
-            TAG_BRANCH if level == 0 => Err(malformed(at, "a branch at level 0")),
-            TAG_BRANCH => self.branch(at, level, origin, sink),
-            TAG_LEAF if level != 0 => Err(malformed(at, "a leaf above level 0")),
-            TAG_LEAF => self.leaf(at, origin, sink),
+            TAG_BRANCH => {
+                if level == CHUNK_LEVEL {
+                    build.begin_chunk();
+                }
+                self.branch(at, level, build)
+            }
+            TAG_NOT_RESIDENT if level < CHUNK_LEVEL => {
+                Err(malformed(at, "a not-resident child below the chunk level"))
+            }
+            TAG_NOT_RESIDENT => Ok((Kind::NotResident, build.not_resident())),
+            TAG_LEAF => Err(malformed(at, "a leaf above level 0")),
             TAG_AIR => Err(malformed(at, "an air child inside a branch")),
             _ => Err(malformed(at, "an unknown child tag")),
         }
     }
 
-    fn branch(
+    /// A child of a level-1 branch whose tag, at body offset `at`, was just
+    /// read.
+    fn leaf_child<B: Build>(
+        &mut self,
+        tag: u8,
+        at: usize,
+        build: &mut B,
+    ) -> Result<(Kind, B::Leaf), DecodeError> {
+        match tag {
+            TAG_UNIFORM => {
+                let id = self.uniform_id(at)?;
+                Ok((Kind::Uniform(id), build.uniform_leaf(MaterialId(id))))
+            }
+            TAG_BRANCH => Err(malformed(at, "a branch at level 0")),
+            TAG_NOT_RESIDENT => Err(malformed(at, "a not-resident child below the chunk level")),
+            TAG_LEAF => self.leaf(at, build),
+            TAG_AIR => Err(malformed(at, "an air child inside a branch")),
+            _ => Err(malformed(at, "an unknown child tag")),
+        }
+    }
+
+    fn branch<B: Build>(
         &mut self,
         at: usize,
         level: u32,
-        origin: [u32; 3],
-        sink: &mut impl Sink,
-    ) -> Result<Kind, DecodeError> {
+        build: &mut B,
+    ) -> Result<(Kind, B::Child), DecodeError> {
         let mask = self.u64()?;
         if mask == 0 {
             return Err(malformed(at, "a branch with no children"));
         }
-        let span = path::child_span(level);
-        let mut material = None;
+        let mut leaves = [B::AIR_LEAF; TREE_FANOUT as usize];
+        let mut children = [B::AIR_CHILD; TREE_FANOUT as usize];
+        let mut same = None;
         let mut mixed = false;
         for slot in set_slots(mask) {
             let child_at = self.pos;
             let tag = self.u8()?;
-            let offset = path::slot_offset(slot);
-            let child_origin = std::array::from_fn(|a| origin[a] + offset[a] * span);
-            match self.child(tag, child_at, level - 1, child_origin, sink)? {
-                Kind::Uniform(id) if material.is_none_or(|m| m == id) => material = Some(id),
+            let kind = if level == 1 {
+                let (kind, leaf) = self.leaf_child(tag, child_at, build)?;
+                leaves[slot as usize] = leaf;
+                kind
+            } else {
+                let (kind, child) = self.node_child(tag, child_at, level - 1, build)?;
+                children[slot as usize] = child;
+                kind
+            };
+            match kind {
+                Kind::Node => mixed = true,
+                filled if same.is_none_or(|s| s == filled) => same = Some(filled),
                 _ => mixed = true,
             }
         }
         if mask == u64::MAX && !mixed {
-            return Err(malformed(at, "a branch whose voxels are all one material"));
+            return Err(match same {
+                Some(Kind::NotResident) => {
+                    malformed(at, "a branch whose children are all not resident")
+                }
+                _ => malformed(at, "a branch whose voxels are all one material"),
+            });
         }
-        Ok(Kind::Node)
+        let built = if level == 1 {
+            build.brick(&leaves)
+        } else {
+            build.branch(level, &children)
+        };
+        Ok((Kind::Node, built))
     }
 
-    fn leaf(
-        &mut self,
-        at: usize,
-        origin: [u32; 3],
-        sink: &mut impl Sink,
-    ) -> Result<Kind, DecodeError> {
+    fn leaf<B: Build>(&mut self, at: usize, build: &mut B) -> Result<(Kind, B::Leaf), DecodeError> {
         let mask = self.u64()?;
         if mask == 0 {
             return Err(malformed(at, "a leaf with no solid voxels"));
@@ -195,6 +303,7 @@ impl<'a> Reader<'a> {
         let packed = self.take((solids * bits).div_ceil(8))?;
         let index_mask = ((1u16 << bits) - 1) as u8;
         let mut used = 0u64;
+        let mut voxels: Voxels = [MaterialId::AIR; TREE_FANOUT as usize];
         for (k, slot) in set_slots(mask).enumerate() {
             // The width divides 8, so an index never straddles a byte. With
             // zero-width indices every voxel is palette entry 0.
@@ -211,9 +320,7 @@ impl<'a> Reader<'a> {
                 ));
             }
             used |= 1 << index;
-            let offset = path::slot_offset(slot);
-            let local = std::array::from_fn(|a| origin[a] + offset[a]);
-            sink.voxel(path::from_world_local(local), MaterialId(palette[index]));
+            voxels[slot as usize] = MaterialId(palette[index]);
         }
         let tail = solids * bits % 8;
         if let Some(&last) = packed.last()
@@ -231,39 +338,37 @@ impl<'a> Reader<'a> {
         if mask == u64::MAX && len == 1 {
             return Err(malformed(at, "a leaf whose voxels are all one material"));
         }
-        Ok(Kind::Node)
+        Ok((Kind::Node, build.mixed_leaf(&voxels)))
     }
 }
 
 /// The set bits of a mask, ascending.
 fn set_slots(mask: u64) -> impl Iterator<Item = u32> {
-    (0..64).filter(move |s| mask >> s & 1 == 1)
+    let mut rest = mask;
+    std::iter::from_fn(move || {
+        (rest != 0).then(|| {
+            let slot = rest.trailing_zeros();
+            rest &= rest - 1;
+            slot
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consts::WORLD_MIN_VOXEL;
-
-    /// Records what the walk produces, to check positions without a tree.
-    #[derive(Default)]
-    struct Record {
-        regions: Vec<(VoxelBox, MaterialId)>,
-        voxels: Vec<(VoxelPos, MaterialId)>,
-    }
-
-    impl Sink for Record {
-        fn uniform(&mut self, region: VoxelBox, material: MaterialId) {
-            self.regions.push((region, material));
-        }
-
-        fn voxel(&mut self, pos: VoxelPos, material: MaterialId) {
-            self.voxels.push((pos, material));
-        }
-    }
+    use crate::coords::VoxelPos;
+    use crate::tree::VoxelTree;
 
     fn check(bytes: &[u8]) -> Result<(), DecodeError> {
         body(bytes, &mut Validate)
+    }
+
+    /// Builds a tree from a body that passed [`check`].
+    fn build(bytes: &[u8]) -> VoxelTree {
+        check(bytes).expect("a valid body");
+        VoxelTree::build_with(|builder| body(bytes, &mut TreeBuild { builder })).unwrap()
     }
 
     /// The reason a body is rejected for.
@@ -321,40 +426,57 @@ mod tests {
     }
 
     #[test]
-    fn regions_and_voxels_land_where_their_slot_path_says() {
+    fn voxels_land_where_their_slot_path_says() {
         // Below the root, every branch down to level 2 holds only slot 63.
         // The level-1 branch holds a leaf in slot 0 and a uniform in slot 63.
         let mut tail = vec![TAG_BRANCH];
         tail.extend_from_slice(&(1u64 << 63 | 1).to_le_bytes());
         tail.extend_from_slice(&leaf(1 << 21, &[6], &[]));
         tail.extend_from_slice(&uniform(7));
-        let bytes = below(1, 63, &tail);
-        let mut record = Record::default();
-        assert_eq!(body(&bytes, &mut record), Ok(()));
+        let tree = build(&below(1, 63, &tail));
 
         // Slot 63 of a level-L node is offset 3 * 4^L on every axis.
         let corner: i32 = (2..TREE_DEPTH).map(|l| 3 * 4i32.pow(l)).sum();
         let base = WORLD_MIN_VOXEL + corner;
-        // Voxel slot 21 is (1, 1, 1).
-        assert_eq!(
-            record.voxels,
-            [(VoxelPos::new(base + 1, base + 1, base + 1), MaterialId(6))]
-        );
-        // The uniform child covers (12, 12, 12) up to (16, 16, 16).
-        assert_eq!(
-            record.regions,
-            [(
-                VoxelBox::from_min_size(VoxelPos::new(base + 12, base + 12, base + 12), [4; 3]),
-                MaterialId(7)
-            )]
-        );
+        let at = |d: i32| VoxelPos::new(base + d, base + d, base + d);
+        // Voxel slot 21 of the leaf is (1, 1, 1); its neighbours are air.
+        assert_eq!(tree.get(at(1)), MaterialId(6));
+        assert_eq!(tree.get(at(0)), MaterialId::AIR);
+        assert_eq!(tree.get(at(2)), MaterialId::AIR);
+        // The uniform leaf covers (12, 12, 12) up to (16, 16, 16).
+        assert_eq!(tree.get(at(12)), MaterialId(7));
+        assert_eq!(tree.get(at(15)), MaterialId(7));
+        assert_eq!(tree.get(at(16)), MaterialId::AIR);
+        let s = tree.stats();
+        assert_eq!((s.branches, s.leaves), (TREE_DEPTH as usize - 1, 1));
     }
 
     #[test]
-    fn a_uniform_root_covers_the_world() {
-        let mut record = Record::default();
-        assert_eq!(body(&uniform(2), &mut record), Ok(()));
-        assert_eq!(record.regions, [(VoxelBox::WORLD, MaterialId(2))]);
+    fn a_uniform_root_fills_the_world() {
+        let tree = build(&uniform(2));
+        assert_eq!(tree.get(VoxelPos::new(0, 0, 0)), MaterialId(2));
+        assert_eq!(
+            tree.get(VoxelPos::new(
+                WORLD_MIN_VOXEL,
+                WORLD_MIN_VOXEL,
+                WORLD_MIN_VOXEL
+            )),
+            MaterialId(2)
+        );
+        assert_eq!(tree.stats().branches, 0);
+    }
+
+    #[test]
+    fn mixed_leaves_keep_every_voxel() {
+        let palette: Vec<u16> = (1..=64).collect();
+        let packed: Vec<u8> = (0..64).collect();
+        let tree = build(&below(0, 0, &leaf(u64::MAX, &palette, &packed)));
+        let o = WORLD_MIN_VOXEL;
+        for slot in 0..64 {
+            let pos = VoxelPos::new(o + slot % 4, o + slot / 4 % 4, o + slot / 16);
+            assert_eq!(tree.get(pos), MaterialId(slot as u16 + 1), "slot {slot}");
+        }
+        assert_eq!(tree.stats().leaves, 1);
     }
 
     #[test]

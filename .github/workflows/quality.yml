@@ -201,6 +201,12 @@ jobs:
       - name: Mutation testing, shard ${{ matrix.shard }} of 4
         run: |
           set +e
+          # Some mutants (a rank that always returns 0) make tests allocate
+          # without bound; on a 16 GB runner that got the whole runner shut
+          # down. Capping each process's address space makes such a test
+          # fail on its own, which counts as caught. Two jobs at 6 GiB each
+          # leave room for the build and the runner.
+          ulimit -v 6291456
           cargo mutants --package world_core --shard ${{ matrix.shard }}/4 --jobs 2
           code=$?
           set -e

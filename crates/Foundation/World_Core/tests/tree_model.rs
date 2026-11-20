@@ -45,7 +45,7 @@ fn solids(tree: &impl TreeRead) -> Vec<(VoxelPos, MaterialId)> {
         let at =
             |offset: [u32; 3], span: u32| std::array::from_fn(|a| origin[a] + offset[a] * span);
         match node {
-            NodeRef::Air => {}
+            NodeRef::Air | NodeRef::NotResident => {}
             NodeRef::Uniform(m) => {
                 let span = path::child_span(level + 1);
                 assert!(

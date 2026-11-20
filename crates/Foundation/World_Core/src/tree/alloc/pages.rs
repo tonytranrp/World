@@ -92,6 +92,7 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
     }
 
     /// Every page in order; page `i` holds items `i * N .. (i + 1) * N`.
+    #[cfg(test)]
     pub fn pages(&self) -> impl Iterator<Item = &[T]> {
         self.dir
             .iter()

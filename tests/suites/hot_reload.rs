@@ -168,7 +168,15 @@ fn player_cameras(app: &mut HeadlessApp) -> Vec<Entity> {
 fn the_player_camera_is_rebuilt_by_a_code_reload() {
     for_each_seed(|seed| {
         let mut app = HeadlessApp::new().randomized(seed);
-        app.add_plugins((WorldReloadPlugin, WorldGamePlugin));
+        // The game registers config files, which need the asset server.
+        app.add_plugins((
+            bevy::asset::AssetPlugin {
+                file_path: assets_dir().to_string_lossy().into_owned(),
+                ..default()
+            },
+            WorldReloadPlugin,
+            WorldGamePlugin,
+        ));
         app.step(2);
         let before = player_cameras(&mut app);
         assert_eq!(before.len(), 1, "seed {seed:#x}");

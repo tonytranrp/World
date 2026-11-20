@@ -17,6 +17,8 @@ bench = false
 bytemuck.workspace = true
 serde.workspace = true
 xxhash-rust.workspace = true
+lz4_flex.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 ron.workspace = true

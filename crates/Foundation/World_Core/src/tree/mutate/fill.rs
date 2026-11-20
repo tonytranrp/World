@@ -34,6 +34,17 @@ impl LocalBox {
         }))
     }
 
+    /// The lowest and highest voxel of the box.
+    pub fn corners(&self) -> ([u32; 3], [u32; 3]) {
+        (self.lo, self.hi.map(|v| v - 1))
+    }
+
+    /// The lowest voxel of the box at or above `origin` on every axis: a
+    /// voxel of the box inside a cube at `origin` that the box overlaps.
+    pub fn lowest_in(&self, origin: [u32; 3]) -> [u32; 3] {
+        [0, 1, 2].map(|a| self.lo[a].max(origin[a]))
+    }
+
     /// Whether the box holds the whole cube of `extent` voxels at `origin`.
     fn covers(&self, origin: [u32; 3], extent: u32) -> bool {
         (0..3).all(|a| self.lo[a] <= origin[a] && origin[a] + extent <= self.hi[a])
@@ -41,7 +52,7 @@ impl LocalBox {
 
     /// The child slots, of a node at `origin` with children `span` voxels
     /// wide, that the box overlaps. The box must overlap the node.
-    fn slots(&self, origin: [u32; 3], span: u32) -> impl Iterator<Item = u32> + use<> {
+    pub fn slots(&self, origin: [u32; 3], span: u32) -> impl Iterator<Item = u32> + use<> {
         let end = TREE_BRANCH_DIM * span;
         let axis = |a: usize| {
             let first = (self.lo[a].max(origin[a]) - origin[a]) / span;
@@ -78,6 +89,11 @@ impl Writer<'_> {
             self.free_subtree(child, level);
             return Some(target);
         }
+        if self.at_chunk_boundary(level) {
+            return self.in_chunk(child, origin, |w, local| {
+                w.fill(local, level, origin, region, material)
+            });
+        }
         let existing = self.existing(child);
         let span = path::child_span(level);
         let child_origin = |slot: u32| {
@@ -111,7 +127,7 @@ impl Writer<'_> {
                 records[slot as usize] = self.store_leaf(old, new);
                 changed = true;
             }
-            return changed.then(|| self.write(existing, 1, brick::pack(&records)));
+            return changed.then(|| self.write(existing, 1, &brick::pack(&records)));
         }
 
         let mut children = self.children(child);
@@ -123,7 +139,7 @@ impl Writer<'_> {
                 changed = true;
             }
         }
-        changed.then(|| self.write(existing, level, branch::pack(&children)))
+        changed.then(|| self.write(existing, level, &branch::pack(&children)))
     }
 }
 

@@ -20,27 +20,34 @@
 
 mod branch;
 mod brick;
+mod build;
 mod fill;
 mod voxel;
 
+pub(crate) use build::{Builder, graft};
 pub(crate) use fill::LocalBox;
 pub(crate) use voxel::LocalEdit;
 
 use super::ROOT_LEVEL;
 use super::alloc::Store;
-use super::node::{Child, Node, Packed};
+use std::sync::Arc;
+
+use super::forest::{Chunk, Forest, chunk_key};
+use super::node::{CHUNK_LEVEL, Child, Node, Packed};
 use crate::consts::TREE_DEPTH;
 use crate::material::MaterialId;
 
 /// Sets voxels. `edits` must be sorted by `node::path_key` with at most one
 /// edit per voxel. Calls `changed` with every edit that changed its voxel and
-/// the material the voxel held before.
+/// the material the voxel held before. Edits whose path meets a region that
+/// is not resident are skipped; returns whether any was. A single edit that
+/// is skipped changes nothing.
 pub(crate) fn set_voxels(
-    store: &mut Store,
+    forest: &mut Forest,
     root: &mut Child,
     edits: &[LocalEdit],
     changed: &mut impl FnMut(LocalEdit, MaterialId),
-) {
+) -> bool {
     debug_assert!(
         edits.windows(2).all(|w| {
             let key = |e: &LocalEdit| super::node::path_key(e.local, TREE_DEPTH);
@@ -48,36 +55,230 @@ pub(crate) fn set_voxels(
         }),
         "voxel edits must be in tree order, one per voxel"
     );
-    let new = Writer { store }.set_voxels(*root, ROOT_LEVEL, edits, changed);
+    // Edits that all fall in one chunk the index knows go straight into it:
+    // the levels above keep their words unless the chunk collapses.
+    if let (Some(first), Some(last)) = (edits.first(), edits.last()) {
+        let key = chunk_key(first.local);
+        if key == chunk_key(last.local)
+            && let Some(id) = forest.indexed_chunk(key)
+        {
+            let mut writer = Writer::new(forest);
+            let result = writer.in_known_chunk(id, first.local, |w, local| {
+                w.set_voxels(local, CHUNK_LEVEL, edits, changed)
+            });
+            if let Some(filled) = result {
+                // Now air or one material: the chunk word above becomes it.
+                graft(forest, root, ROOT_LEVEL, CHUNK_LEVEL, first.local, |_| {
+                    filled
+                });
+            }
+            return false;
+        }
+    }
+    let mut writer = Writer::new(forest);
+    let new = writer.set_voxels(*root, ROOT_LEVEL, edits, changed);
+    let refused = writer.refused;
     if let Some(child) = new {
         *root = child;
     }
+    refused
 }
 
 /// Sets every voxel of `region`. Returns whether anything changed.
 pub(crate) fn fill_box(
-    store: &mut Store,
+    forest: &mut Forest,
     root: &mut Child,
     region: &LocalBox,
     material: MaterialId,
 ) -> bool {
-    let new = Writer { store }.fill(*root, ROOT_LEVEL, [0; 3], region, material);
+    // A box inside one chunk the index knows is filled inside that chunk.
+    let (lo, hi) = region.corners();
+    let key = chunk_key(lo);
+    if key == chunk_key(hi)
+        && let Some(id) = forest.indexed_chunk(key)
+    {
+        let mask = !((1u32 << (2 * (CHUNK_LEVEL + 1))) - 1);
+        let origin = lo.map(|v| v & mask);
+        let mut changed = false;
+        let mut writer = Writer::new(forest);
+        let result = writer.in_known_chunk(id, lo, |w, local| {
+            let new = w.fill(local, CHUNK_LEVEL, origin, region, material);
+            changed = new.is_some();
+            new
+        });
+        if let Some(filled) = result {
+            graft(forest, root, ROOT_LEVEL, CHUNK_LEVEL, lo, |_| filled);
+        }
+        return changed;
+    }
+    let new = Writer::new(forest).fill(*root, ROOT_LEVEL, [0; 3], region, material);
     new.map(|child| *root = child).is_some()
 }
 
-/// Rewrites children through the store. Every method takes a child and the
+/// Rewrites children through the forest. Every method takes a child and the
 /// level its node has (or would have, once split): 1 for a node whose
 /// children are leaf records.
+///
+/// Above [`CHUNK_LEVEL`] the writer works on the top store; a method that
+/// reaches a chunk-level child enters that child's chunk (see
+/// [`in_chunk`](Self::in_chunk)) and works on its store until it returns.
 struct Writer<'a> {
-    store: &'a mut Store,
+    forest: &'a mut Forest,
+    /// The chunk being written, or `None` above the chunk level.
+    chunk: Option<u32>,
+    /// That chunk, checked out of the forest at its first write and put back
+    /// when the writer leaves it.
+    held: Option<Arc<Chunk>>,
+    /// A voxel write met a region that is not resident.
+    refused: bool,
+}
+
+impl<'a> Writer<'a> {
+    fn new(forest: &'a mut Forest) -> Self {
+        Self {
+            forest,
+            chunk: None,
+            held: None,
+            refused: false,
+        }
+    }
 }
 
 impl Writer<'_> {
+    /// The store the writer is working on.
+    #[inline(always)]
+    fn store(&self) -> &Store {
+        if let Some(chunk) = &self.held {
+            return &chunk.store;
+        }
+        match self.chunk {
+            None => &self.forest.top,
+            Some(id) => &self.forest.chunk(id).store,
+        }
+    }
+
+    #[inline(always)]
+    fn store_mut(&mut self) -> &mut Store {
+        let Some(id) = self.chunk else {
+            return &mut self.forest.top;
+        };
+        let held = self.held.get_or_insert_with(|| self.forest.check_out(id));
+        // Unique since check-out: nothing else can clone it meanwhile.
+        &mut Arc::get_mut(held)
+            .expect("a checked-out chunk is unique")
+            .store
+    }
+
+    /// Whether `level` is the chunk level, reached from the top: the child
+    /// there is a chunk id, air, uniform or not resident, and must be entered
+    /// with [`in_chunk`](Self::in_chunk) before it is read or written.
+    fn at_chunk_boundary(&self, level: u32) -> bool {
+        level == CHUNK_LEVEL && self.chunk.is_none()
+    }
+
+    /// Runs `write` on the chunk-level child `child`, holding world-local
+    /// `at`, inside its chunk, with
+    /// the child as the chunk's store sees it. An air or uniform child gets a
+    /// new chunk, which is dropped again unless the write leaves mixed
+    /// content. A result of air, one material or not resident drops the
+    /// chunk. Returns the child the parent should hold, as `write` does.
+    fn in_chunk(
+        &mut self,
+        child: Child,
+        at: [u32; 3],
+        write: impl FnOnce(&mut Self, Child) -> Option<Child>,
+    ) -> Option<Child> {
+        debug_assert!(self.at_chunk_boundary(CHUNK_LEVEL));
+        debug_assert!(
+            child != Child::NotResident,
+            "writes never reach unloaded chunks"
+        );
+        let (id, fresh, local) = match child {
+            Child::Node(id) => (id, false, Child::Node(self.forest.chunk(id).root)),
+            filled => (self.forest.alloc_chunk(), true, filled),
+        };
+        self.chunk = Some(id);
+        let result = write(self, local);
+        self.chunk = None;
+        let held = self.held.take();
+        match result {
+            None => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                if fresh {
+                    self.forest.free_chunk(id);
+                }
+                None
+            }
+            Some(Child::Node(root)) => {
+                let mut chunk = held.unwrap_or_else(|| self.forest.check_out(id));
+                let generation = self.forest.next_generation();
+                let c = Arc::get_mut(&mut chunk).expect("a checked-out chunk is unique");
+                c.root = root;
+                c.generation = generation;
+                self.forest.check_in(id, chunk);
+                self.forest.link(id, chunk_key(at));
+                Some(Child::Node(id))
+            }
+            Some(other) => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                self.forest.free_chunk(id);
+                Some(other)
+            }
+        }
+    }
+
+    /// Runs `write` inside chunk `id`, which the index places at world-local
+    /// `at`, as [`in_chunk`](Self::in_chunk) does for a chunk-level child that
+    /// is a chunk. Returns the content when the chunk is no longer mixed (air
+    /// or one material) and leaves the chunk for the caller to replace, since
+    /// the word above it still names it; `None` otherwise.
+    fn in_known_chunk(
+        &mut self,
+        id: u32,
+        at: [u32; 3],
+        write: impl FnOnce(&mut Self, Child) -> Option<Child>,
+    ) -> Option<Child> {
+        let local = Child::Node(self.forest.chunk(id).root);
+        self.chunk = Some(id);
+        let result = write(self, local);
+        self.chunk = None;
+        let held = self.held.take();
+        match result {
+            None => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                None
+            }
+            Some(Child::Node(root)) => {
+                let mut chunk = held.unwrap_or_else(|| self.forest.check_out(id));
+                let generation = self.forest.next_generation();
+                let c = Arc::get_mut(&mut chunk).expect("a checked-out chunk is unique");
+                c.root = root;
+                c.generation = generation;
+                self.forest.check_in(id, chunk);
+                self.forest.link(id, chunk_key(at));
+                None
+            }
+            Some(filled) => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                Some(filled)
+            }
+        }
+    }
+
     /// The index and contents of the node behind `child`, if it is one.
+    #[inline(always)]
     fn existing(&self, child: Child) -> Option<(u32, Node)> {
         match child {
-            Child::Node(index) => Some((index, self.store.node(index))),
-            Child::Air | Child::Uniform(_) => None,
+            Child::Node(index) => Some((index, self.store().node(index))),
+            Child::Air | Child::Uniform(_) | Child::NotResident => None,
         }
     }
 
@@ -89,27 +290,33 @@ impl Writer<'_> {
         &mut self,
         existing: Option<(u32, Node)>,
         level: u32,
-        packed: Packed<N>,
+        packed: &Packed<N>,
     ) -> Child {
         match (packed, existing) {
-            (Packed::Filled(material), existing) => {
+            (&Packed::Filled(material), existing) => {
                 if let Some((index, node)) = existing {
                     self.release(index, node, level);
                 }
                 Child::filled(material)
             }
+            (&Packed::NotResident, existing) => {
+                if let Some((index, node)) = existing {
+                    self.release(index, node, level);
+                }
+                Child::NotResident
+            }
             (Packed::Node(p), Some((index, old))) => {
-                self.rewrite(index, old, level, p.mask, p.words());
+                self.rewrite(index, old, level, p.mask, p.info, p.words());
                 Child::Node(index)
             }
             (Packed::Node(p), None) => {
-                let base = self.store.alloc_block(p.words());
+                let base = self.store_mut().alloc_block(p.words());
                 let node = Node {
                     mask: p.mask,
                     base,
-                    info: 0,
+                    info: p.info,
                 };
-                Child::Node(self.store.alloc_node(node))
+                Child::Node(self.store_mut().alloc_node(node))
             }
         }
     }
@@ -117,36 +324,40 @@ impl Writer<'_> {
     /// Updates node `index` from `old` to `mask` and `words`, writing only
     /// what differs. A block of the same length is overwritten in place;
     /// otherwise a new block replaces it.
-    fn rewrite(&mut self, index: u32, old: Node, level: u32, mask: u64, words: &[u32]) {
+    fn rewrite(&mut self, index: u32, old: Node, level: u32, mask: u64, info: u32, words: &[u32]) {
         let old_len = old.block_len(level);
         let base = if old_len == words.len() {
-            if self.store.block(old.base, old_len) != words {
-                self.store.write_block(old.base, words);
+            if self.store().block(old.base, old_len) != words {
+                self.store_mut().write_block(old.base, words);
             }
             old.base
         } else {
-            let base = self.store.alloc_block(words);
-            self.store.free_block(old.base, old_len);
+            let base = self.store_mut().alloc_block(words);
+            self.store_mut().free_block(old.base, old_len);
             base
         };
-        let node = Node {
-            mask,
-            base,
-            info: 0,
-        };
+        let node = Node { mask, base, info };
         if node != old {
-            self.store.set_node(index, node);
+            self.store_mut().set_node(index, node);
         }
     }
 
     /// Frees one node and its block, not its children.
     fn release(&mut self, index: u32, node: Node, level: u32) {
-        self.store.free_block(node.base, node.block_len(level));
-        self.store.free_node(index);
+        self.store_mut()
+            .free_block(node.base, node.block_len(level));
+        self.store_mut().free_node(index);
     }
 
-    /// Frees every node and palette block under and including `child`.
+    /// Frees every node and palette block under and including `child`. A
+    /// whole chunk is dropped at once.
     fn free_subtree(&mut self, child: Child, level: u32) {
+        if self.at_chunk_boundary(level) {
+            if let Child::Node(id) = child {
+                self.forest.free_chunk(id);
+            }
+            return;
+        }
         let Some((index, node)) = self.existing(child) else {
             return;
         };

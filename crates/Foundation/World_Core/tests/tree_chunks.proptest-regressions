@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9b2743f05c22c30cb4a48b6c15c5c41a81478020a347a796cd9963138323e956 # shrinks to ops = [Fill { region: VoxelBox { min: VoxelPos { x: 8, y: 8, z: 8 }, end: VoxelPos { x: 9, y: 9, z: 9 } }, material: MaterialId(1) }]
+cc 563d639e94075ad707a83070d8aa3622a618e0a033e3cb77db528210322be1c1 # shrinks to base_ops = [Set(Edit { pos: VoxelPos { x: 32, y: 16, z: 32 }, material: MaterialId(1) })], edits = [Fill { region: VoxelBox { min: VoxelPos { x: 8, y: 8, z: 8 }, end: VoxelPos { x: 33, y: 17, z: 33 } }, material: MaterialId(0) }]

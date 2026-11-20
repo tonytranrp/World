@@ -2,7 +2,7 @@
 
 use xxhash_rust::xxh3::Xxh3;
 
-use super::{TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_UNIFORM, index_bits};
+use super::{TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_NOT_RESIDENT, TAG_UNIFORM, index_bits};
 use crate::tree::{NodeKind, NodeView};
 
 /// Where body bytes go: a buffer when encoding, a hasher for the content hash.
@@ -38,6 +38,7 @@ pub(super) fn child(out: &mut impl Out, node: impl NodeView) {
             }
         }
         NodeKind::Leaf => leaf(out, node),
+        NodeKind::NotResident => out.put(&[TAG_NOT_RESIDENT]),
     }
 }
 

@@ -24,10 +24,19 @@ impl Writer<'_> {
         edits: &[LocalEdit],
         changed: &mut impl FnMut(LocalEdit, MaterialId),
     ) -> Option<Child> {
+        if child == Child::NotResident {
+            self.refused = true;
+            return None;
+        }
         if let Child::Air | Child::Uniform(_) = child
             && edits.iter().all(|e| Child::filled(e.material) == child)
         {
             return None;
+        }
+        if self.at_chunk_boundary(level) {
+            return self.in_chunk(child, edits[0].local, |w, local| {
+                w.set_voxels(local, level, edits, changed)
+            });
         }
         if level == 1 {
             return self.set_leaves(child, edits, changed);
@@ -65,7 +74,7 @@ impl Writer<'_> {
         Some(match children {
             // Every changed child was rebuilt in place: this node's words stand.
             None => child,
-            Some(children) => self.write(existing, level, super::branch::pack(&children)),
+            Some(children) => self.write(existing, level, &super::branch::pack(&children)),
         })
     }
 
@@ -109,7 +118,7 @@ impl Writer<'_> {
         Some(match records {
             // Every changed leaf was rewritten in place: the mask stands.
             None => child,
-            Some(records) => self.write(existing, 1, brick::pack(&records)),
+            Some(records) => self.write(existing, 1, &brick::pack(&records)),
         })
     }
 

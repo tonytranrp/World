@@ -67,8 +67,9 @@ fn one_voxel_is_one_branch_and_one_leaf() {
     assert!(grid.set(VoxelPos::new(105, 101, 115), MaterialId(9)));
     let counts = check_canonical(&grid).unwrap();
     assert_eq!((counts.branches, counts.leaves), (1, 1));
-    // The level-1 root holds one three-word record and no palette.
-    assert_eq!(counts.words, 3);
+    // As the world tree would store it: a brick header and one three-word
+    // record, no palette.
+    assert_eq!(counts.words, 6);
     assert_eq!(
         VoxelSource::get(&grid, VoxelPos::new(105, 101, 115)),
         MaterialId(9)

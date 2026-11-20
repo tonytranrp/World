@@ -4,7 +4,7 @@ use super::pages::Pages;
 use crate::tree::node::{MAX_NODES, Node};
 
 /// Which node slots are in use. The node contents live in the pages.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct NodeSlots {
     /// One past the highest slot ever handed out.
     end: u32,

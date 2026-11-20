@@ -18,6 +18,7 @@ mod pages;
 use blocks::WordBlocks;
 use nodes::NodeSlots;
 use pages::{PageReader, Pages};
+use std::sync::Arc;
 
 use super::TreeStats;
 use super::node::{MAX_BLOCK_LEN, Node};
@@ -78,16 +79,6 @@ impl Storage {
         }
     }
 
-    /// Every node page in order; page `i` holds nodes from `i * NODE_PAGE_LEN`.
-    pub fn node_pages(&self) -> impl Iterator<Item = &[Node]> {
-        self.nodes.pages()
-    }
-
-    /// Every word page in order; page `i` holds words from `i * WORD_PAGE_LEN`.
-    pub fn word_pages(&self) -> impl Iterator<Item = &[u32]> {
-        self.words.pages()
-    }
-
     /// Whether both hold the very same page directories: nothing was written
     /// or added between them.
     #[cfg(test)]
@@ -130,11 +121,15 @@ impl<'a> StorageReader<'a> {
 }
 
 /// The writer's arenas: storage plus free lists and live counts.
-#[derive(Default)]
+///
+/// The free lists sit behind `Arc`s too, so the first write after a snapshot
+/// copies them only if it allocates or frees: a write in place copies one
+/// page and nothing else.
+#[derive(Clone, Default)]
 pub(crate) struct Store {
     storage: Storage,
-    nodes: NodeSlots,
-    blocks: WordBlocks,
+    nodes: Arc<NodeSlots>,
+    blocks: Arc<WordBlocks>,
     /// Live leaves: records that are neither air nor uniform.
     leaves: usize,
 }
@@ -158,7 +153,7 @@ impl Store {
 
     /// Stores a new node and returns its index.
     pub fn alloc_node(&mut self, node: Node) -> u32 {
-        let index = self.nodes.alloc(&mut self.storage.nodes);
+        let index = Arc::make_mut(&mut self.nodes).alloc(&mut self.storage.nodes);
         self.set_node(index, node);
         index
     }
@@ -169,12 +164,12 @@ impl Store {
     }
 
     pub fn free_node(&mut self, index: u32) {
-        self.nodes.free(index);
+        Arc::make_mut(&mut self.nodes).free(index);
     }
 
     /// Stores a new block of 1 to 192 words and returns its base.
     pub fn alloc_block(&mut self, words: &[u32]) -> u32 {
-        let base = self.blocks.alloc(words.len(), &mut self.storage.words);
+        let base = Arc::make_mut(&mut self.blocks).alloc(words.len(), &mut self.storage.words);
         self.write_block(base, words);
         base
     }
@@ -188,7 +183,7 @@ impl Store {
     }
 
     pub fn free_block(&mut self, base: u32, len: usize) {
-        self.blocks.free(base, len);
+        Arc::make_mut(&mut self.blocks).free(base, len);
     }
 
     /// Counts a leaf in or out: `was` and `is` say whether the record that
@@ -208,6 +203,7 @@ impl Store {
             words: self.blocks.live_words(),
             free_nodes: self.nodes.free_count(),
             free_words: self.blocks.free_words(),
+            chunks: 0,
             bytes: self.storage.nodes.page_count() * NODE_PAGE_LEN * size_of::<Node>()
                 + self.storage.words.page_count() * WORD_PAGE_LEN * size_of::<u32>(),
         }

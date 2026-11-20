@@ -32,7 +32,7 @@ fn live(tree: &VoxelTree) -> (usize, usize, usize) {
 fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
     fn walk(node: NodeRef<'_>, level: u32, found: &mut (usize, usize, usize)) {
         match node {
-            NodeRef::Air => {}
+            NodeRef::Air | NodeRef::NotResident => {}
             NodeRef::Uniform(m) => assert!(!m.is_air(), "a uniform child is never air"),
             NodeRef::Branch(b) => {
                 assert_eq!(b.level(), level);
@@ -50,9 +50,31 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                     "a branch of one material must be a uniform child"
                 );
                 found.0 += 1;
-                // One child word each, or one leaf record each at level 1.
-                let per_child = if level == 1 { RECORD_WORDS } else { 1 };
-                found.2 += per_child * children.len();
+                if let Some((header, stored)) = b.brick_layout() {
+                    // A header, and a record for every leaf but the full ones
+                    // of the default material: the most common full material.
+                    let mut counts = std::collections::BTreeMap::new();
+                    for (_, c) in &children {
+                        if let NodeRef::Uniform(m) = c {
+                            *counts.entry(*m).or_insert(0usize) += 1;
+                        }
+                    }
+                    let best = counts
+                        .iter()
+                        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                        .map(|(&m, &n)| (m, n));
+                    match best {
+                        Some((m, n)) => {
+                            assert_eq!(header.default, m, "the most common full leaf");
+                            assert_eq!(header.full.count_ones() as usize, n);
+                        }
+                        None => assert_eq!(header, Default::default()),
+                    }
+                    assert_eq!(stored, children.len() - header.full.count_ones() as usize);
+                    found.2 += 3 + RECORD_WORDS * stored;
+                } else {
+                    found.2 += children.len();
+                }
                 for (slot, child) in children {
                     assert!(b.mask() & (1 << slot) != 0);
                     assert!(!matches!(child, NodeRef::Air));
@@ -172,7 +194,7 @@ fn refused_edits_change_nothing_and_copy_nothing() {
 
     assert_eq!(tree.get(pos(1, 1, 1)), STONE, "the batch applied nothing");
     assert_eq!(tree.stats(), stats);
-    assert!(tree.store.storage().shares_everything_with(&before.storage));
+    assert!(tree.shares_everything_with(&before));
 }
 
 #[test]
@@ -199,7 +221,7 @@ fn writes_that_change_nothing_copy_and_report_nothing() {
     assert!(tree.apply(&no_ops).unwrap().is_empty());
 
     assert_eq!(tree.stats(), stats);
-    assert!(tree.store.storage().shares_everything_with(&before.storage));
+    assert!(tree.shares_everything_with(&before));
 }
 
 #[test]
@@ -258,10 +280,15 @@ fn clearing_a_region_returns_every_node_and_word() {
     assert!(matches!(tree.root(), NodeRef::Air));
     assert_eq!(live(&tree), (0, 0, 0));
     let cleared = tree.stats();
-    // Leaves live in their parents' blocks, so only branches were nodes.
-    assert_eq!(cleared.free_nodes, grown.branches + grown.free_nodes);
-    assert_eq!(cleared.free_words, grown.words + grown.free_words);
-    assert_eq!(cleared.bytes, grown.bytes, "freeing keeps the pages");
+    // Every chunk went with its region, pages and all; only the top store's
+    // pages remain, its nodes back on the free list.
+    assert!(grown.chunks > 0);
+    assert_eq!(cleared.chunks, 0);
+    assert!(
+        cleared.bytes < grown.bytes,
+        "dropping chunks returns their pages"
+    );
+    assert!(cleared.free_nodes <= grown.branches + grown.free_nodes);
 }
 
 #[test]
@@ -409,7 +436,8 @@ fn a_single_material_leaf_is_one_three_word_record() {
     tree.set(pos(4, 0, 0), STONE).unwrap();
     tree.set(pos(5, 1, 0), STONE).unwrap();
     assert_eq!(live_bytes(&tree) - one, 12);
-    assert_eq!(live(&tree), (9, 2, 8 + 2 * RECORD_WORDS));
+    // Level 2 and up: eight child words; the brick: a header and two records.
+    assert_eq!(live(&tree), (9, 2, 8 + 3 + 2 * RECORD_WORDS));
 
     let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
         panic!("a partly solid leaf");
@@ -910,37 +938,4 @@ proptest! {
         prop_assert!(!same_content(&grid, &tree));
         prop_assert!(same_content(&grid, &grid.clone()));
     }
-}
-
-#[test]
-fn snapshot_pages_expose_the_raw_layout_without_copying() {
-    let mut tree = VoxelTree::new();
-    assert_eq!(tree.snapshot().root_word(), None);
-    tree.set(pos(1, 2, 3), STONE).unwrap();
-    tree.set(pos(-100, 50, 7), DIRT).unwrap();
-    let snap = tree.snapshot();
-
-    let nodes: Vec<(usize, &[Node])> = snap.node_pages().collect();
-    let words: Vec<(usize, &[u32])> = snap.word_pages().collect();
-    assert_eq!((nodes.len(), words.len()), (1, 1));
-    assert_eq!((nodes[0].0, words[0].0), (0, 0));
-    assert_eq!(nodes[0].1.len(), NODE_PAGE_LEN);
-    assert_eq!(words[0].1.len(), WORD_PAGE_LEN);
-    let bytes: &[u8] = bytemuck::cast_slice(nodes[0].1);
-    assert_eq!(bytes.len(), NODE_PAGE_LEN * 16);
-
-    // The root word leads to the node a reader sees.
-    let root = snap.root_word().unwrap();
-    assert_eq!(root & UNIFORM_BIT, 0);
-    let node = nodes[0].1[root as usize];
-    let NodeRef::Branch(b) = snap.root() else {
-        panic!("two voxels need a root branch");
-    };
-    assert_eq!(node.mask, b.mask());
-    assert_eq!(node.info, 0);
-    let first = words[0].1[node.base as usize];
-    assert_eq!(first & UNIFORM_BIT, 0, "the root's children are nodes");
-
-    tree.fill_box(VoxelBox::WORLD, STONE).unwrap();
-    assert_eq!(tree.snapshot().root_word(), Some(UNIFORM_BIT | 1));
 }

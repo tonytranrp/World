@@ -26,6 +26,7 @@
 //! | 1   | uniform | material id, `u16`, not 0                                 |
 //! | 2   | branch  | mask, `u64`, not 0; then each child whose mask bit is set, in ascending slot order |
 //! | 3   | leaf    | mask, `u64`, not 0; palette length `p`, `u8`; `p` material ids, `u16`; packed indices |
+//! | 4   | not resident | none. Only where a node at the chunk level or above would stand (decision 0006) |
 //!
 //! The root child stands where a level `TREE_DEPTH - 1` node would; the
 //! children of a level-`L` branch stand where level `L - 1` nodes would. A
@@ -41,8 +42,9 @@
 //!
 //! The body must be canonical, exactly as the tree is: no branch or leaf whose
 //! voxels are all one material (a full mask of identical uniform children, or
-//! a full leaf with one palette entry), every palette entry used by some
-//! voxel, and no bytes after the root. Equal content therefore has exactly one
+//! a full leaf with one palette entry), no branch whose children are all not
+//! resident, every palette entry used by some voxel, and no bytes after the
+//! root. Tag 4 was added before any save existed, so it shares version 1. Equal content therefore has exactly one
 //! encoding, and the xxh3-64 of the body is the [`content_hash`].
 //!
 //! # Decoding
@@ -51,7 +53,10 @@
 //! before it builds anything, so a rejected input never costs more than one
 //! pass over its own bytes. It allocates nothing but the tree it returns.
 
+pub mod codec;
 mod read;
+pub mod region;
+pub mod wal;
 mod write;
 
 use std::fmt;
@@ -80,6 +85,7 @@ const TAG_AIR: u8 = 0;
 const TAG_UNIFORM: u8 = 1;
 const TAG_BRANCH: u8 = 2;
 const TAG_LEAF: u8 = 3;
+const TAG_NOT_RESIDENT: u8 = 4;
 
 /// Encodes a tree. The same content always gives the same bytes.
 pub fn encode(tree: &impl TreeRead) -> Vec<u8> {
@@ -101,11 +107,9 @@ pub fn encode(tree: &impl TreeRead) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Result<VoxelTree, DecodeError> {
     let body = unseal(bytes)?;
     read::body(body, &mut read::Validate)?;
-    // A faster bulk build can replace the per-voxel writes later; the body is
-    // already known to be valid, so this pass cannot fail.
-    let mut tree = VoxelTree::new();
-    read::body(body, &mut tree)?;
-    Ok(tree)
+    // The body is known to be valid, so the build pass cannot fail; it
+    // writes each leaf and node once, bottom-up.
+    VoxelTree::build_with(|builder| read::body(body, &mut read::TreeBuild { builder }))
 }
 
 /// A hash of the tree's content, stable across machines and versions of this

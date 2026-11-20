@@ -1,9 +1,12 @@
-//! Composite, version 0: the sky.
+//! Composite: voxels, then the sky.
 //!
-//! The voxel passes do not exist yet, so there is no G-buffer depth to tell
-//! sky from surface. Until they land, composite paints the procedural sky over
-//! the view, blended by `strength`. The shader is a WESL asset that imports a
-//! shared sky module, so editing either file hot-reloads the pass.
+//! `voxel` draws the primary hits into the view's colour and depth right
+//! after Bevy's opaque pass, marking covered pixels with alpha 0. The sky is
+//! a post-process blended by `strength` times the pixel's alpha, so it fills
+//! only what no voxel covered. Both shaders are WESL assets; editing them
+//! (or the shared modules they import) hot-reloads the passes.
+
+pub mod voxel;
 
 use bevy::core_pipeline::fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin};
 use bevy::prelude::*;

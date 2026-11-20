@@ -13,15 +13,19 @@ dev_tools = ["dep:bevy_egui", "dep:bevy-inspector-egui"]
 
 [dependencies]
 world_core.workspace = true
+world_gen.workspace = true
+world_cpu_ref.workspace = true
 world_render.workspace = true
 world_reload.workspace = true
 bevy.workspace = true
+serde.workspace = true
 bevy_egui = { workspace = true, optional = true }
 bevy-inspector-egui = { workspace = true, optional = true }
 
 [dev-dependencies]
+world_testkit.workspace = true
 world_testkit_bevy.workspace = true
-serde.workspace = true
+ron.workspace = true
 
 [lints]
 workspace = true

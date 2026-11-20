@@ -42,6 +42,12 @@ serde = { version = "1", features = ["derive"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 # Must match the ron that Bevy itself uses, so there is one RON parser.
 ron = "0.12"
+# Brick pool sub-allocation (decision 0007). Safe Rust, already in the lockfile
+# through Bevy; keep the exact version Bevy resolves.
+offset-allocator = "=0.2.0"
+# The WESL compiler Bevy uses, for tests and benches that build World_Render's
+# shaders on a bare wgpu device. Keep the exact version Bevy resolves.
+wesl = "=0.6.0"
 
 # Developer tools, only in dev builds
 bevy_egui = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
@@ -50,6 +56,11 @@ bevy-inspector-egui = { version = "0.38.0", default-features = false, features =
 # Testing engine
 proptest = "1.12"
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+# Chunk compression (decision 0006): LZ4 for the warm in-RAM tier, pure-Rust
+# zstd (already in the lockfile through Bevy) for region files. Safe modes
+# only; lz4_flex 0.12.1 fixed RUSTSEC-2026-0041.
+lz4_flex = { version = "0.12.1", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
 serde_json = "1"
