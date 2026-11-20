@@ -236,8 +236,14 @@ impl Caves {
         let scale = 1.0 / (1 << COARSE_SHIFT) as f32;
         let t = (di as f32 * scale, dj as f32 * scale, dk as f32 * scale);
         let field = |n: usize| trilerp(&std::array::from_fn(|c| corners[c][n]), t);
-        let tunnel = field(0).abs().max(field(1).abs()) - self.tunnel_radius;
-        let cavern = self.cavern_threshold - field(2);
+        self.combine([field(0), field(1), field(2)])
+    }
+
+    /// The cave value from the three upsampled fields `(a, b, c)`.
+    #[inline]
+    fn combine(&self, [a, b, c]: [f32; 3]) -> f32 {
+        let tunnel = a.abs().max(b.abs()) - self.tunnel_radius;
+        let cavern = self.cavern_threshold - c;
         tunnel.min(cavern)
     }
 
@@ -328,29 +334,54 @@ impl Caves {
                 }
             }
         }
+        // Upsampling, one axis at a time: each lattice value goes through
+        // `upsample`'s lerps in its order (x, then y, then z), but a lerp
+        // along x is shared by every lattice point with the same x and
+        // coarse row, and one along y by every point with the same x and y.
         let n = CELLS + 1;
         let mask = (1 << COARSE_SHIFT) - 1;
-        let mut lattice = Vec::with_capacity(n * (rows + 1) * n);
-        for k in 0..n {
-            let gz = gk + k as i32;
-            for j in 0..=rows {
-                let gy = gj + j as i32;
-                for i in 0..n {
-                    let gx = gi + i as i32;
-                    let (oi, oj, ok) = (
-                        ((gx >> COARSE_SHIFT) - ci) as usize,
-                        ((gy >> COARSE_SHIFT) - cj) as usize,
-                        ((gz >> COARSE_SHIFT) - ck) as usize,
-                    );
-                    let corners: [[f32; 3]; 8] = std::array::from_fn(|c| {
-                        let (dx, dy, dz) = corner(c);
-                        let at =
-                            ((ok + dz as usize) * cy + oj + dy as usize) * cx + oi + dx as usize;
-                        coarse[at]
-                    });
-                    lattice.push(self.upsample(&corners, (gx & mask, gy & mask, gz & mask)));
-                }
+        let scale = 1.0 / (1 << COARSE_SHIFT) as f32;
+        // Per lattice index on an axis: its coarse cell and position in it.
+        let axis = |g0: i32, c0: i32, count: usize| -> Vec<(usize, f32)> {
+            (0..count)
+                .map(|i| {
+                    let g = g0 + i as i32;
+                    (
+                        ((g >> COARSE_SHIFT) - c0) as usize,
+                        (g & mask) as f32 * scale,
+                    )
+                })
+                .collect()
+        };
+        let (xs, ys, zs) = (axis(gi, ci, n), axis(gj, cj, rows + 1), axis(gk, ck, n));
+        let lerp3 = |t: f32, a: &[f32; 3], b: &[f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|f| a[f] + t * (b[f] - a[f]))
+        };
+        // Along x, on every coarse row: `[k][j][i]` for coarse `k`, `j`.
+        let mut along_x = Vec::with_capacity(cz * cy * n);
+        for row in coarse.chunks_exact(cx) {
+            along_x.extend(xs.iter().map(|&(o, t)| lerp3(t, &row[o], &row[o + 1])));
+        }
+        // Then along y: `[k][j][i]` for coarse `k`, lattice `j`.
+        let mut along_y = Vec::with_capacity(cz * (rows + 1) * n);
+        for k in 0..cz {
+            for &(o, t) in &ys {
+                let low = &along_x[(k * cy + o) * n..][..n];
+                let high = &along_x[(k * cy + o + 1) * n..][..n];
+                along_y.extend(low.iter().zip(high).map(|(a, b)| lerp3(t, a, b)));
             }
+        }
+        // Then along z, combined into the cave value.
+        let mut lattice = Vec::with_capacity(n * (rows + 1) * n);
+        let slab = (rows + 1) * n;
+        for &(o, t) in &zs {
+            let low = &along_y[o * slab..][..slab];
+            let high = &along_y[(o + 1) * slab..][..slab];
+            lattice.extend(
+                low.iter()
+                    .zip(high)
+                    .map(|(a, b)| self.combine(lerp3(t, a, b))),
+            );
         }
         let mut grid = CaveGrid {
             origin: min,
@@ -760,6 +791,41 @@ mod tests {
             let p = VoxelPos::new(v(), v(), v());
             let f = trilinear(&c, p);
             assert!((-1.0..=1.0).contains(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn grid_values_are_the_lattice_values_bit_for_bit() {
+        let caves = caves();
+        // A chunk inside the band and one cut by its top (fewer rows).
+        for (chunk, max_height) in [
+            (ChunkCoord::new(511, 506, 513).unwrap(), i32::MAX / 2),
+            (ChunkCoord::new(517, 512, 509).unwrap(), 600),
+        ] {
+            let grid = caves.grid(chunk, max_height).unwrap();
+            let min = chunk.min_voxel();
+            let (gi, gj, gk) = (
+                min.x >> CAVE_CELL_SHIFT,
+                (min.y >> CAVE_CELL_SHIFT) + grid.first as i32,
+                min.z >> CAVE_CELL_SHIFT,
+            );
+            let mut s = crate::noise::Stream::new(9);
+            let mut pick = |n: usize| (s.next_u64() % n as u64) as usize;
+            for step in 0..4_000 {
+                // Every corner and edge of the lattice, then random points.
+                let (i, j, k) = if step < 8 {
+                    let c = corner(step);
+                    (
+                        c.0 as usize * CELLS,
+                        c.1 as usize * grid.rows,
+                        c.2 as usize * CELLS,
+                    )
+                } else {
+                    (pick(CELLS + 1), pick(grid.rows + 1), pick(CELLS + 1))
+                };
+                let want = caves.lattice_value(gi + i as i32, gj + j as i32, gk + k as i32);
+                assert_eq!(grid.at(i, j, k).to_bits(), want.to_bits(), "{i} {j} {k}");
+            }
         }
     }
 
