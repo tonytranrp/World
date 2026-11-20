@@ -9,6 +9,7 @@
 //!
 //! The device and tier are decided once; changing them needs a restart.
 
+mod awake;
 mod frame_stats;
 #[cfg(feature = "hotpatch")]
 mod hot_probe;
@@ -124,6 +125,10 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
         // Automated runs (benchmarks, screenshots, CI) must not depend on
         // window focus: Bevy's default lets an unfocused window wait on a
         // timer, which macOS App Nap stretches to seconds in the background.
+        // Continuous updates are not enough when the window cannot be seen
+        // at all (behind others, or the screen locked): App Nap then lowers
+        // the whole process's priority and its frames slow by ten times.
+        awake::stay_out_of_app_nap();
         app.insert_resource(bevy::winit::WinitSettings::continuous())
             .insert_resource(ExitAfter(frames))
             .insert_resource(frame_stats::FrameTimes {
