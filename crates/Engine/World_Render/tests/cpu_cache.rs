@@ -422,7 +422,15 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
     let mut union = Selection::default();
     let mut frames = 0;
     loop {
-        let s = select_budgeted(&res, &mut walk, &view, &lod, lod.max_visits_per_frame, true);
+        let s = select_budgeted(
+            &res,
+            &mut walk,
+            &view,
+            &lod,
+            1.0,
+            lod.max_visits_per_frame,
+            true,
+        );
         union.collapse.extend(s.collapse);
         union.evict.extend(s.evict);
         union.expand.extend(s.expand);
@@ -490,6 +498,73 @@ fn stage_one_refines_the_debug_scene_from_the_default_camera() {
     assert!(stats.bricks > 500, "{stats:?}");
     let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
     assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+}
+
+/// A node pool too small for the view's full detail: stage 1 raises its
+/// detail threshold until the pool stops refusing expansions, keeps the pool
+/// below full, and the result stays consistent. With room, it never does.
+#[test]
+fn a_full_node_pool_makes_stage_one_settle_for_less_detail() {
+    use world_render::internals::layout::PoolLayout;
+    use world_render::internals::residency::Residency;
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let run = |layout: PoolLayout| {
+        let mut res = Residency::new(shape, &layout).expect("node space");
+        let mut pools = world_render::internals::batch::CpuPools::new(
+            layout.node_count,
+            &layout.segments,
+            layout.brick_ids,
+        );
+        let mut batch = UploadBatch::default();
+        let mut refused_late = 0;
+        for frame in 1..=120 {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 24 << 20,
+                victim_capacity: 64,
+            };
+            let report = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if frame > 100 {
+                refused_late += report.refused_nodes;
+            }
+        }
+        let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+        (
+            res.pressure(),
+            res.node_fill(),
+            refused_late,
+            res.stats().bricks,
+        )
+    };
+    let roomy = run(common::small_layout());
+    assert_eq!(roomy.0, 1.0, "no pressure with room: {roomy:?}");
+    let tight = run(PoolLayout {
+        node_count: 5 << 9,
+        node_groups: 5 << 7,
+        ..common::small_layout()
+    });
+    assert!(
+        tight.0 > 1.0,
+        "the small pool raised the threshold: {tight:?}"
+    );
+    assert_eq!(tight.2, 0, "no refusals once settled: {tight:?}");
+    assert!(tight.3 > 0, "still shows detail: {tight:?}");
 }
 
 #[test]

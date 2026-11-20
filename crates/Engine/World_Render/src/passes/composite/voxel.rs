@@ -194,7 +194,7 @@ pub fn prepare_material_colors(
 pub struct VoxelCompositeView {
     pipeline: CachedRenderPipelineId,
     bind_group: wgpu::BindGroup,
-    key: (u64, u64, u32),
+    key: (u64, u64, u32, UVec2),
     _params: wgpu::Buffer,
 }
 
@@ -220,7 +220,12 @@ pub fn prepare_composite(
     for (entity, view, targets, msaa, existing) in &views {
         let samples = msaa.map_or(1, Msaa::samples);
         let id = pipeline.variant(&cache, view.target_format, samples);
-        let key = (targets.generation, colors.generation, colors.count);
+        let key = (
+            targets.generation,
+            colors.generation,
+            colors.count,
+            targets.viewport,
+        );
         if let Some(e) = existing
             && e.key == key
             && e.pipeline == id
@@ -229,11 +234,20 @@ pub fn prepare_composite(
         }
         let params = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite.voxel_params"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let p = [targets.size.x, targets.size.y, colors.count, 0u32];
+        let p = [
+            targets.size.x,
+            targets.size.y,
+            colors.count,
+            0u32,
+            targets.viewport.x,
+            targets.viewport.y,
+            0,
+            0,
+        ];
         queue.write_buffer(&params, 0, bytemuck::cast_slice(&p));
         let layout = cache.get_bind_group_layout(&pipeline.layout);
         let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {

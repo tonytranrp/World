@@ -23,6 +23,31 @@ use crate::brick_cache::feedback::{Request, Victim};
 /// whatever its distance.
 pub const REQUEST_HOLD_FRAMES: u32 = 60;
 
+/// Node pool fill below which stage 1 asks for more detail again.
+pub const PRESSURE_LOW: f32 = 0.80;
+/// Frames after a rise before the pressure may fall, so a rise's collapses
+/// settle instead of being undone at once.
+pub const PRESSURE_COOLDOWN_FRAMES: u32 = 120;
+/// The most stage 1 may raise its node detail threshold.
+pub const PRESSURE_MAX: f32 = 64.0;
+
+/// The next pressure multiplier: up 25% when the node pool refused an
+/// expansion; down 5% when the pool is emptier than [`PRESSURE_LOW`] and no
+/// rise happened in the last [`PRESSURE_COOLDOWN_FRAMES`]; unchanged
+/// otherwise. Pressure raises the detail threshold of nodes (levels 2 and
+/// up), so the shrink walk collapses the farthest expanded nodes, freeing
+/// records for nearer ones, and stage 1 stops asking for expansions the pool
+/// cannot hold. A full pool that refuses nothing is left alone.
+pub fn adapt_pressure(pressure: f32, node_fill: f32, refused: bool, frames_since_rise: u32) -> f32 {
+    if refused {
+        (pressure * 1.25).min(PRESSURE_MAX)
+    } else if node_fill < PRESSURE_LOW && frames_since_rise >= PRESSURE_COOLDOWN_FRAMES {
+        (pressure / 1.05).max(1.0)
+    } else {
+        pressure
+    }
+}
+
 /// What one frame gets to work with.
 pub struct FrameInput<'a, S: VoxelSource> {
     pub source: &'a S,
@@ -50,6 +75,8 @@ pub struct FrameReport {
     pub evicted: u32,
     pub victims_applied: u32,
     pub refused_full: u32,
+    /// Expansions the node pool refused.
+    pub refused_nodes: u32,
     /// Bytes of the serialized upload.
     pub upload_bytes: u64,
     /// Victims to ask the eviction pass for, if it should run.
@@ -81,13 +108,20 @@ pub fn run_frame<S: VoxelSource + Sync>(
     let budget = input.budget.max(1);
     let mean = u64::from(input.config.mean_brick_bytes);
 
-    // Stage work, decided before edits so their reserve is known.
+    // Stage work, decided before edits so their reserve is known. Under node
+    // pool pressure stage 1 asks for coarser nodes.
     let lod = &input.config.lod;
     let selection = match input.view {
         Some(view) => {
             let grow = res.growth().due(&view, lod.regrow_voxels);
+            let visits = if res.take_full_shrink() {
+                u32::MAX
+            } else {
+                lod.max_visits_per_frame
+            };
             let mut walk = res.take_walk();
-            let s = select_budgeted(res, &mut walk, &view, lod, lod.max_visits_per_frame, grow);
+            let pressure = res.pressure();
+            let s = select_budgeted(res, &mut walk, &view, lod, pressure, visits, grow);
             res.put_walk(walk);
             if grow {
                 res.growth().ran(view);
@@ -175,7 +209,10 @@ pub fn run_frame<S: VoxelSource + Sync>(
         }
         match res.expand(source, k, batch) {
             Ok(_) => report.expanded += 1,
-            Err(Refused::PoolFull) => report.refused_full += 1,
+            Err(Refused::PoolFull) => {
+                report.refused_full += 1;
+                report.refused_nodes += 1;
+            }
             Err(_) => {}
         }
     }
@@ -193,6 +230,18 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
 
     report.upload_bytes = cost(batch);
+    if input.config.stage == Stage::Distance {
+        let before = res.pressure();
+        let since = input.frame.wrapping_sub(res.pressure_raised_at());
+        let after = adapt_pressure(before, res.node_fill(), report.refused_nodes > 0, since);
+        if after != before {
+            if after > before {
+                res.set_pressure_raised_at(input.frame);
+            }
+            res.set_pressure(after);
+            res.growth().changed();
+        }
+    }
     // Anything that changed the table can change what growth finds; edits
     // rewrite records even when no brick is uploaded.
     if !dirty.is_empty()
@@ -221,4 +270,42 @@ pub fn run_frame<S: VoxelSource + Sync>(
             .then_some((bricks as u32 / 20).clamp(1, input.victim_capacity))
     });
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressure_rises_on_refusals_and_falls_after_a_cooldown_when_drained() {
+        let settled = PRESSURE_COOLDOWN_FRAMES;
+        assert_eq!(adapt_pressure(1.0, 0.5, false, settled), 1.0);
+        assert_eq!(
+            adapt_pressure(1.0, 0.99, false, settled),
+            1.0,
+            "full, refusing nothing"
+        );
+        assert_eq!(
+            adapt_pressure(2.0, 0.5, true, 0),
+            2.5,
+            "a refusal raises it"
+        );
+        assert_eq!(
+            adapt_pressure(4.0, 0.9, false, settled),
+            4.0,
+            "held above the low mark"
+        );
+        assert_eq!(
+            adapt_pressure(4.0, 0.5, false, 3),
+            4.0,
+            "held during the cooldown"
+        );
+        assert!(adapt_pressure(4.0, 0.5, false, settled) < 4.0);
+        assert_eq!(
+            adapt_pressure(1.01, 0.1, false, settled),
+            1.0,
+            "never below 1"
+        );
+        assert_eq!(adapt_pressure(PRESSURE_MAX, 1.0, true, 0), PRESSURE_MAX);
+    }
 }

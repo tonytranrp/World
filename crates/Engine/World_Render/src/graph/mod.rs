@@ -28,9 +28,9 @@ use world_reload::AppConfigExt;
 
 use crate::brick_cache::config::BrickCacheConfig;
 use crate::brick_cache::render::{
-    CacheViewPoint, ExtractedCacheConfig, PendingFeed, advance_frame, copy_feedback, extract_feed,
-    init_brick_cache, init_cache_pipelines, log_cache_stats, map_feedback, run_brick_cache,
-    update_view_point,
+    CacheConfigReady, CacheViewPoint, ExtractedCacheConfig, PendingFeed, advance_frame,
+    copy_feedback, extract_feed, init_brick_cache, init_cache_pipelines, log_cache_stats,
+    map_feedback, run_brick_cache, update_view_point,
 };
 use crate::brick_cache::stream::feed::VoxelWorldFeed;
 use crate::debug::{start_debug_scene, update_debug_scene};
@@ -53,6 +53,7 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
         .insert_resource(tier.clone())
         .init_resource::<PendingFeed>()
         .init_resource::<ExtractedCacheConfig>()
+        .init_resource::<CacheConfigReady>()
         .init_resource::<CacheViewPoint>()
         .init_resource::<MaterialColors>()
         .add_systems(ExtractSchedule, (extract_feed, extract_material_colors))

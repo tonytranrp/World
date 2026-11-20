@@ -1,4 +1,6 @@
 // Composite v1: voxel hit records to colour and depth.
+// The trace may run below the viewport's size (the profile's internal
+// resolution); each screen pixel reads the traced pixel under it.
 // Material colour times a fixed light per face; coarse hits (from the pixel
 // footprint or a missing brick) are drawn the same way with their cell's
 // representative material. Covered pixels get alpha 0, which tells the sky
@@ -8,8 +10,10 @@ import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 import package::shaders::common::format::{HIT_WORDS, HIT_FLAG_HIT};
 
 struct CompositeParams {
-    // Width, height, material count, unused.
+    // Traced width, height, material count, unused.
     size: vec4<u32>,
+    // Viewport width, height, unused, unused.
+    viewport: vec4<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> hits: array<u32>;
@@ -36,10 +40,11 @@ fn face_light(face: u32) -> f32 {
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> CompositeOutput {
-    let pixel = vec2<u32>(in.position.xy);
-    if pixel.x >= params.size.x || pixel.y >= params.size.y {
+    let screen = vec2<u32>(in.position.xy);
+    if screen.x >= params.viewport.x || screen.y >= params.viewport.y {
         discard;
     }
+    let pixel = min(screen * params.size.xy / params.viewport.xy, params.size.xy - 1u);
     let i = (pixel.y * params.size.x + pixel.x) * HIT_WORDS;
     let packed = hits[i + 3u];
     let flags = packed >> 24u;

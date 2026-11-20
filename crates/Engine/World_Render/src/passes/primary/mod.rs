@@ -14,6 +14,7 @@ use bevy::render::view::ExtractedView;
 
 use crate::brick_cache::render::{BrickCacheState, ExtractedCacheConfig, VOXELS_PER_METER};
 use crate::gbuffer::HIT_WORDS;
+use crate::tier::RenderTier;
 use trace::{
     DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, record_trace, trace_bind_group,
     trace_layout_entries,
@@ -47,13 +48,33 @@ pub fn init_trace_pipeline(
     commands.insert_resource(TracePipeline { layout, id });
 }
 
+/// The size a view is traced at: the viewport, scaled down (keeping its
+/// aspect) so its height is at most the profile's internal height. The
+/// composite stretches the result over the viewport.
+pub fn trace_size(viewport: UVec2, internal: Option<UVec2>) -> UVec2 {
+    let viewport = viewport.max(UVec2::ONE);
+    let Some(internal) = internal else {
+        return viewport;
+    };
+    let height = internal.y.max(1);
+    if viewport.y <= height {
+        return viewport;
+    }
+    let width = (u64::from(viewport.x) * u64::from(height) + u64::from(viewport.y) / 2)
+        / u64::from(viewport.y);
+    UVec2::new((width as u32).max(1), height)
+}
+
 /// One view's hit records, parameters and bind group.
 #[derive(Component)]
 pub struct VoxelViewTargets {
-    /// The G-buffer: [`HIT_WORDS`] words per pixel.
+    /// The G-buffer: [`HIT_WORDS`] words per traced pixel.
     pub hits: wgpu::Buffer,
     pub params: wgpu::Buffer,
+    /// The traced size (see [`trace_size`]).
     pub size: UVec2,
+    /// The viewport the trace is stretched over.
+    pub viewport: UVec2,
     pub bind_group: wgpu::BindGroup,
     /// Changes whenever `hits` is replaced, so dependents rebuild.
     pub generation: u64,
@@ -76,6 +97,7 @@ pub fn prepare_view_targets(
     pipeline: Option<Res<TracePipeline>>,
     cache: Res<PipelineCache>,
     config: Res<ExtractedCacheConfig>,
+    tier: Option<Res<RenderTier>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut generation: Local<u64>,
@@ -85,7 +107,9 @@ pub fn prepare_view_targets(
     };
     let wgpu_device = device.wgpu_device();
     for (entity, view, targets) in &mut views {
-        let size = UVec2::new(view.viewport.z.max(1), view.viewport.w.max(1));
+        let viewport = UVec2::new(view.viewport.z.max(1), view.viewport.w.max(1));
+        let internal = tier.as_ref().map(|t| t.budgets.internal_resolution);
+        let size = trace_size(viewport, internal);
         let clip_from_world = view
             .clip_from_world
             .unwrap_or_else(|| view.clip_from_view * view.world_from_view.to_matrix().inverse());
@@ -113,8 +137,11 @@ pub fn prepare_view_targets(
             ],
         };
         match targets {
-            Some(t) if t.size == size => {
+            Some(mut t) if t.size == size => {
                 queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&params));
+                if t.viewport != viewport {
+                    t.viewport = viewport;
+                }
             }
             _ => {
                 let hits = hits_buffer(wgpu_device, size);
@@ -133,6 +160,7 @@ pub fn prepare_view_targets(
                     hits,
                     params: params_buf,
                     size,
+                    viewport,
                     bind_group,
                     generation: *generation,
                 });
@@ -160,4 +188,36 @@ pub fn voxel_trace(
         targets.size.y,
         None,
     );
+}
+
+#[cfg(test)]
+mod trace_size_tests {
+    use super::*;
+
+    #[test]
+    fn views_taller_than_the_internal_height_are_traced_smaller_at_their_aspect() {
+        let floor = Some(UVec2::new(1280, 720));
+        assert_eq!(
+            trace_size(UVec2::new(2560, 1440), floor),
+            UVec2::new(1280, 720)
+        );
+        assert_eq!(
+            trace_size(UVec2::new(3024, 1964), floor),
+            UVec2::new(1109, 720)
+        );
+        // At or below the internal height, and without a tier, the viewport.
+        assert_eq!(
+            trace_size(UVec2::new(1280, 720), floor),
+            UVec2::new(1280, 720)
+        );
+        assert_eq!(
+            trace_size(UVec2::new(640, 360), floor),
+            UVec2::new(640, 360)
+        );
+        assert_eq!(
+            trace_size(UVec2::new(2560, 1440), None),
+            UVec2::new(2560, 1440)
+        );
+        assert_eq!(trace_size(UVec2::ZERO, floor), UVec2::ONE);
+    }
 }

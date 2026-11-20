@@ -29,8 +29,9 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 use bevy::render::view::ExtractedView;
 use wgpu::util::StagingBelt;
+use world_core::ConfigAsset;
 use world_core::{TreeSnapshot, VoxelTree};
-use world_reload::Config;
+use world_reload::{Config, ConfigOrigin, ConfigRegistry};
 
 use super::config::{BrickCacheConfig, Stage};
 use super::evict::EvictParams;
@@ -62,6 +63,18 @@ pub struct PendingFeed(pub FeedFrame);
 #[derive(Resource, Clone, Default)]
 pub struct ExtractedCacheConfig(pub BrickCacheConfig);
 
+/// Whether the config the render world holds is the one to size the pools
+/// from: the file has been applied, or there is no file to wait for (no
+/// config registry, as in tests), or [`CONFIG_GRACE_SECS`] have passed. The
+/// pools never grow, so sizing them from the defaults before the file is in
+/// would ignore the file's pool sizes for the whole run.
+#[derive(Resource, Clone, Copy, Default)]
+pub struct CacheConfigReady(pub bool);
+
+/// How long to wait for `brick_cache.ron` before sizing the pools from the
+/// defaults (a missing or broken file never blocks rendering).
+pub const CONFIG_GRACE_SECS: f32 = 3.0;
+
 /// The main camera's position, for stage 1 and edit priorities.
 #[derive(Resource, Clone, Copy, Default)]
 pub struct CacheViewPoint(pub Option<ViewPoint>);
@@ -71,6 +84,7 @@ pub fn extract_feed(
     mut main_world: ResMut<MainWorld>,
     mut pending: ResMut<PendingFeed>,
     mut config: ResMut<ExtractedCacheConfig>,
+    mut ready: ResMut<CacheConfigReady>,
 ) {
     if let Some(mut feed) = main_world.get_resource_mut::<VoxelWorldFeed>() {
         let taken = feed.take();
@@ -78,6 +92,18 @@ pub fn extract_feed(
     }
     if let Some(c) = main_world.get_resource::<Config<BrickCacheConfig>>() {
         config.0 = (**c).clone();
+    }
+    if !ready.0 {
+        let applied = match main_world.get_resource::<ConfigRegistry>() {
+            Some(registry) => registry
+                .get(<BrickCacheConfig as ConfigAsset>::NAME)
+                .is_some_and(|e| e.origin != ConfigOrigin::Defaults),
+            None => true,
+        };
+        let waited = main_world
+            .get_resource::<Time>()
+            .is_some_and(|t| t.elapsed_secs() >= CONFIG_GRACE_SECS);
+        ready.0 = applied || waited;
     }
 }
 
@@ -88,6 +114,7 @@ pub const VOXELS_PER_METER: f32 = world_core::consts::VOXELS_PER_METER as f32;
 /// Orthographic views (UI, debug overlays) are skipped.
 pub fn update_view_point(
     views: Query<(&ExtractedView, &ExtractedCamera)>,
+    tier: Option<Res<RenderTier>>,
     mut point: ResMut<CacheViewPoint>,
 ) {
     let main = views
@@ -96,7 +123,10 @@ pub fn update_view_point(
         .min_by_key(|(_, c)| c.order);
     point.0 = main.map(|(v, _)| {
         let eye = v.world_from_view.translation() * VOXELS_PER_METER;
-        let height = v.viewport.w.max(1) as f32;
+        // Detail follows the traced height, not the window's.
+        let viewport = bevy::math::UVec2::new(v.viewport.z, v.viewport.w);
+        let internal = tier.as_ref().map(|t| t.budgets.internal_resolution);
+        let height = crate::passes::primary::trace_size(viewport, internal).y as f32;
         // clip_from_view[1][1] is 1 / tan(fov / 2) for a perspective view.
         let f = v.clip_from_view.y_axis.y.abs().max(1e-6);
         ViewPoint {
@@ -180,9 +210,10 @@ pub fn init_brick_cache(
     cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     config: Res<ExtractedCacheConfig>,
+    ready: Res<CacheConfigReady>,
     tier: Option<Res<RenderTier>>,
 ) {
-    if state.is_some() {
+    if state.is_some() || !ready.0 {
         return;
     }
     let Some(pipelines) = pipelines else {
@@ -427,7 +458,7 @@ pub fn log_cache_stats(
     let s = state.residency.stats();
     let r = state.last_report;
     info!(
-        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} evicted, {} victims, {} B upload; read-back skips {}",
+        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
         state.frame,
         s.entries,
         s.expanded,
@@ -443,6 +474,7 @@ pub fn log_cache_stats(
         r.victims_applied,
         r.upload_bytes,
         state.ring.skipped,
+        state.residency.pressure(),
     );
     if let Some(v) = view.as_ref().and_then(|v| v.0) {
         info!(

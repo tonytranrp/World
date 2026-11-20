@@ -90,14 +90,17 @@ pub fn projected_pixels(origin: VoxelPos, key: NodeKey, view: &ViewPoint) -> f32
 struct Reach([f64; 16]);
 
 impl Reach {
-    fn new(view: &ViewPoint, detail: f32) -> Self {
+    /// `pressure` multiplies the threshold of levels 2 and up only: the
+    /// nodes whose children take node pool records.
+    fn new(view: &ViewPoint, detail: f32, pressure: f32) -> Self {
         let angle = f64::from(view.pixel_angle.max(1e-6));
         Self(std::array::from_fn(|level| {
             if level == 0 {
                 return -1.0;
             }
+            let scale = if level >= 2 { pressure } else { 1.0 };
             let cell = (1u64 << (2 * (level - 1))) as f64;
-            let r = cell / (angle * f64::from(detail));
+            let r = cell / (angle * f64::from(detail * scale));
             if r >= 1.0 { r * r } else { -1.0 }
         }))
     }
@@ -169,12 +172,14 @@ impl GrowthState {
 /// Walks the whole resident tree and lists what to change.
 pub fn select(res: &Residency, view: &ViewPoint, lod: &LodTuning) -> Selection {
     let mut walk = Vec::new();
-    select_budgeted(res, &mut walk, view, lod, u32::MAX, true)
+    select_budgeted(res, &mut walk, view, lod, 1.0, u32::MAX, true)
 }
 
 /// Lists what to change: when `grow`, every node that wants growing (a walk
 /// bounded by the view), and what shrinking the walk in `walk` finds in at
 /// most `max_visits` records (a new walk from the root when it is empty).
+/// `pressure` (at least 1) raises the detail threshold of levels 2 and up,
+/// whose expansions take node pool records; bricks keep theirs.
 /// Records removed since they were queued are skipped; children of nodes
 /// expanded since are visited by the next pass.
 pub fn select_budgeted(
@@ -182,6 +187,7 @@ pub fn select_budgeted(
     walk: &mut Vec<NodeKey>,
     view: &ViewPoint,
     lod: &LodTuning,
+    pressure: f32,
     max_visits: u32,
     grow: bool,
 ) -> Selection {
@@ -203,7 +209,7 @@ pub fn select_budgeted(
     // Growth: only where refining is wanted (or forced). Children are
     // judged from their squared distances before any table lookup, so only
     // nodes that want refining cost one.
-    let reach = Reach::new(view, lod.detail_pixels);
+    let reach = Reach::new(view, lod.detail_pixels, pressure);
     let eye = view.eye.map(f64::from);
     let origin = shape.origin.to_array().map(f64::from);
     let forced = |level: u8| level >= 2 && u32::from(level) >= always;
@@ -271,7 +277,8 @@ pub fn select_budgeted(
         };
         visits += 1;
         let px = projected_pixels(shape.origin, key, view);
-        let keep = px >= lod.detail_pixels * lod.hysteresis;
+        let scale = if key.level >= 2 { pressure } else { 1.0 };
+        let keep = px >= lod.detail_pixels * scale * lod.hysteresis;
         if key.level >= 2 {
             let forced = key.level() >= always;
             if node.expanded {

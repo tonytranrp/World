@@ -103,6 +103,14 @@ pub struct Residency {
     walk: Vec<NodeKey>,
     /// When stage 1's growth last ran.
     growth: GrowthState,
+    /// Stage 1's detail threshold multiplier under node pool pressure (see
+    /// `frame::adapt_pressure`); 1 when the pool has room.
+    pressure: f32,
+    /// The next shrink walk runs whole: the pressure just changed, and its
+    /// collapses should land before it is judged again.
+    full_shrink: bool,
+    /// The frame the pressure last rose.
+    pressure_raised_at: u32,
 }
 
 /// What stage 1 needs of one node, from a single table lookup.
@@ -131,6 +139,9 @@ impl Residency {
             tally: Tally::default(),
             walk: Vec::new(),
             growth: GrowthState::default(),
+            pressure: 1.0,
+            full_shrink: false,
+            pressure_raised_at: 0,
         })
     }
 
@@ -199,6 +210,33 @@ impl Residency {
     /// When stage 1's growth last ran.
     pub fn growth(&mut self) -> &mut GrowthState {
         &mut self.growth
+    }
+
+    /// Stage 1's detail threshold multiplier under node pool pressure.
+    pub fn pressure(&self) -> f32 {
+        self.pressure
+    }
+
+    /// Sets the pressure; a change makes the next shrink walk run whole.
+    pub fn set_pressure(&mut self, pressure: f32) {
+        if pressure != self.pressure {
+            self.full_shrink = true;
+        }
+        self.pressure = pressure;
+    }
+
+    /// The frame the pressure last rose.
+    pub fn pressure_raised_at(&self) -> u32 {
+        self.pressure_raised_at
+    }
+
+    pub fn set_pressure_raised_at(&mut self, frame: u32) {
+        self.pressure_raised_at = frame;
+    }
+
+    /// Whether the next shrink walk should run whole; clears the request.
+    pub fn take_full_shrink(&mut self) -> bool {
+        std::mem::take(&mut self.full_shrink)
     }
 
     pub fn is_expanded(&self, key: NodeKey) -> bool {
