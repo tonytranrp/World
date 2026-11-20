@@ -71,6 +71,10 @@ struct Entry {
     /// Slots of the children that have entries (mixed content), when
     /// expanded.
     kids: u64,
+    /// The mask the group or the brick block was laid out for: the GPU
+    /// finds children and leaves by their rank in the record's mask, so a
+    /// record may only point at them with this mask.
+    layout: u64,
     /// Slots of the children whose bricks are resident (level 2).
     bricks: u64,
 }
@@ -84,6 +88,7 @@ impl Entry {
             brick: None,
             last_requested: 0,
             kids: 0,
+            layout: 0,
             bricks: 0,
         }
     }
@@ -586,6 +591,36 @@ impl Residency {
         }
     }
 
+    /// Records the mask the group or brick block of `key` was laid out for.
+    fn set_layout(&mut self, key: NodeKey, mask: u64) {
+        if let Some(e) = self.entries.get_mut(&key) {
+            e.layout = mask;
+        }
+    }
+
+    /// Before the record of `key` is written again for content whose mask
+    /// is `mask`: drops what the entry holds below it (children, group,
+    /// brick) when that was laid out for another mask, or when it lies in a
+    /// replaced chunk that waits (it describes the old content, and applying
+    /// the chunk would drop it anyway). The record then points at nothing
+    /// it cannot read; stage 1 refines the node again.
+    fn unlink_stale(&mut self, key: NodeKey, mask: u64, batch: &mut UploadBatch) {
+        let Some(&e) = self.entries.get(&key) else {
+            return;
+        };
+        if e.group.is_none() && e.brick.is_none() {
+            return;
+        }
+        if e.layout == mask && !self.in_waiting_chunk(key) {
+            return;
+        }
+        self.release(key, e, batch);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.group = None;
+        }
+        self.set_brick(key, None);
+    }
+
     /// Forgets everything below and including `key` without writing records:
     /// the caller rewrites the group or record that referred to it.
     fn drop_subtree(&mut self, key: NodeKey, batch: &mut UploadBatch) {
@@ -598,11 +633,13 @@ impl Residency {
     /// Frees what an entry holds: its children (recursively), group and brick.
     fn release(&mut self, key: NodeKey, e: Entry, batch: &mut UploadBatch) {
         if let Some(g) = e.group {
-            let mask = e.record.mask();
-            for slot in 0..64 {
-                if mask & (1u64 << slot) != 0 {
-                    self.drop_subtree(key.child(slot), batch);
-                }
+            // The entries below, not the record's mask: a record may have
+            // been rewritten for content the group does not hold yet.
+            let mut kids = e.kids;
+            while kids != 0 {
+                let slot = kids.trailing_zeros();
+                kids &= kids - 1;
+                self.drop_subtree(key.child(slot), batch);
             }
             self.nodes.free(g);
         }
@@ -675,11 +712,13 @@ impl Residency {
         };
         if let Some(e) = self.entries.get_mut(&key) {
             e.group = Some(group);
+            e.layout = mask;
         }
 
         for (k, (slot, child)) in view.children().enumerate() {
             let ck = key.child(slot);
             let index = group.first + k as u32;
+            self.unlink_stale(ck, child.mask(), batch);
             let Some(record) = self.child_record(ck, child) else {
                 continue;
             };
@@ -709,7 +748,7 @@ impl Residency {
             return Ok(());
         };
         let mask = view.mask();
-        if slots == u64::MAX || mask != e.record.mask() || group.len != mask.count_ones().max(1) {
+        if slots == u64::MAX || mask != e.layout || group.len != mask.count_ones().max(1) {
             return self.write_group(key, view, batch);
         }
         // A changed slot that became air changed the mask: all are set.
@@ -724,6 +763,7 @@ impl Residency {
                 self.drop_subtree(ck, batch);
             }
             let index = group.first + (mask & ((1u64 << slot) - 1)).count_ones();
+            self.unlink_stale(ck, child.mask(), batch);
             if let Some(record) = self.child_record(ck, child) {
                 if branch {
                     self.put_entry(ck, index, record);
@@ -856,6 +896,7 @@ impl Residency {
         let material = self.summary(key, view).material;
         let record = GpuNode::brick(view.mask(), slot.alloc.block, material, edited);
         self.set_brick(key, Some(slot));
+        self.set_layout(key, view.mask());
         self.write_record(key, record, batch);
         Ok(u64::from(slot.alloc.units) * 16)
     }
@@ -920,6 +961,7 @@ impl Residency {
             let record =
                 GpuNode::brick(encoded.mask, alloc.block, encoded.summary.material, *edited);
             self.set_brick(*key, Some(slot));
+            self.set_layout(*key, encoded.mask);
             self.write_record(*key, record, batch);
             loaded += 1;
         }
@@ -1169,6 +1211,7 @@ impl Residency {
             && let Ok(new_slot) = self.place_brick(k, view, batch)
         {
             self.set_brick(k, Some(new_slot));
+            self.set_layout(k, view.mask());
         }
     }
 
@@ -1300,6 +1343,13 @@ impl Residency {
                         }
                     }
                 }
+            }
+            if (e.group.is_some() || e.brick.is_some()) && e.layout != e.record.mask() {
+                return Err(format!(
+                    "{key:?}: record mask {:#x}, its group or block is laid out for {:#x}",
+                    e.record.mask(),
+                    e.layout
+                ));
             }
             if (e.kids, e.bricks) != (kids, bricks) {
                 return Err(format!(

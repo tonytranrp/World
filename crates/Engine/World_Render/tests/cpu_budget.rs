@@ -724,3 +724,106 @@ fn a_pressure_change_shrinks_within_the_visit_budget() {
     assert!(!res.settling(), "and it finished");
     verify(&mut res, &snap, &pools);
 }
+
+/// A rough slab of material 3 over `x0..x0 + 256` and `z0..z0 + 256`, 14
+/// voxels thick with holes: 16 mixed level-2 nodes, so summarizing it takes
+/// several frames on a small budget.
+fn rough_slab(x0: i32, z0: i32) -> VoxelTree {
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(
+                VoxelPos::new(x0, -16, z0),
+                VoxelPos::new(x0 + 256, -2, z0 + 256),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+    for x in (x0..x0 + 256).step_by(5) {
+        for z in (z0..z0 + 256).step_by(7) {
+            other.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    other
+}
+
+/// A small slab of material 3 inside the chunk at `min`.
+fn replacement_at(min: VoxelPos) -> world_core::tree::ChunkData {
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(
+                VoxelPos::new(min.x, -16, min.z),
+                VoxelPos::new(min.x + 40, -6, min.z + 40),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+    other.chunk_data(min).expect("mixed content")
+}
+
+/// The table is consistent while a replaced chunk waits, even when a
+/// sibling's change rewrites the group holding the waiting chunk with a
+/// different mask: the waiting chunk's old children are never read through
+/// the new mask, and collapsing it frees everything below it.
+#[test]
+fn a_waiting_chunk_stays_consistent_when_its_parent_group_is_rewritten() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    // c1 holds part of the slab and is expanded; c2, in the same level-5
+    // node, is air until it is replaced.
+    let c1 = VoxelPos::new(0, -1024, 0);
+    let c2 = VoxelPos::new(1024, -1024, 0);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    assert_eq!(key(c1).parent(), key(c2).parent());
+    assert!(res.is_expanded(key(c1)) && res.is_expanded(key(c1).parent()));
+    assert!(!res.has_record(key(c2)));
+    // c1's new content sits in another level-3 cell, so its mask changes.
+    tree.insert_chunk(c1, rough_slab(256, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c2, replacement_at(c2)).unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    // Over c2, with a pixel angle so fine that stage 1 keeps everything.
+    let view = ViewPoint {
+        eye: [c2.x as f32 + 40.0, -10.0, c2.z as f32 + 40.0],
+        pixel_angle: 1e-6,
+    };
+    let both = [c1, c2];
+    let mut frame = 10;
+    while !res.has_record(key(c2)) {
+        step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        frame += 1;
+        assert!(frame < 30, "c2 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    verify(&mut res, &snap, &pools);
+
+    // Collapsing the waiting chunk leaks nothing: after a reset no node
+    // group and no brick id is left in use.
+    let mut batch = UploadBatch::default();
+    let _ = res.collapse(key(c1), &mut batch);
+    apply_cpu(&mut pools, &batch);
+    verify(&mut res, &snap, &pools);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    let s = res.stats();
+    assert_eq!((s.expanded, s.bricks), (0, 0), "{s:?}");
+}
