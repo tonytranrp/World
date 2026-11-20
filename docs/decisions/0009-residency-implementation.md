@@ -140,7 +140,11 @@ from the CI artifact, compared function by function, found the causes:
   itself refuses at an unloaded child. Lookups test for not-resident words
   only above the chunk level.
 
-What remains is the price of chunk-owned arenas: a lookup starts a second
+After the fixes the gate measures, against main: random reads +27%,
+single-voxel writes into an empty tree +26% and into a dense block +7%, box
+fills +10%, an edit after a snapshot +15% (the chunk's free lists are
+copied), batched edits +3%, encoding 0%, decoding -97%. What remains is the
+price of chunk-owned arenas: a lookup starts a second
 page reader (two more page lookups and its setup) when it enters a chunk,
 and a write to a new chunk allocates that chunk's own pages. In exchange a
 chunk is freed, moved or snapshotted whole, decoding is 97% cheaper, and
