@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::ROOT_LEVEL;
 use super::alloc::StorageReader;
-use super::forest::ChunkLookup;
+use super::forest::{Chunks, chunk_root};
 use super::node::{CHUNK_LEVEL, Child, slot_at};
 use super::read::{Step, TreeView, record_voxel, step};
 use crate::consts::TREE_DEPTH;
@@ -25,7 +25,7 @@ pub struct TreeCursor<'a> {
     top: StorageReader<'a>,
     /// Reads the chunk on the cached path, when the path reaches one.
     chunk: Option<StorageReader<'a>>,
-    chunks: &'a dyn ChunkLookup,
+    chunks: &'a Chunks,
     root: Child,
     /// World-local coordinate of the last lookup.
     last: [u32; 3],
@@ -106,7 +106,7 @@ impl<'a> TreeCursor<'a> {
                     level -= 1;
                     self.path[level as usize] = child;
                     if level == CHUNK_LEVEL {
-                        let (storage, root) = self.chunks.chunk_root(child);
+                        let (storage, root) = chunk_root(self.chunks, child);
                         self.chunk = Some(storage.reader());
                         self.path[level as usize] = root;
                     }

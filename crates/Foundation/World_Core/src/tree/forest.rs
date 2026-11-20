@@ -113,11 +113,33 @@ impl Forest {
         Arc::make_mut(chunk)
     }
 
+    /// Takes chunk `id` out of the table for a run of writes, made unique
+    /// (copied if a snapshot still shares it); [`check_in`](Self::check_in)
+    /// puts it back. Until then the id reads as free, so only the writer that
+    /// holds the chunk may touch it.
+    pub fn check_out(&mut self, id: u32) -> Arc<Chunk> {
+        let mut arc = Arc::make_mut(&mut self.chunks)[id as usize]
+            .take()
+            .expect("stored chunk ids are live");
+        Arc::make_mut(&mut arc);
+        arc
+    }
+
+    /// Puts back a chunk taken with [`check_out`](Self::check_out).
+    pub fn check_in(&mut self, id: u32, chunk: Arc<Chunk>) {
+        Arc::make_mut(&mut self.chunks)[id as usize] = Some(chunk);
+    }
+
     /// Records a change to a chunk.
     pub fn touch(&mut self, id: u32) {
-        self.generation += 1;
-        let generation = self.generation;
+        let generation = self.next_generation();
         self.chunk_mut(id).generation = generation;
+    }
+
+    /// A generation no chunk has had.
+    pub fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
 
     /// Live and free storage of the top and every chunk.
@@ -142,24 +164,23 @@ impl Forest {
     }
 }
 
-/// Finding a chunk's storage and root from the chunk id in a child word.
-pub(crate) trait ChunkLookup: Sync {
-    fn chunk_root(&self, id: u32) -> (&Storage, u32);
+/// The live chunks by id, as readers see them: the forest's table or a
+/// snapshot's, which are the same type.
+pub(crate) type Chunks = [Option<Arc<Chunk>>];
+
+/// A chunk's storage and root, from the chunk id in a child word.
+#[inline]
+pub(crate) fn chunk_root(chunks: &Chunks, id: u32) -> (&Storage, u32) {
+    let chunk = chunks[id as usize]
+        .as_ref()
+        .expect("stored chunk ids are live");
+    (chunk.store.storage(), chunk.root)
 }
 
-impl ChunkLookup for Forest {
-    fn chunk_root(&self, id: u32) -> (&Storage, u32) {
-        let chunk = self.chunk(id);
-        (chunk.store.storage(), chunk.root)
-    }
-}
-
-impl ChunkLookup for ChunkTable {
-    fn chunk_root(&self, id: u32) -> (&Storage, u32) {
-        let chunk = self[id as usize]
-            .as_ref()
-            .expect("stored chunk ids are live");
-        (chunk.store.storage(), chunk.root)
+impl Forest {
+    /// The live chunks, for readers.
+    pub fn chunk_slice(&self) -> &Chunks {
+        &self.chunks
     }
 }
 

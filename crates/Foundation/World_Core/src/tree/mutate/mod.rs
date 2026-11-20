@@ -30,7 +30,9 @@ pub(crate) use voxel::LocalEdit;
 
 use super::ROOT_LEVEL;
 use super::alloc::Store;
-use super::forest::Forest;
+use std::sync::Arc;
+
+use super::forest::{Chunk, Forest};
 use super::node::{CHUNK_LEVEL, Child, Node, Packed};
 use crate::consts::TREE_DEPTH;
 use crate::material::MaterialId;
@@ -79,6 +81,9 @@ struct Writer<'a> {
     forest: &'a mut Forest,
     /// The chunk being written, or `None` above the chunk level.
     chunk: Option<u32>,
+    /// That chunk, checked out of the forest at its first write and put back
+    /// when the writer leaves it.
+    held: Option<Arc<Chunk>>,
 }
 
 impl<'a> Writer<'a> {
@@ -86,6 +91,7 @@ impl<'a> Writer<'a> {
         Self {
             forest,
             chunk: None,
+            held: None,
         }
     }
 }
@@ -93,6 +99,9 @@ impl<'a> Writer<'a> {
 impl Writer<'_> {
     /// The store the writer is working on.
     fn store(&self) -> &Store {
+        if let Some(chunk) = &self.held {
+            return &chunk.store;
+        }
         match self.chunk {
             None => &self.forest.top,
             Some(id) => &self.forest.chunk(id).store,
@@ -100,10 +109,14 @@ impl Writer<'_> {
     }
 
     fn store_mut(&mut self) -> &mut Store {
-        match self.chunk {
-            None => &mut self.forest.top,
-            Some(id) => &mut self.forest.chunk_mut(id).store,
-        }
+        let Some(id) = self.chunk else {
+            return &mut self.forest.top;
+        };
+        let held = self.held.get_or_insert_with(|| self.forest.check_out(id));
+        // Unique since check-out: nothing else can clone it meanwhile.
+        &mut Arc::get_mut(held)
+            .expect("a checked-out chunk is unique")
+            .store
     }
 
     /// Whether `level` is the chunk level, reached from the top: the child
@@ -135,19 +148,30 @@ impl Writer<'_> {
         self.chunk = Some(id);
         let result = write(self, local);
         self.chunk = None;
+        let held = self.held.take();
         match result {
             None => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
                 if fresh {
                     self.forest.free_chunk(id);
                 }
                 None
             }
             Some(Child::Node(root)) => {
-                self.forest.chunk_mut(id).root = root;
-                self.forest.touch(id);
+                let mut chunk = held.unwrap_or_else(|| self.forest.check_out(id));
+                let generation = self.forest.next_generation();
+                let c = Arc::get_mut(&mut chunk).expect("a checked-out chunk is unique");
+                c.root = root;
+                c.generation = generation;
+                self.forest.check_in(id, chunk);
                 Some(Child::Node(id))
             }
             Some(other) => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
                 self.forest.free_chunk(id);
                 Some(other)
             }

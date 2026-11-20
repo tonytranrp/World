@@ -15,7 +15,7 @@
 use std::fmt;
 
 use super::alloc::{Storage, StorageReader};
-use super::forest::ChunkLookup;
+use super::forest::{Chunks, chunk_root};
 use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
 use super::node::{
@@ -288,12 +288,7 @@ pub enum NodeRef<'a> {
 impl<'a> NodeRef<'a> {
     /// The reader's view of a stored child whose node, if it is one, has
     /// `level` (1 or higher) and lives in `storage`.
-    pub(crate) fn new(
-        storage: &'a Storage,
-        chunks: &'a dyn ChunkLookup,
-        child: Child,
-        level: u32,
-    ) -> Self {
+    pub(crate) fn new(storage: &'a Storage, chunks: &'a Chunks, child: Child, level: u32) -> Self {
         match child {
             Child::Air => Self::Air,
             Child::Uniform(m) => Self::Uniform(m),
@@ -396,7 +391,7 @@ impl NodeView for NodeRef<'_> {
 #[derive(Clone, Copy)]
 pub struct BranchRef<'a> {
     storage: &'a Storage,
-    chunks: &'a dyn ChunkLookup,
+    chunks: &'a Chunks,
     level: u32,
     mask: u64,
     /// One child word (level 2 and up) or leaf record (level 1) per non-air
@@ -466,7 +461,7 @@ impl<'a> BranchRef<'a> {
             && let Child::Node(id) = child
         {
             // The children of a level-5 node root chunks.
-            let (storage, root) = self.chunks.chunk_root(id);
+            let (storage, root) = chunk_root(self.chunks, id);
             return NodeRef::new(storage, self.chunks, Child::Node(root), CHUNK_LEVEL);
         }
         NodeRef::new(self.storage, self.chunks, child, self.level - 1)
@@ -564,7 +559,7 @@ impl fmt::Debug for LeafRef<'_> {
 #[derive(Clone, Copy)]
 pub(crate) struct TreeView<'a> {
     pub top: &'a Storage,
-    pub chunks: &'a dyn ChunkLookup,
+    pub chunks: &'a Chunks,
     pub root: Child,
 }
 
@@ -603,7 +598,7 @@ impl<'a> TreeView<'a> {
                     level -= 1;
                     index = child;
                     if level == CHUNK_LEVEL {
-                        let (chunk, root) = self.chunks.chunk_root(child);
+                        let (chunk, root) = chunk_root(self.chunks, child);
                         storage = chunk.reader();
                         index = root;
                     }

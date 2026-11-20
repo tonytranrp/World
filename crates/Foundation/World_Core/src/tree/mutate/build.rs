@@ -76,6 +76,9 @@ impl<'a> Builder<'a> {
         let Some(id) = self.writer.chunk.take() else {
             return root;
         };
+        if let Some(chunk) = self.writer.held.take() {
+            self.writer.forest.check_in(id, chunk);
+        }
         match root {
             Child::Node(index) => {
                 self.writer.forest.chunk_mut(id).root = index;
@@ -132,13 +135,17 @@ impl Writer<'_> {
     ) -> Option<Child> {
         if level == target_level {
             self.free_subtree(child, level);
+            // The builder writes the same chunk: it takes the checked-out
+            // chunk along and hands it back.
             let mut builder = Builder {
                 writer: Writer {
                     forest: &mut *self.forest,
                     chunk: self.chunk,
+                    held: self.held.take(),
                 },
             };
             let new = make(&mut builder);
+            self.held = builder.writer.held.take();
             // A freed node may come back with the same index, so only a
             // filled child that stays the same is "no change".
             let same = new == child && !matches!(child, Child::Node(_));
@@ -193,11 +200,14 @@ mod tests {
         records[0] = record;
         let child = b.brick(&records);
         assert!(matches!(child, Child::Node(_)));
-        let s = b.writer.forest.stats();
-        assert_eq!((s.branches, s.leaves, s.chunks), (1, 1, 1));
+        // The open chunk is checked out of the forest: read its own store.
+        let s = b.writer.store().stats();
+        assert_eq!((s.branches, s.leaves), (1, 1));
 
         b.discard(child, 1);
-        let s = b.writer.forest.stats();
+        let s = b.writer.store().stats();
         assert_eq!((s.branches, s.leaves, s.words), (0, 0, 0));
+        assert_eq!(b.end_chunk(Child::Air), Child::Air);
+        assert_eq!(forest.stats().chunks, 0);
     }
 }

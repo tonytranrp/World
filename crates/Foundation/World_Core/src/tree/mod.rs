@@ -326,7 +326,7 @@ impl VoxelTree {
     fn view(&self) -> TreeView<'_> {
         TreeView {
             top: self.forest.top.storage(),
-            chunks: &self.forest,
+            chunks: self.forest.chunk_slice(),
             root: self.root,
         }
     }
@@ -411,7 +411,7 @@ impl TreeSnapshot {
     fn view(&self) -> TreeView<'_> {
         TreeView {
             top: &self.top,
-            chunks: &self.chunks,
+            chunks: self.chunks.as_slice(),
             root: self.root,
         }
     }
