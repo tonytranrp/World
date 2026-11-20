@@ -313,20 +313,18 @@ pub(crate) struct PackedNode<const N: usize> {
 }
 
 impl<const N: usize> PackedNode<N> {
-    /// Panics if `words` is empty or longer than `N`.
-    pub fn new(mask: u64, info: u32, words: &[u32]) -> Self {
+    /// The first `len` words of `words`, taken as they are: no second array
+    /// to clear and copy. Panics if `len` is 0 or above `N`.
+    pub fn from_array(mask: u64, info: u32, words: [u32; N], len: usize) -> Self {
         assert!(
-            (1..=N).contains(&words.len()),
-            "a node block holds 1 to {N} words, not {}",
-            words.len()
+            (1..=N).contains(&len),
+            "a node block holds 1 to {N} words, not {len}"
         );
-        let mut block = [0; N];
-        block[..words.len()].copy_from_slice(words);
         Self {
             mask,
             info,
-            words: block,
-            len: words.len(),
+            words,
+            len,
         }
     }
 
@@ -467,6 +465,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "1 to 64 words")]
     fn packed_nodes_are_never_empty() {
-        PackedNode::<64>::new(0, 0, &[]);
+        PackedNode::<64>::from_array(0, 0, [0; 64], 0);
     }
 }

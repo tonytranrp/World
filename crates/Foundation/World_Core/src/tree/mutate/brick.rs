@@ -196,7 +196,7 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
             stored += 1;
         }
     }
-    Packed::Node(PackedNode::new(mask, stored, &words[..len]))
+    Packed::Node(PackedNode::from_array(mask, stored, words, len))
 }
 
 /// The default material of a brick and the leaves it stands for.
