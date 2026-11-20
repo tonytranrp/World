@@ -297,6 +297,7 @@ fn edited_bricks_go_first_and_get_at_least_a_quarter_of_the_budget() {
         frame: 10,
         refresh: false,
         dirty: dirty.as_slice(),
+        chunks: &[],
         view: None,
         requests: &requests,
         victims: &[],
@@ -345,6 +346,8 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         footprint_bias: 1.0,
         max_visits_per_frame: 65536,
         regrow_voxels: 16.0,
+        restart_voxels: 128.0,
+        max_expansions_per_frame: 128,
     };
     let brick = res.resident_bricks()[0];
     let pixel_angle = 0.002;
@@ -409,6 +412,8 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         footprint_bias: 1.0,
         max_visits_per_frame: 65536,
         regrow_voxels: 16.0,
+        restart_voxels: 128.0,
+        max_expansions_per_frame: 128,
     };
     let view = ViewPoint {
         eye: [3.0, 900.0, -5.0],
@@ -487,6 +492,7 @@ fn a_split_growth_pass_finds_the_most_important_work_first() {
             frame,
             refresh: frame == 1,
             dirty: &[],
+            chunks: &[],
             view: Some(view),
             requests: &[],
             victims: &[],
@@ -537,8 +543,9 @@ fn a_split_growth_pass_finds_the_most_important_work_first() {
     assert_eq!((expand, load), (want_expand, want_load));
 }
 
-/// A growth pass whose camera moved on starts over: its next frame finds
-/// exactly what a fresh pass from the new view finds.
+/// A growth pass whose camera moved more than `lod.restart_voxels` starts
+/// over: its next frame finds exactly what a fresh pass from the new view
+/// finds.
 #[test]
 fn a_moving_camera_restarts_the_growth_pass() {
     let tree = world_render::internals::scene::build();
@@ -557,6 +564,7 @@ fn a_moving_camera_restarts_the_growth_pass() {
             frame,
             refresh: frame == 1,
             dirty: &[],
+            chunks: &[],
             view: Some(view),
             requests: &[],
             victims: &[],
@@ -573,7 +581,7 @@ fn a_moving_camera_restarts_the_growth_pass() {
     assert!(growth.is_active());
 
     let moved = ViewPoint {
-        eye: [0.0, 0.0, 2.0 * lod.regrow_voxels],
+        eye: [0.0, 0.0, 2.0 * lod.restart_voxels.max(lod.regrow_voxels)],
         ..view
     };
     let resumed = select_budgeted(&res, &mut walk, &mut growth, &moved, &lod, 1.0, 5);
@@ -612,6 +620,7 @@ fn candidates_the_budget_turns_away_are_carried_until_done() {
                 frame,
                 refresh: frame == 1,
                 dirty: &[],
+                chunks: &[],
                 view: Some(view),
                 requests: &[],
                 victims: &[],
@@ -659,6 +668,7 @@ fn a_still_camera_over_a_settled_cache_walks_nothing() {
             frame,
             refresh: frame == 1,
             dirty: &[],
+            chunks: &[],
             view: Some(view),
             requests: &[],
             victims: &[],
@@ -713,6 +723,7 @@ fn stage_one_refines_the_debug_scene_from_the_default_camera() {
             frame,
             refresh: frame == 1,
             dirty: &[],
+            chunks: &[],
             view: Some(view),
             requests: &[],
             victims: &[],
@@ -759,6 +770,7 @@ fn a_full_node_pool_makes_stage_one_settle_for_less_detail() {
                 frame,
                 refresh: frame == 1,
                 dirty: &[],
+                chunks: &[],
                 view: Some(view),
                 requests: &[],
                 victims: &[],
@@ -821,6 +833,7 @@ fn stage_two_loads_what_rays_request() {
         frame: 3,
         refresh: false,
         dirty: &[],
+        chunks: &[],
         view: None,
         requests: &requests,
         victims: &[],

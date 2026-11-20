@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bevy::prelude::Resource;
-use world_core::{BrickPos, DirtyBricks, TreeSnapshot};
+use world_core::{BrickPos, DirtyBricks, TreeSnapshot, VoxelPos};
 
 /// The world the renderer mirrors. Whoever owns the `VoxelTree` updates it
 /// once per frame after applying that frame's edits:
@@ -21,6 +21,7 @@ use world_core::{BrickPos, DirtyBricks, TreeSnapshot};
 pub struct VoxelWorldFeed {
     snapshot: Option<Arc<TreeSnapshot>>,
     dirty: Vec<BrickPos>,
+    chunks: Vec<VoxelPos>,
     refresh: bool,
     /// Counts [`replace`](Self::replace) and [`clear`](Self::clear) calls:
     /// a publisher that remembers it can tell when another one took over.
@@ -32,6 +33,8 @@ pub struct VoxelWorldFeed {
 pub struct FeedFrame {
     pub snapshot: Option<Arc<TreeSnapshot>>,
     pub dirty: Vec<BrickPos>,
+    /// Chunks replaced wholesale, by any voxel inside.
+    pub chunks: Vec<VoxelPos>,
     pub refresh: bool,
 }
 
@@ -39,14 +42,29 @@ impl VoxelWorldFeed {
     /// The next state of the same world, and the bricks that changed since
     /// the previous publish.
     pub fn publish(&mut self, snapshot: Arc<TreeSnapshot>, dirty: &DirtyBricks) {
+        self.publish_with_chunks(snapshot, dirty, &[]);
+    }
+
+    /// [`publish`](Self::publish), with the chunks (level
+    /// `world_core::tree::CHUNK_LEVEL` subtrees, by any voxel inside) whose
+    /// content was replaced wholesale since: loaded, unloaded or swapped for
+    /// other detail. The cache rebuilds what it holds of them.
+    pub fn publish_with_chunks(
+        &mut self,
+        snapshot: Arc<TreeSnapshot>,
+        dirty: &DirtyBricks,
+        chunks: &[VoxelPos],
+    ) {
         self.snapshot = Some(snapshot);
         self.dirty.extend_from_slice(dirty.as_slice());
+        self.chunks.extend_from_slice(chunks);
     }
 
     /// A different world: everything resident is dropped and rebuilt.
     pub fn replace(&mut self, snapshot: Arc<TreeSnapshot>) {
         self.snapshot = Some(snapshot);
         self.dirty.clear();
+        self.chunks.clear();
         self.refresh = true;
         self.generation += 1;
     }
@@ -55,6 +73,7 @@ impl VoxelWorldFeed {
     pub fn clear(&mut self) {
         self.snapshot = None;
         self.dirty.clear();
+        self.chunks.clear();
         self.refresh = true;
         self.generation += 1;
     }
@@ -75,6 +94,7 @@ impl VoxelWorldFeed {
         FeedFrame {
             snapshot: self.snapshot.clone(),
             dirty: std::mem::take(&mut self.dirty),
+            chunks: std::mem::take(&mut self.chunks),
             refresh: std::mem::take(&mut self.refresh),
         }
     }
@@ -90,6 +110,7 @@ impl FeedFrame {
         }
         self.snapshot = later.snapshot;
         self.dirty.extend(later.dirty);
+        self.chunks.extend(later.chunks);
     }
 }
 

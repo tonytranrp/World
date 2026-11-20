@@ -67,6 +67,14 @@ pub struct LodTuning {
     /// many voxels, or the cache changed; `0` looks every frame.
     /// `0.0..=4096.0`.
     pub regrow_voxels: f32,
+    /// A stage 1 pass in progress starts over from the root only once the
+    /// camera moved this many voxels since it started (at least
+    /// `regrow_voxels`); smaller moves let it finish, since every node is
+    /// checked against the current view when it is taken. `0.0..=65536.0`.
+    pub restart_voxels: f32,
+    /// Nodes stage 1 or 2 expands per frame at most; the rest wait for the
+    /// next frame. `1..=1048576`.
+    pub max_expansions_per_frame: u32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -95,6 +103,11 @@ pub struct BrickCacheConfig {
     /// Victims one eviction pass can return. Read at startup. `64..=1048576`.
     pub victim_capacity: u32,
     pub lod: LodTuning,
+    /// Node summaries (each over up to 64 children) that applying changed
+    /// bricks and replaced chunks may compute per frame; further changes
+    /// wait for later frames, nearest first. A replaced 16 m chunk costs
+    /// one per mixed node in it. `1..=16777216`.
+    pub max_change_summaries_per_frame: u32,
     /// Show a small built-in scene while nothing feeds the renderer a world.
     pub debug_scene: bool,
     /// Animate a carve in the debug scene, to exercise edit uploads.
@@ -128,7 +141,10 @@ impl Default for BrickCacheConfig {
                 footprint_bias: 1.0,
                 max_visits_per_frame: 16384,
                 regrow_voxels: 16.0,
+                restart_voxels: 128.0,
+                max_expansions_per_frame: 128,
             },
+            max_change_summaries_per_frame: 2048,
             debug_scene: true,
             debug_scene_edits: true,
         }
@@ -221,6 +237,24 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.regrow_voxels.into(),
             0.0,
             4096.0,
+        );
+        range(
+            "max_change_summaries_per_frame",
+            self.max_change_summaries_per_frame.into(),
+            1.0,
+            16777216.0,
+        );
+        range(
+            "lod.restart_voxels",
+            self.lod.restart_voxels.into(),
+            0.0,
+            65536.0,
+        );
+        range(
+            "lod.max_expansions_per_frame",
+            self.lod.max_expansions_per_frame.into(),
+            1.0,
+            1048576.0,
         );
         range(
             "lod.max_visits_per_frame",

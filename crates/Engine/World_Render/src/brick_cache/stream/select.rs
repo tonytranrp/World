@@ -31,9 +31,14 @@
 //! camera over a settled cache walks nothing.
 //! Nodes expanded while a pass runs rejoin it, so their children are judged
 //! by the same pass. A growth pass whose camera moved more than
-//! `regrow_voxels` starts over from the root, so a moving camera always
-//! works on its current view, nearest and coarsest first. Every node taken
-//! off a queue counts against the budget, whether or not it still exists.
+//! `restart_voxels` (at least `regrow_voxels`) starts over from the root, so
+//! a moving camera works on its current view, nearest and coarsest first;
+//! smaller moves let it finish, since every node is checked against the
+//! current view when it is taken. Every node taken off a queue or put on
+//! one counts against the budget, whether or not it still exists. Only
+//! children with records of their own are queued, and of a level-2 node's
+//! only those whose bricks are not resident, so a settled region costs one
+//! visit per expanded node instead of one per child.
 //!
 //! A growth pass or a shrink pass run to completion under one view gives
 //! exactly [`select`]'s answer.
@@ -202,6 +207,8 @@ pub struct GrowthState {
     /// Candidates found but not taken yet; checked again before use.
     carry_expand: Vec<NodeKey>,
     carry_load: Vec<NodeKey>,
+    /// Pops and pushes the last growth step made.
+    visits: u32,
 }
 
 /// Whether a pass that last started at `last` must start again for `view`.
@@ -256,6 +263,17 @@ impl GrowthState {
     /// A pass is in progress.
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// The view the pass in progress (or the last one) started with.
+    pub fn started_at(&self) -> Option<ViewPoint> {
+        self.last
+    }
+
+    /// Queue pops and pushes the last growth step made, which the visit
+    /// budget bounds (one node's pushes may overshoot it by up to 64).
+    pub fn last_visits(&self) -> u32 {
+        self.visits
     }
 
     /// Node `key`, just expanded, rejoins the pass in progress so its
@@ -339,7 +357,8 @@ pub fn select_budgeted(
     // A pass whose camera moved on restarts: its queue was ordered for a
     // view that is gone. Table changes wait for the pass to finish (nodes
     // expanded meanwhile rejoin it).
-    let moved = growth.active && pass_due(growth.last, false, view, lod.regrow_voxels);
+    let restart = lod.restart_voxels.max(lod.regrow_voxels);
+    let moved = growth.active && pass_due(growth.last, false, view, restart);
     if moved || (!growth.active && growth.due(view, lod.regrow_voxels)) {
         growth.ran(*view);
         let d2 = distance2(origin, root, eye);
@@ -378,7 +397,13 @@ pub fn select_budgeted(
                         d * d
                     })
                 });
-                let mut mask = node.mask;
+                // Only children with records can need work; of a level-2
+                // node's, only those whose bricks are not resident.
+                let mut mask = if key.level == 2 {
+                    node.kids & !node.bricks
+                } else {
+                    node.kids
+                };
                 while mask != 0 {
                     let slot = 63 - mask.leading_zeros();
                     mask &= !(1u64 << slot);
@@ -390,6 +415,8 @@ pub fn select_budgeted(
                     );
                     let d2 = slabs[0][ox] + slabs[1][oy] + slabs[2][oz];
                     if wanted(child, d2) {
+                        // Pushes count too: a node can queue 64 children.
+                        visits += 1;
                         growth.frontier.push(Pending {
                             pixels: pixels(child, d2),
                             key: child,
@@ -411,6 +438,7 @@ pub fn select_budgeted(
     if growth.frontier.is_empty() {
         growth.active = false;
     }
+    growth.visits = visits;
 
     // Candidates carried from earlier frames, if they still apply.
     for key in std::mem::take(&mut growth.carry_expand) {

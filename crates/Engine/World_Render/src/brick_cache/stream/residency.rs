@@ -60,6 +60,11 @@ struct Entry {
     brick: Option<BrickSlot>,
     /// The frame a ray last asked for this node.
     last_requested: u32,
+    /// Slots of the children that have entries (mixed content), when
+    /// expanded.
+    kids: u64,
+    /// Slots of the children whose bricks are resident (level 2).
+    bricks: u64,
 }
 
 impl Entry {
@@ -70,6 +75,8 @@ impl Entry {
             group: None,
             brick: None,
             last_requested: 0,
+            kids: 0,
+            bricks: 0,
         }
     }
 }
@@ -89,8 +96,19 @@ pub struct ResidencyStats {
 pub struct Residency {
     shape: Shape,
     entries: HashMap<NodeKey, Entry>,
+    /// Cached summaries of nodes at and above the chunk level.
     summaries: HashMap<NodeKey, Summary>,
+    /// Cached summaries below the chunk level, by chunk, so a replaced
+    /// chunk forgets its own at once.
+    chunk_summaries: HashMap<NodeKey, HashMap<NodeKey, Summary>>,
     edited: HashSet<NodeKey>,
+    /// Changes not applied yet, in arrival order without repeats.
+    pending: Vec<Change>,
+    /// Replaced chunks among them: their summaries are not computed until
+    /// they are applied (see [`summary`](Self::summary)).
+    pending_chunks: HashSet<NodeKey>,
+    /// Node summaries computed so far, the unit of the change budget.
+    summarized: u64,
     nodes: NodeSpace,
     bricks: BrickSpace,
     ids: IdSpace,
@@ -113,6 +131,35 @@ pub struct Residency {
     pressure_raised_at: u32,
 }
 
+/// A change of the source the table has not caught up with yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Change {
+    /// The content of a level-1 node (a brick) changed.
+    Brick(NodeKey),
+    /// The whole node at the chunk level was replaced (loaded, unloaded,
+    /// or switched between full and coarse detail).
+    Chunk(NodeKey),
+}
+
+impl Change {
+    pub fn key(self) -> NodeKey {
+        match self {
+            Self::Brick(k) | Self::Chunk(k) => k,
+        }
+    }
+}
+
+/// What [`Residency::apply_changes`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Changes applied.
+    pub applied: u32,
+    /// Changes still waiting.
+    pub pending: u32,
+    /// Node summaries computed while applying them.
+    pub summarized: u64,
+}
+
 /// What stage 1 needs of one node, from a single table lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeState {
@@ -120,6 +167,11 @@ pub struct NodeState {
     pub brick_resident: bool,
     /// Children with content, by slot.
     pub mask: u64,
+    /// Children with records of their own (mixed content), by slot: the
+    /// only ones that can need work.
+    pub kids: u64,
+    /// Children whose bricks are resident, by slot (level 2).
+    pub bricks: u64,
 }
 
 impl Residency {
@@ -130,7 +182,11 @@ impl Residency {
             shape,
             entries: HashMap::default(),
             summaries: HashMap::default(),
+            chunk_summaries: HashMap::default(),
             edited: HashSet::default(),
+            pending: Vec::new(),
+            pending_chunks: HashSet::default(),
+            summarized: 0,
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
             bricks: BrickSpace::new(&layout.segments, layout.allocs_per_segment),
             ids: IdSpace::new(layout.brick_ids),
@@ -194,6 +250,8 @@ impl Residency {
             expanded: e.group.is_some(),
             brick_resident: e.brick.is_some(),
             mask: e.record.mask(),
+            kids: e.kids,
+            bricks: e.bricks,
         })
     }
 
@@ -331,13 +389,66 @@ impl Residency {
         self.edited.contains(&key)
     }
 
+    /// The level of the chunks: summaries below it are kept per chunk.
+    pub fn chunk_level(&self) -> u32 {
+        world_core::tree::CHUNK_LEVEL.min(self.shape.root_level())
+    }
+
+    fn cached_summary(&self, key: NodeKey) -> Option<Summary> {
+        let split = self.chunk_level();
+        if key.level() >= split {
+            self.summaries.get(&key).copied()
+        } else {
+            self.chunk_summaries
+                .get(&key.ancestor(split))?
+                .get(&key)
+                .copied()
+        }
+    }
+
+    fn cache_summary(&mut self, key: NodeKey, s: Summary) {
+        let split = self.chunk_level();
+        if key.level() >= split {
+            self.summaries.insert(key, s);
+        } else {
+            self.chunk_summaries
+                .entry(key.ancestor(split))
+                .or_default()
+                .insert(key, s);
+        }
+    }
+
+    fn forget_summary(&mut self, key: NodeKey) {
+        let split = self.chunk_level();
+        if key.level() >= split {
+            self.summaries.remove(&key);
+        } else if let Some(m) = self.chunk_summaries.get_mut(&key.ancestor(split)) {
+            m.remove(&key);
+        }
+    }
+
+    /// Node summaries computed since the table was made: a count of work,
+    /// for budgets and tests.
+    pub fn summaries_computed(&self) -> u64 {
+        self.summarized
+    }
+
     /// The summary of the node `key`, whose view is `view`; cached for
-    /// branches until an edit below them invalidates it.
+    /// branches until a change below them invalidates it. A replaced chunk
+    /// that is not applied yet and has no cached summary gets a stand-in
+    /// (see [`stand_in`]) instead of a walk over its whole content: the
+    /// records above it are rewritten when it is applied.
     fn summary<N: NodeView>(&mut self, key: NodeKey, view: N) -> Summary {
-        if let Some(s) = self.summaries.get(&key) {
-            return *s;
+        if let Some(s) = self.cached_summary(key) {
+            return s;
         }
         let kind = content(&view);
+        if kind == Content::Branch
+            && key.level() == self.chunk_level()
+            && self.pending_chunks.contains(&key)
+        {
+            return stand_in(key, view);
+        }
         let s = match kind {
             Content::Air | Content::Unloaded => Summary::default(),
             Content::Uniform(m) => Summary {
@@ -356,7 +467,8 @@ impl Residency {
             }
         };
         if kind == Content::Branch {
-            self.summaries.insert(key, s);
+            self.summarized += 1;
+            self.cache_summary(key, s);
         }
         s
     }
@@ -387,10 +499,58 @@ impl Residency {
 
     // ---------------------------------------------------------- structure --
 
+    /// Adds or updates the entry of `key`, keeping its parent's child mask.
+    fn put_entry(&mut self, key: NodeKey, index: u32, record: GpuNode) {
+        self.entries
+            .entry(key)
+            .and_modify(|e| {
+                e.index = index;
+                e.record = record;
+            })
+            .or_insert_with(|| Entry::new(index, record));
+        if key != self.shape.root()
+            && let Some(p) = self.entries.get_mut(&key.parent())
+        {
+            p.kids |= 1u64 << key.slot_in_parent();
+        }
+    }
+
+    /// Removes the entry of `key`, keeping its parent's child masks.
+    fn remove_entry(&mut self, key: NodeKey) -> Option<Entry> {
+        let e = self.entries.remove(&key)?;
+        if key != self.shape.root()
+            && let Some(p) = self.entries.get_mut(&key.parent())
+        {
+            let bit = 1u64 << key.slot_in_parent();
+            p.kids &= !bit;
+            p.bricks &= !bit;
+        }
+        Some(e)
+    }
+
+    /// Sets the resident brick of level-1 node `key`, keeping its parent's
+    /// brick mask.
+    fn set_brick(&mut self, key: NodeKey, slot: Option<BrickSlot>) {
+        let Some(e) = self.entries.get_mut(&key) else {
+            return;
+        };
+        e.brick = slot;
+        if key != self.shape.root()
+            && let Some(p) = self.entries.get_mut(&key.parent())
+        {
+            let bit = 1u64 << key.slot_in_parent();
+            if slot.is_some() {
+                p.bricks |= bit;
+            } else {
+                p.bricks &= !bit;
+            }
+        }
+    }
+
     /// Forgets everything below and including `key` without writing records:
     /// the caller rewrites the group or record that referred to it.
     fn drop_subtree(&mut self, key: NodeKey, batch: &mut UploadBatch) {
-        let Some(e) = self.entries.remove(&key) else {
+        let Some(e) = self.remove_entry(key) else {
             return;
         };
         self.release(key, e, batch);
@@ -485,13 +645,7 @@ impl Residency {
                 continue;
             };
             if content(&child) == Content::Branch {
-                self.entries
-                    .entry(ck)
-                    .and_modify(|e| {
-                        e.index = index;
-                        e.record = record;
-                    })
-                    .or_insert_with(|| Entry::new(index, record));
+                self.put_entry(ck, index, record);
             }
             batch.write_node(index, record);
         }
@@ -526,6 +680,9 @@ impl Residency {
         }
         self.entries.clear();
         self.summaries.clear();
+        self.chunk_summaries.clear();
+        self.pending.clear();
+        self.pending_chunks.clear();
         self.walk.clear();
         self.growth.changed();
         self.write_root(source, batch);
@@ -609,9 +766,7 @@ impl Residency {
         let edited = self.edited_bit(key);
         let material = self.summary(key, view).material;
         let record = GpuNode::brick(view.mask(), slot.alloc.block, material, edited);
-        if let Some(e) = self.entries.get_mut(&key) {
-            e.brick = Some(slot);
-        }
+        self.set_brick(key, Some(slot));
         self.write_record(key, record, batch);
         Ok(u64::from(slot.alloc.units) * 16)
     }
@@ -664,7 +819,7 @@ impl Residency {
             };
             let start = batch.data_mut().len();
             batch.data_mut().extend_from_slice(&words);
-            self.summaries.insert(*key, encoded.summary);
+            self.cache_summary(*key, encoded.summary);
             batch.scatter(start as u32, alloc.block, encoded.words);
             batch.write_table(*id, Some(alloc.block), self.frame);
             if let Some(k) = self.id_keys.get_mut(*id as usize) {
@@ -673,9 +828,7 @@ impl Residency {
             let slot = BrickSlot { id: *id, alloc };
             let record =
                 GpuNode::brick(encoded.mask, alloc.block, encoded.summary.material, *edited);
-            if let Some(e) = self.entries.get_mut(key) {
-                e.brick = Some(slot);
-            }
+            self.set_brick(*key, Some(slot));
             self.write_record(*key, record, batch);
             loaded += 1;
         }
@@ -703,7 +856,7 @@ impl Residency {
             self.ids.free(id);
             return Err(Refused::PoolFull);
         };
-        self.summaries.insert(key, encoded.summary);
+        self.cache_summary(key, encoded.summary);
         batch.scatter(start as u32, alloc.block, encoded.words);
         batch.write_table(id, Some(alloc.block), self.frame);
         if let Some(k) = self.id_keys.get_mut(id as usize) {
@@ -715,13 +868,14 @@ impl Residency {
     /// Takes the brick of `key` off the GPU; its record keeps mask and
     /// material.
     pub fn evict_brick(&mut self, key: NodeKey, batch: &mut UploadBatch) -> Result<(), Refused> {
-        let Some(e) = self.entries.get_mut(&key) else {
+        let Some(e) = self.entries.get(&key) else {
             return Err(Refused::NotApplicable);
         };
-        let Some(slot) = e.brick.take() else {
+        let Some(slot) = e.brick else {
             return Err(Refused::AlreadyDone);
         };
         let record = e.record.unlinked();
+        self.set_brick(key, None);
         self.free_brick(slot, batch);
         self.write_record(key, record, batch);
         Ok(())
@@ -738,59 +892,94 @@ impl Residency {
         }
     }
 
-    /// Applies an edit batch's changed bricks. `reupload` decides, in the
-    /// caller's priority order, which resident changed bricks are uploaded
-    /// again this frame (it gets the block bytes the brick needs and returns
-    /// whether it fits the budget); the rest become not resident. Every
-    /// record on the changed paths is rewritten from the source.
+    /// Applies an edit batch's changed bricks at once (see
+    /// [`apply_changes`](Self::apply_changes)).
     pub fn apply_edits<S: VoxelSource>(
         &mut self,
         source: &S,
         dirty: &[NodeKey],
-        mut reupload: impl FnMut(u64) -> bool,
+        reupload: impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
     ) {
+        self.queue_changes(dirty.iter().map(|&k| Change::Brick(k)));
+        self.apply_changes(source, None, u64::MAX, reupload, batch);
+    }
+
+    /// Queues changes of the source; [`apply_changes`](Self::apply_changes)
+    /// applies them. A change already waiting is not queued twice.
+    pub fn queue_changes(&mut self, changes: impl IntoIterator<Item = Change>) {
+        let mut seen: HashSet<Change> = self.pending.iter().copied().collect();
+        for c in changes {
+            if seen.insert(c) {
+                if let Change::Chunk(k) = c {
+                    self.pending_chunks.insert(k);
+                }
+                self.pending.push(c);
+            }
+        }
+    }
+
+    /// Changes queued and not applied yet.
+    pub fn pending_changes(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Applies queued changes, nearest to `eye` first (in key order without
+    /// one), until applying them has computed `max_summaries` node
+    /// summaries; at least one is applied when any wait. The rest wait for
+    /// the next call, and until then the records above them describe the
+    /// content they had before.
+    ///
+    /// A changed brick: `reupload` decides, in that order, which resident
+    /// changed bricks are uploaded again (it gets the block bytes the brick
+    /// needs and returns whether it fits the budget); the rest become not
+    /// resident. A replaced chunk drops everything resident below it (it
+    /// described the old content) and is summarized afresh. Then every
+    /// record on the applied changes' paths is rewritten from the source.
+    pub fn apply_changes<S: VoxelSource>(
+        &mut self,
+        source: &S,
+        eye: Option<[f32; 3]>,
+        max_summaries: u64,
+        mut reupload: impl FnMut(u64) -> bool,
+        batch: &mut UploadBatch,
+    ) -> Applied {
+        let start = self.summarized;
+        let mut order = std::mem::take(&mut self.pending);
+        if let Some(eye) = eye {
+            let origin = self.shape.origin;
+            order.sort_by(|a, b| {
+                let da = super::select::distance(origin, a.key(), eye);
+                let db = super::select::distance(origin, b.key(), eye);
+                da.total_cmp(&db).then(a.key().cmp(&b.key()))
+            });
+        } else {
+            order.sort_by_key(|c| c.key());
+        }
         let root_level = self.shape.root_level();
-        for &k in dirty {
-            for level in 1..=root_level {
-                let a = k.ancestor(level);
-                self.summaries.remove(&a);
-                self.edited.insert(a);
-            }
-        }
-
-        // Resident changed bricks: upload again within budget, else unlink.
-        for &k in dirty {
-            let Some(slot) = self.entries.get(&k).and_then(|e| e.brick) else {
-                continue;
-            };
-            self.free_brick(slot, batch);
-            if let Some(e) = self.entries.get_mut(&k) {
-                e.brick = None;
-            }
-            let view = view_at(source, k);
-            if content(&view) != Content::Branch {
-                continue;
-            }
-            let wanted = u64::from(slot.alloc.units) * 16;
-            if reupload(wanted)
-                && let Ok(new_slot) = self.place_brick(k, view, batch)
-                && let Some(e) = self.entries.get_mut(&k)
-            {
-                e.brick = Some(new_slot);
-            }
-        }
-
-        // Every expanded ancestor rewrites its group, bottom-up.
         let mut groups = std::collections::BTreeSet::new();
-        for &k in dirty {
-            for level in 2..=root_level {
+        let mut applied = 0usize;
+        for &change in &order {
+            if applied > 0 && self.summarized - start >= max_summaries {
+                break;
+            }
+            applied += 1;
+            match change {
+                Change::Brick(k) => self.apply_brick(source, k, &mut reupload, batch),
+                Change::Chunk(c) => self.apply_chunk(source, c, batch),
+            }
+            let k = change.key();
+            // A replaced chunk rewrites its own group too.
+            for level in k.level().max(2)..=root_level {
                 let a = k.ancestor(level);
                 if self.is_expanded(a) {
                     groups.insert(a);
                 }
             }
         }
+        self.pending = order.split_off(applied);
+
+        // Every expanded ancestor rewrites its group, bottom-up.
         for a in groups {
             if !self.entries.contains_key(&a) {
                 continue; // dropped by a lower rewrite
@@ -809,7 +998,71 @@ impl Residency {
         }
         // Level-1 records of changed bricks whose parent is not expanded have
         // no group to live in; everything else was rewritten above.
-        self.write_root(source, batch);
+        if applied > 0 {
+            self.write_root(source, batch);
+        }
+        Applied {
+            applied: applied as u32,
+            pending: self.pending.len() as u32,
+            summarized: self.summarized - start,
+        }
+    }
+
+    /// The first half of applying a changed brick: its path forgets its
+    /// summaries and is marked edited, and a resident brick is uploaded
+    /// again or unlinked.
+    fn apply_brick<S: VoxelSource>(
+        &mut self,
+        source: &S,
+        k: NodeKey,
+        reupload: &mut impl FnMut(u64) -> bool,
+        batch: &mut UploadBatch,
+    ) {
+        for level in 1..=self.shape.root_level() {
+            let a = k.ancestor(level);
+            self.forget_summary(a);
+            self.edited.insert(a);
+        }
+        let Some(slot) = self.entries.get(&k).and_then(|e| e.brick) else {
+            return;
+        };
+        self.free_brick(slot, batch);
+        self.set_brick(k, None);
+        let view = view_at(source, k);
+        if content(&view) != Content::Branch {
+            return;
+        }
+        let wanted = u64::from(slot.alloc.units) * 16;
+        if reupload(wanted)
+            && let Ok(new_slot) = self.place_brick(k, view, batch)
+        {
+            self.set_brick(k, Some(new_slot));
+        }
+    }
+
+    /// The first half of applying a replaced chunk: it and its path forget
+    /// their summaries, everything resident below it is dropped (its group
+    /// stays, to be rewritten), and it is summarized from the source.
+    fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, batch: &mut UploadBatch) {
+        self.pending_chunks.remove(&c);
+        self.chunk_summaries.remove(&c);
+        for level in c.level()..=self.shape.root_level() {
+            self.forget_summary(c.ancestor(level));
+        }
+        if let Some(e) = self.entries.get(&c)
+            && e.group.is_some()
+        {
+            let kids = e.kids;
+            for slot in 0..64 {
+                if kids & (1u64 << slot) != 0 {
+                    self.drop_subtree(c.child(slot), batch);
+                }
+            }
+        }
+        let view = view_at(source, c);
+        if content(&view) == Content::Branch {
+            self.summary(c, view);
+        }
     }
 
     // -------------------------------------------------------------- checks --
@@ -844,6 +1097,23 @@ impl Residency {
                 return Err(format!(
                     "{key:?}: record {:?} but the source gives {expected:?}",
                     e.record
+                ));
+            }
+            let (mut kids, mut bricks) = (0u64, 0u64);
+            if e.group.is_some() {
+                for slot in 0..64 {
+                    if let Some(c) = self.entries.get(&key.child(slot)) {
+                        kids |= 1u64 << slot;
+                        if c.brick.is_some() {
+                            bricks |= 1u64 << slot;
+                        }
+                    }
+                }
+            }
+            if (e.kids, e.bricks) != (kids, bricks) {
+                return Err(format!(
+                    "{key:?}: child masks {:#x}/{:#x}, table holds {kids:#x}/{bricks:#x}",
+                    e.kids, e.bricks
                 ));
             }
             if let Some(g) = e.group {
@@ -884,6 +1154,34 @@ impl Residency {
             }
         }
         Ok(())
+    }
+}
+
+/// A cheap summary for a replaced chunk that is not applied yet: the
+/// material found by following the lowest non-air child down, and half the
+/// volume of its non-air children. Deterministic, and replaced by the exact
+/// summary when the chunk is applied.
+fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
+    let mut node = view;
+    let material = loop {
+        match content(&node) {
+            Content::Uniform(m) => break m,
+            Content::Leaf => {
+                break node
+                    .palette()
+                    .as_slice()
+                    .first()
+                    .copied()
+                    .unwrap_or(MaterialId::AIR);
+            }
+            Content::Branch => node = node.child(node.mask().trailing_zeros()),
+            Content::Air | Content::Unloaded => break MaterialId::AIR,
+        }
+    };
+    let child = node_volume(key.level().saturating_sub(1));
+    Summary {
+        material,
+        solid: u64::from(view.mask().count_ones()) * child / 2,
     }
 }
 

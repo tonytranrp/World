@@ -7,14 +7,20 @@
 //! brick that does not fit is made not resident (rays then request it
 //! again), never left stale. Record rewrites caused by edits and unlinks are
 //! mandatory and always go out, whatever the budget.
+//!
+//! Work that costs CPU time per item is bounded by counts, never by the
+//! clock, so frames stay deterministic (decision 0012): changes are applied
+//! nearest first until they have computed `max_change_summaries_per_frame`
+//! node summaries, and at most `lod.max_expansions_per_frame` nodes are
+//! expanded; the rest waits for later frames.
 
-use world_core::BrickPos;
 use world_core::tree::VoxelSource;
+use world_core::{BrickPos, VoxelPos};
 
 use super::batch::UploadBatch;
 use super::key::NodeKey;
-use super::residency::{Refused, Residency};
-use super::select::{ViewPoint, distance, projected_pixels, select_budgeted};
+use super::residency::{Change, Refused, Residency};
+use super::select::{ViewPoint, projected_pixels, select_budgeted};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -55,6 +61,9 @@ pub struct FrameInput<'a, S: VoxelSource> {
     /// The world changed wholesale: drop everything and start over.
     pub refresh: bool,
     pub dirty: &'a [BrickPos],
+    /// Chunks (by any voxel inside) whose content was replaced wholesale:
+    /// loaded, unloaded, or switched between full and coarse detail.
+    pub chunks: &'a [VoxelPos],
     pub view: Option<ViewPoint>,
     pub requests: &'a [Request],
     pub victims: &'a [Victim],
@@ -77,6 +86,10 @@ pub struct FrameReport {
     pub refused_full: u32,
     /// Expansions the node pool refused.
     pub refused_nodes: u32,
+    /// Changed bricks and replaced chunks applied this frame.
+    pub changes_applied: u32,
+    /// Changes left for later frames by the summary budget.
+    pub changes_pending: u32,
     /// Bytes of the serialized upload.
     pub upload_bytes: u64,
     /// Victims to ask the eviction pass for, if it should run.
@@ -149,28 +162,32 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
-    // Edits first.
-    let mut dirty: Vec<NodeKey> = input
-        .dirty
-        .iter()
-        .filter_map(|&b| shape.brick_key(b))
-        .collect();
-    dirty.sort_unstable();
-    dirty.dedup();
-    if let Some(view) = input.view {
-        dirty.sort_by(|a, b| {
-            distance(shape.origin, *a, view.eye)
-                .total_cmp(&distance(shape.origin, *b, view.eye))
-                .then(a.cmp(b))
-        });
-    }
-    if !dirty.is_empty() {
+    // Changes first: changed bricks and replaced chunks, nearest first,
+    // while their summaries fit the budget; the rest wait.
+    let split = res.chunk_level();
+    res.queue_changes(
+        input
+            .dirty
+            .iter()
+            .filter_map(|&b| shape.brick_key(b))
+            .map(Change::Brick)
+            .chain(
+                input
+                    .chunks
+                    .iter()
+                    .filter_map(|&p| shape.local(p))
+                    .map(|local| Change::Chunk(NodeKey::containing(local, split))),
+            ),
+    );
+    let had_changes = res.pending_changes() > 0;
+    if had_changes {
         let edit_budget = budget - reserve;
         let mut spent = cost(batch);
         let (mut up, mut down) = (0, 0);
-        res.apply_edits(
+        let applied = res.apply_changes(
             source,
-            &dirty,
+            input.view.map(|v| v.eye),
+            u64::from(input.config.max_change_summaries_per_frame),
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {
@@ -185,6 +202,8 @@ pub fn run_frame<S: VoxelSource + Sync>(
         );
         report.edited_uploaded = up;
         report.edited_unlinked = down;
+        report.changes_applied = applied.applied;
+        report.changes_pending = applied.pending;
     }
 
     // Shrinking never needs budget.
@@ -207,11 +226,18 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // Growth, by priority, while the budget lasts. An expanded node rejoins
     // the growth pass so its children are judged; candidates the budget did
     // not reach are carried to the next frame.
+    // Each expansion rewrites a group and summarizes its children, so their
+    // number is bounded as well as their bytes.
+    let mut attempts = 0u32;
     for &k in &expands {
-        if cost(batch) >= budget {
+        if cost(batch) >= budget || attempts >= lod.max_expansions_per_frame {
             break;
         }
-        match res.expand(source, k, batch) {
+        let result = res.expand(source, k, batch);
+        if matches!(result, Ok(_) | Err(Refused::PoolFull)) {
+            attempts += 1;
+        }
+        match result {
             Ok(_) => {
                 report.expanded += 1;
                 if let Some(view) = input.view {
@@ -260,7 +286,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     // Anything that changed the table can change what growth finds; edits
     // rewrite records even when no brick is uploaded.
-    if !dirty.is_empty()
+    if report.changes_applied > 0
         || report.collapsed
             + report.evicted
             + report.victims_applied

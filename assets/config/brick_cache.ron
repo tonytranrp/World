@@ -52,7 +52,20 @@
         // this many voxels or the cache changed; 0 looks every frame.
         // 0.0..=4096.0
         regrow_voxels: 16.0,
+        // A pass in progress starts over only once the camera moved this
+        // many voxels (at least regrow_voxels); smaller moves let it finish.
+        // 0.0..=65536.0
+        restart_voxels: 128.0,
+        // Nodes expanded per frame at most; the rest wait for the next
+        // frame. Each costs tens of microseconds on the floor Mac.
+        // 1..=1048576
+        max_expansions_per_frame: 128,
     ),
+    // Node summaries (each over up to 64 children) that applying edits and
+    // replaced chunks may compute per frame; further changes wait for later
+    // frames, nearest first. A replaced 16 m chunk costs one per mixed node
+    // in it. 1..=16777216
+    max_change_summaries_per_frame: 2048,
     // A small built-in scene while nothing feeds the renderer a world.
     debug_scene: true,
     // Animate a carve in the debug scene, exercising edit uploads.

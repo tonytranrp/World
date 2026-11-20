@@ -355,6 +355,7 @@ pub fn run_brick_cache(
         frame: state.frame,
         refresh,
         dirty: &feed.dirty,
+        chunks: &feed.chunks,
         view: view.0,
         requests: &requests,
         victims: &victims,
@@ -458,7 +459,7 @@ pub fn log_cache_stats(
     let s = state.residency.stats();
     let r = state.last_report;
     info!(
-        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
+        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} changes applied, {} pending, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
         state.frame,
         s.entries,
         s.expanded,
@@ -470,6 +471,8 @@ pub fn log_cache_stats(
         r.expanded,
         r.edited_uploaded,
         r.edited_unlinked,
+        r.changes_applied,
+        r.changes_pending,
         r.evicted,
         r.victims_applied,
         r.upload_bytes,
