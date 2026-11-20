@@ -48,7 +48,7 @@ fn settle(world: &mut StreamedWorld, eye: VoxelPos) {
     for _ in 0..2000 {
         world.update(eye, FRAME);
         let s = world.stats();
-        if world.is_settled(eye) && s.loading == 0 && s.saving == 0 {
+        if world.is_settled(eye) && s.loading == 0 && s.saving == 0 && s.compressing == 0 {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -752,7 +752,10 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
     let s = world.stats();
     assert!(s.saving >= 1 && s.saving_bytes > 0, "{s:?}");
     assert_eq!(s.hot_bytes, world.hot_bytes_walked());
-    assert_eq!(world.hot_bytes_counted(), s.hot_bytes + s.saving_bytes);
+    assert_eq!(
+        world.hot_bytes_counted(),
+        s.hot_bytes + s.saving_bytes + s.compressing_bytes
+    );
     settle(&mut world, away);
     assert_eq!(world.stats().saving_bytes, 0);
 
@@ -824,7 +827,14 @@ fn unedited_chunks_come_back_from_the_warm_cache_unchanged() {
 
     // Away: the unedited chunks are evicted, nothing is written, and they
     // stay compressed in RAM.
+    // Loads come first: while they fill the in-flight cap, the evicted
+    // chunks wait (counted toward the hot cap) instead of taking workers.
     let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    world.update(away, FRAME);
+    let s = world.stats();
+    assert!(s.loading > 0, "{s:?}");
+    assert!(s.compressing > 0 && s.compressing_bytes > 0, "{s:?}");
+    assert_eq!(s.warm_chunks, 0, "{s:?}");
     settle(&mut world, away);
     let s = world.stats();
     assert_eq!(s.writes, 0);
