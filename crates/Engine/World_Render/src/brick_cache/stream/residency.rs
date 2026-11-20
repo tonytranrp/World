@@ -22,12 +22,14 @@
 //!   brick id, and each entry's child masks match its children's entries.
 
 use bevy::platform::collections::{HashMap, HashSet};
+use bevy::tasks::{TaskPool, TaskPoolBuilder};
 use world_core::MaterialId;
 use world_core::tree::{NodeView, VoxelSource};
 
 use super::batch::UploadBatch;
 use super::key::{NodeKey, Shape, view_at};
 use super::select::GrowthState;
+use super::table::Table;
 use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
     Content, Summary, Tally, content, count_voxels, exact_summary, node_volume,
@@ -108,7 +110,7 @@ pub struct ResidencyStats {
 /// The residency table and the slot bookkeeping of the pools.
 pub struct Residency {
     shape: Shape,
-    entries: HashMap<NodeKey, Entry>,
+    entries: Table<Entry>,
     /// Cached summaries of nodes at and above the chunk level.
     summaries: HashMap<NodeKey, Summary>,
     /// Cached summaries below the chunk level, by chunk, so a replaced
@@ -126,6 +128,15 @@ pub struct Residency {
     warming: HashMap<NodeKey, u32>,
     /// Node summaries computed so far, the unit of the change budget.
     summarized: u64,
+    /// Entries taken out of the tree by a collapse or a replaced chunk and
+    /// not freed yet, with the node they were taken from: freeing a large
+    /// subtree is spread over frames (see [`free_buried`](Self::free_buried)).
+    /// Their descendants stay in the table under their keys until freed.
+    graveyard: std::collections::VecDeque<(NodeKey, NodeKey, Entry)>,
+    /// The nodes with descendants still in the graveyard or below it, and
+    /// how many graveyard entries each has left. Nothing below them is
+    /// refined until they are freed.
+    burying: HashMap<NodeKey, u32>,
     nodes: NodeSpace,
     bricks: BrickSpace,
     ids: IdSpace,
@@ -200,14 +211,9 @@ impl Residency {
     pub fn new(shape: Shape, layout: &PoolLayout) -> Option<Self> {
         Some(Self {
             shape,
-            // Growing a table of a million entries rehashes it in one go,
-            // over 100 ms on the floor Mac: reserve what a full node pool
-            // typically holds (entries are the mixed records, about a third
-            // of them) so that never happens mid-walk.
-            entries: HashMap::with_capacity_and_hasher(
-                (layout.node_count as usize).saturating_mul(7) / 16,
-                Default::default(),
-            ),
+            // Levels 1 and 2 grouped by their level-3 ancestor: at most 4160
+            // entries per small map.
+            entries: Table::new(3),
             summaries: HashMap::default(),
             chunk_summaries: HashMap::default(),
             edited: HashSet::default(),
@@ -215,6 +221,8 @@ impl Residency {
             pending_chunks: HashSet::default(),
             warming: HashMap::default(),
             summarized: 0,
+            graveyard: std::collections::VecDeque::new(),
+            burying: HashMap::default(),
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
             bricks: BrickSpace::new(&layout.segments, layout.allocs_per_segment),
             ids: IdSpace::new(layout.brick_ids),
@@ -255,6 +263,12 @@ impl Residency {
             brick_fill: self.bricks.fill(),
             brick_bytes: self.bricks.used_bytes(),
         }
+    }
+
+    /// Entries in the largest of the maps the table is split into: what one
+    /// insertion may have to rehash at worst.
+    pub fn largest_table_part(&self) -> usize {
+        self.entries.largest_part()
     }
 
     /// Resident bricks: each holds exactly one brick id. O(1), unlike
@@ -573,13 +587,15 @@ impl Residency {
 
     /// Adds or updates the entry of `key`, keeping its parent's child mask.
     fn put_entry(&mut self, key: NodeKey, index: u32, record: GpuNode) {
-        self.entries
-            .entry(key)
-            .and_modify(|e| {
+        match self.entries.get_mut(&key) {
+            Some(e) => {
                 e.index = index;
                 e.record = record;
-            })
-            .or_insert_with(|| Entry::new(index, record));
+            }
+            None => {
+                self.entries.insert(key, Entry::new(index, record));
+            }
+        }
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
@@ -794,15 +810,18 @@ impl Residency {
                 false,
             )),
         };
-        self.entries
-            .entry(root)
-            .and_modify(|e| e.record = record)
-            .or_insert_with(|| Entry::new(ROOT_NODE, record));
+        match self.entries.get_mut(&root) {
+            Some(e) => e.record = record,
+            None => {
+                self.entries.insert(root, Entry::new(ROOT_NODE, record));
+            }
+        }
         batch.write_node(ROOT_NODE, record);
     }
 
     /// Drops everything and writes the root from `source`, not expanded.
     pub fn reset<S: VoxelSource>(&mut self, source: &S, batch: &mut UploadBatch) {
+        self.free_buried(u32::MAX, batch);
         let root = self.shape.root();
         if let Some(e) = self.entries.remove(&root) {
             self.release(root, e, batch);
@@ -835,7 +854,7 @@ impl Residency {
         if e.group.is_some() {
             return Err(Refused::AlreadyDone);
         }
-        if self.in_waiting_chunk(key) {
+        if self.is_blocked(key) {
             return Err(Refused::Waiting);
         }
         let view = view_at(source, key);
@@ -865,14 +884,104 @@ impl Residency {
         if e.group.is_none() {
             return Err(Refused::AlreadyDone);
         }
-        let mut cleared = e;
-        cleared.brick = None;
-        self.release(key, cleared, batch);
+        // A leftover of a burial is freed by the graveyard, not here.
+        if self.in_buried(key) {
+            return Err(Refused::Waiting);
+        }
+        self.bury_children(key);
+        if let Some(g) = e.group {
+            self.nodes.free(g);
+        }
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.group = None;
         }
         self.write_record(key, e.record.unlinked(), batch);
         Ok(())
+    }
+
+    /// Takes the children of `key` out of the tree into the graveyard:
+    /// their groups and bricks, and their descendants, are freed later
+    /// under a budget. The caller rewrites or frees the group that held
+    /// their records.
+    fn bury_children(&mut self, key: NodeKey) {
+        let Some(e) = self.entries.get(&key) else {
+            return;
+        };
+        let mut kids = e.kids;
+        while kids != 0 {
+            let slot = kids.trailing_zeros();
+            kids &= kids - 1;
+            let ck = key.child(slot);
+            if let Some(ce) = self.remove_entry(ck) {
+                self.graveyard.push_back((key, ck, ce));
+                *self.burying.entry(key).or_default() += 1;
+            }
+        }
+    }
+
+    /// Frees buried entries (their groups and bricks), oldest first, taking
+    /// their children out of the table into the graveyard in turn, until
+    /// `max` entries were freed or taken out (at most 64 more). Returns how
+    /// many were freed. A node is no longer burying once everything below
+    /// it is freed, and stage 1 then starts a new pass, since its passes
+    /// skipped what lies below it.
+    pub fn free_buried(&mut self, max: u32, batch: &mut UploadBatch) -> u32 {
+        let mut freed = 0;
+        let mut work = 0u32;
+        while work < max {
+            // Oldest first, so no burial waits behind newer ones.
+            let Some((tag, key, e)) = self.graveyard.pop_front() else {
+                break;
+            };
+            if let Some(g) = e.group {
+                let mut kids = e.kids;
+                while kids != 0 {
+                    let slot = kids.trailing_zeros();
+                    kids &= kids - 1;
+                    let ck = key.child(slot);
+                    // Its parent left the table already: no masks to keep.
+                    if let Some(ce) = self.entries.remove(&ck) {
+                        self.graveyard.push_back((tag, ck, ce));
+                        *self.burying.entry(tag).or_default() += 1;
+                        work = work.saturating_add(1);
+                    }
+                }
+                self.nodes.free(g);
+            }
+            if let Some(b) = e.brick {
+                self.free_brick(b, batch);
+            }
+            if let Some(left) = self.burying.get_mut(&tag) {
+                *left -= 1;
+                if *left == 0 {
+                    // Stage 1 skipped everything below it: look again.
+                    self.burying.remove(&tag);
+                    self.growth.changed();
+                }
+            }
+            freed += 1;
+            work = work.saturating_add(1);
+        }
+        freed
+    }
+
+    /// Entries in the graveyard, not counting their descendants.
+    pub fn buried(&self) -> usize {
+        self.graveyard.len()
+    }
+
+    /// Whether `key` lies below a node whose descendants are still being
+    /// freed: its table entry may be one of them.
+    pub fn in_buried(&self, key: NodeKey) -> bool {
+        !self.burying.is_empty()
+            && (key.level()..self.shape.root_level())
+                .any(|level| self.burying.contains_key(&key.ancestor(level + 1)))
+    }
+
+    /// Whether stage 1 must leave `key` alone: it lies in a replaced chunk
+    /// that waits, or below a node whose descendants are being freed.
+    pub fn is_blocked(&self, key: NodeKey) -> bool {
+        self.in_waiting_chunk(key) || self.in_buried(key)
     }
 
     /// Uploads the brick of level-1 node `key`. Returns the block's bytes.
@@ -891,7 +1000,7 @@ impl Residency {
         if e.brick.is_some() {
             return Err(Refused::AlreadyDone);
         }
-        if self.in_waiting_chunk(key) {
+        if self.is_blocked(key) {
             return Err(Refused::Waiting);
         }
         let view = view_at(source, key);
@@ -927,7 +1036,7 @@ impl Residency {
         for &key in keys {
             let ok = key.level == 1
                 && self.entries.get(&key).is_some_and(|e| e.brick.is_none())
-                && !self.in_waiting_chunk(key);
+                && !self.is_blocked(key);
             if !ok {
                 continue;
             }
@@ -1014,6 +1123,9 @@ impl Residency {
         let Some(slot) = e.brick else {
             return Err(Refused::AlreadyDone);
         };
+        if self.in_buried(key) {
+            return Err(Refused::Waiting);
+        }
         let record = e.record.unlinked();
         self.set_brick(key, None);
         self.free_brick(slot, batch);
@@ -1025,7 +1137,7 @@ impl Residency {
     /// block it was chosen with (the readback is frames old).
     pub fn evict_victim(&mut self, id: u32, block: u32, batch: &mut UploadBatch) -> bool {
         match (self.key_of_id(id), self.block_of_id(id)) {
-            (Some(key), Some(current)) if current.pack() == block => {
+            (Some(key), Some(current)) if current.pack() == block && !self.in_buried(key) => {
                 self.evict_brick(key, batch).is_ok()
             }
             _ => false,
@@ -1033,16 +1145,18 @@ impl Residency {
     }
 
     /// Applies an edit batch's changed bricks at once (see
-    /// [`apply_changes`](Self::apply_changes)).
-    pub fn apply_edits<S: VoxelSource>(
+    /// [`apply_changes`](Self::apply_changes)), after freeing everything
+    /// buried, which an edit below would otherwise wait for.
+    pub fn apply_edits<S: VoxelSource + Sync>(
         &mut self,
         source: &S,
         dirty: &[NodeKey],
         reupload: impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
     ) {
+        self.free_buried(u32::MAX, batch);
         self.queue_changes(dirty.iter().map(|&k| Change::Brick(k)));
-        self.apply_changes(source, None, u64::MAX, reupload, batch);
+        self.apply_changes(source, None, u64::MAX, 1, reupload, batch);
     }
 
     /// Queues changes of the source; [`apply_changes`](Self::apply_changes)
@@ -1089,17 +1203,25 @@ impl Residency {
     /// progress per call. The rest wait for the next call, and until then
     /// the records above them describe the content they had before.
     ///
+    /// The budget can be exceeded by the last change it lets in: a chunk's
+    /// planned grandchildren stop once they reach it, so by at most one
+    /// grandchild (65 summaries), plus the children whose grandchildren
+    /// that completes (up to 64) and the chunk itself when it is applied;
+    /// a changed brick by its path (up to the tree's depth); and the path
+    /// rewrites that follow.
+    ///
     /// A changed brick: `reupload` decides, in that order, which resident
     /// changed bricks are uploaded again (it gets the block bytes the brick
     /// needs and returns whether it fits the budget); the rest become not
     /// resident. A replaced chunk drops everything resident below it (it
     /// described the old content) and is summarized afresh. Then every
     /// record on the applied changes' paths is rewritten from the source.
-    pub fn apply_changes<S: VoxelSource>(
+    pub fn apply_changes<S: VoxelSource + Sync>(
         &mut self,
         source: &S,
         eye: Option<[f32; 3]>,
         max_summaries: u64,
+        threads: usize,
         mut reupload: impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
     ) -> Applied {
@@ -1135,6 +1257,12 @@ impl Residency {
             }
             worked = true;
             let done = match change {
+                Change::Brick(k) if self.in_buried(k) => {
+                    // Its old entries are still being freed: it applies
+                    // once they are.
+                    rest.push(change);
+                    continue;
+                }
                 Change::Brick(k) if self.in_waiting_chunk(k) => {
                     // Its chunk is rebuilt when applied; only the edited
                     // marks carry over.
@@ -1147,9 +1275,10 @@ impl Residency {
                     true
                 }
                 Change::Chunk(c) => {
-                    let ready = self.warm_chunk(source, c, max_summaries.saturating_sub(spent));
+                    let ready =
+                        self.warm_chunk(source, c, max_summaries.saturating_sub(spent), threads);
                     if ready {
-                        self.apply_chunk(source, c, batch);
+                        self.apply_chunk(source, c);
                     }
                     ready
                 }
@@ -1249,10 +1378,17 @@ impl Residency {
 
     /// Summarizes the grandchildren of the replaced chunk `c` (and each
     /// child once its grandchildren are done) from where the last call
-    /// stopped, until `budget` summaries were computed (at least one
-    /// grandchild). The first call forgets what the chunk's old content
-    /// cached. Returns whether every grandchild is done.
-    fn warm_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, budget: u64) -> bool {
+    /// stopped: as many as fit `budget` summaries, counted exactly before
+    /// any is computed (at least one grandchild), on up to `threads`
+    /// threads. The first call forgets what the chunk's old content cached.
+    /// Returns whether every grandchild is done.
+    fn warm_chunk<S: VoxelSource + Sync>(
+        &mut self,
+        source: &S,
+        c: NodeKey,
+        budget: u64,
+        threads: usize,
+    ) -> bool {
         const DONE: u32 = 64 * 64;
         let next = match self.warming.get(&c) {
             Some(&n) => n,
@@ -1262,59 +1398,68 @@ impl Residency {
             }
         };
         let view = view_at(source, c);
-        if c.level < 3 || content(&view) != Content::Branch {
+        // Grandchildren are summarized as level-2 nodes (`summarize_level2`),
+        // so only a level-4 chunk is warmed; a smaller tree's chunk (its
+        // root) is summarized whole when applied.
+        if c.level != 4 || content(&view) != Content::Branch {
             self.warming.insert(c, DONE);
             return true;
         }
-        let start = self.summarized;
-        let mut next = next;
-        let mut progressed = false;
-        while next < DONE {
-            if progressed && self.summarized - start >= budget {
+        // The grandchildren this call summarizes, and what each costs: one
+        // summary for it and one per mixed child.
+        let mut units: Vec<NodeKey> = Vec::new();
+        let mut planned = 0u64;
+        let mut end = next;
+        while end < DONE {
+            if !units.is_empty() && planned >= budget {
                 break;
             }
-            let (s1, s2) = (next / 64, next % 64);
+            let (s1, s2) = (end / 64, end % 64);
             let child = view.child(s1);
             if view.mask() & (1u64 << s1) == 0 || content(&child) != Content::Branch {
-                next = (s1 + 1) * 64;
+                end = (s1 + 1) * 64;
                 continue;
             }
             if child.mask() & (1u64 << s2) != 0 {
                 let grandchild = child.child(s2);
                 if content(&grandchild) == Content::Branch {
-                    self.summary(c.child(s1).child(s2), grandchild);
-                    progressed = true;
+                    let mixed = grandchild
+                        .children()
+                        .filter(|(_, b)| content(b) == Content::Branch)
+                        .count();
+                    planned += 1 + mixed as u64;
+                    units.push(c.child(s1).child(s2));
                 }
             }
-            next += 1;
-            if next % 64 == 0 {
-                // From the cached grandchildren.
+            end += 1;
+        }
+        for (key, summary) in summarize_level2(source, &units, threads) {
+            self.summarized += 1;
+            self.cache_summary(key, summary);
+        }
+        // Children whose grandchildren are all done, from the cache.
+        for s1 in next / 64..end / 64 {
+            let child = view.child(s1);
+            if view.mask() & (1u64 << s1) != 0 && content(&child) == Content::Branch {
                 self.summary(c.child(s1), child);
             }
         }
-        self.warming.insert(c, next);
-        next >= DONE
+        self.warming.insert(c, end);
+        end >= DONE
     }
 
     /// The first half of applying a replaced chunk, once its grandchildren
     /// are summarized: it and its path forget their summaries, everything
-    /// resident below it is dropped (its group stays, to be rewritten), and
-    /// it is summarized from the source.
-    fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, batch: &mut UploadBatch) {
+    /// resident below it is buried (freed under a budget; its group stays,
+    /// to be rewritten), and it is summarized from the source.
+    fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey) {
         self.pending_chunks.remove(&c);
         self.warming.remove(&c);
         for level in c.level()..=self.shape.root_level() {
             self.forget_summary(c.ancestor(level));
         }
-        if let Some(e) = self.entries.get(&c)
-            && e.group.is_some()
-        {
-            let kids = e.kids;
-            for slot in 0..64 {
-                if kids & (1u64 << slot) != 0 {
-                    self.drop_subtree(c.child(slot), batch);
-                }
-            }
+        if self.entries.get(&c).is_some_and(|e| e.group.is_some()) {
+            self.bury_children(c);
         }
         let view = view_at(source, c);
         if content(&view) == Content::Branch {
@@ -1333,8 +1478,16 @@ impl Residency {
         segments: &[&[u32]],
         table: &[u32],
     ) -> Result<(), String> {
-        let expanded = self.entries.values().filter(|e| e.group.is_some()).count();
-        let bricks = self.entries.values().filter(|e| e.brick.is_some()).count();
+        let held = self
+            .entries
+            .values()
+            .chain(self.graveyard.iter().map(|(_, _, e)| e));
+        let (expanded, bricks) = held.fold((0, 0), |(g, b), e| {
+            (
+                g + usize::from(e.group.is_some()),
+                b + usize::from(e.brick.is_some()),
+            )
+        });
         let stats = self.stats();
         if (stats.expanded, stats.bricks) != (expanded, bricks) {
             return Err(format!(
@@ -1355,9 +1508,34 @@ impl Residency {
         }
         let affected =
             |res: &Self, key: NodeKey| pending_paths.contains(&key) || res.in_waiting_chunk(key);
+        // The tree: what the root reaches through the entries' child masks.
+        // Everything else is a buried entry's descendant, out of the tree
+        // and freed under a budget.
+        let mut reachable: HashSet<NodeKey> = HashSet::default();
+        let mut stack = vec![self.shape.root()];
+        while let Some(key) = stack.pop() {
+            let Some(e) = self.entries.get(&key) else {
+                continue;
+            };
+            reachable.insert(key);
+            if e.group.is_some() {
+                let mut kids = e.kids;
+                while kids != 0 {
+                    let slot = kids.trailing_zeros();
+                    kids &= kids - 1;
+                    stack.push(key.child(slot));
+                }
+            }
+        }
         let mut keys = self.keys();
         keys.sort_unstable();
         for key in keys {
+            if !reachable.contains(&key) {
+                if !self.in_buried(key) {
+                    return Err(format!("{key:?}: out of the tree but not buried"));
+                }
+                continue;
+            }
             let e = self.entries[&key];
             let stale = affected(self, key);
             let pool = nodes.get(e.index as usize).copied();
@@ -1522,7 +1700,100 @@ fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
     }
 }
 
-/// Encodes `jobs` (key, brick id, edited) on up to `threads` scoped threads,
+/// The summaries of the level-2 nodes `keys` (only level 2: a uniform
+/// child weighs a level-1 node's volume) and of their mixed children,
+/// computed in up to `threads` tasks: for each node, its mixed
+/// children's then its own, as [`Residency::summary`] computes them with
+/// nothing cached. Pure, so the result does not depend on the threads.
+fn summarize_level2<S: VoxelSource + Sync>(
+    source: &S,
+    keys: &[NodeKey],
+    threads: usize,
+) -> Vec<(NodeKey, Summary)> {
+    let run = |chunk: &[NodeKey]| {
+        let mut out = Vec::new();
+        let mut tally = Tally::default();
+        for &key in chunk {
+            debug_assert_eq!(key.level, 2, "summarize_level2 weighs level-1 children");
+            let view = view_at(source, key);
+            let mut node = Tally::default();
+            for (slot, child) in view.children() {
+                let s = match content(&child) {
+                    Content::Air | Content::Unloaded => Summary::default(),
+                    Content::Uniform(m) => Summary {
+                        material: m,
+                        solid: node_volume(1),
+                    },
+                    Content::Leaf => exact_summary(child, 0),
+                    Content::Branch => {
+                        tally.clear();
+                        count_voxels(child, 1, &mut tally);
+                        let s = tally.summary();
+                        out.push((key.child(slot), s));
+                        s
+                    }
+                };
+                node.add(s.material, s.solid);
+            }
+            out.push((key, node.summary()));
+        }
+        out
+    };
+    // A few nodes are not worth a task.
+    let tasks = if keys.len() < 8 { 1 } else { threads };
+    in_parallel(keys, tasks, run)
+}
+
+/// The brick cache's own task pool: up to 8 threads, made once. Not Bevy's
+/// compute task pool: a scope there, from inside the render system, made
+/// frames wait on Bevy's own tasks (walking, p95 and p99 5 to 7 ms higher).
+fn pool() -> &'static TaskPool {
+    static POOL: std::sync::OnceLock<TaskPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
+        TaskPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name("brick cache".to_string())
+            .build()
+    })
+}
+
+/// Threads of the brick cache's task pool, for sizing parallel work.
+pub fn pool_threads() -> usize {
+    pool().thread_num().max(1)
+}
+
+/// `run` over `items` split into up to `tasks` contiguous parts, on the
+/// brick cache's task pool (no threads are spawned per call), the results
+/// concatenated in order. A panic in a part is raised again here.
+fn in_parallel<T: Sync, R: Send + 'static>(
+    items: &[T],
+    tasks: usize,
+    run: impl Fn(&[T]) -> Vec<R> + Sync,
+) -> Vec<R> {
+    if tasks <= 1 || items.len() <= 1 {
+        return run(items);
+    }
+    let per = items.len().div_ceil(tasks);
+    let run = &run;
+    let parts = pool().scope(|scope| {
+        for part in items.chunks(per) {
+            scope.spawn(async move {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(part)))
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(items.len());
+    for part in parts {
+        match part {
+            Ok(results) => out.extend(results),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    out
+}
+
+/// Encodes `jobs` (key, brick id, edited) in up to `threads` tasks,
 /// each into its own buffer, and returns the blocks in job order.
 fn encode_parallel<S: VoxelSource + Sync>(
     source: &S,
@@ -1543,19 +1814,29 @@ fn encode_parallel<S: VoxelSource + Sync>(
             })
             .collect::<Vec<_>>()
     };
-    // Small batches are not worth a thread.
-    if threads <= 1 || jobs.len() < 32 {
-        return encode(jobs);
+    // Small batches are not worth a task.
+    let tasks = if jobs.len() < 32 { 1 } else { threads };
+    in_parallel(jobs, tasks, encode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_parallel;
+
+    #[test]
+    fn parallel_parts_keep_their_order() {
+        let items: Vec<u32> = (0..1000).collect();
+        let doubled = in_parallel(&items, 7, |part| part.iter().map(|x| x * 2).collect());
+        assert_eq!(doubled, items.iter().map(|x| x * 2).collect::<Vec<_>>());
     }
-    let per = jobs.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .chunks(per)
-            .map(|chunk| scope.spawn(move || encode(chunk)))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+
+    #[test]
+    #[should_panic(expected = "a part failed")]
+    fn a_panic_in_a_part_is_raised_again() {
+        let items: Vec<u32> = (0..1000).collect();
+        in_parallel(&items, 4, |part| {
+            assert!(!part.contains(&700), "a part failed");
+            part.to_vec()
+        });
+    }
 }

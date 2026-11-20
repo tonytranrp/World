@@ -12,8 +12,10 @@
 //! clock, so frames stay deterministic (decision 0012): changes are applied
 //! nearest first until they have computed `max_summaries_per_frame`
 //! node summaries; at most `lod.max_expansions_per_frame` nodes are
-//! expanded, and only while they too have computed fewer summaries than
-//! that; the shrink walk takes `lod.max_shrink_visits_per_frame` records.
+//! expanded, and only while they have computed fewer than
+//! `lod.max_expansion_summaries_per_frame` summaries; the shrink walk takes `lod.max_shrink_visits_per_frame` records;
+//! the records of collapsed or replaced subtrees are freed
+//! `max_frees_per_frame` at a time.
 //! The rest waits for later frames.
 
 use world_core::tree::VoxelSource;
@@ -92,6 +94,8 @@ pub struct FrameReport {
     pub changes_applied: u32,
     /// Changes left for later frames by the summary budget.
     pub changes_pending: u32,
+    /// Records of collapsed or replaced subtrees freed this frame.
+    pub freed: u32,
     /// Bytes of the serialized upload.
     pub upload_bytes: u64,
     /// Victims to ask the eviction pass for, if it should run.
@@ -183,6 +187,14 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
+    // Brick encoding and a replaced chunk's summaries are split into up to
+    // this many tasks on the brick cache's task pool.
+    let threads = super::residency::pool_threads();
+    let summary_tasks = match input.config.summary_threads {
+        0 => threads,
+        n => n as usize,
+    };
+
     // Changes first: changed bricks and replaced chunks, nearest first,
     // while their summaries fit the budget; the rest wait.
     let split = res.chunk_level();
@@ -209,6 +221,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
             source,
             input.view.map(|v| v.eye),
             u64::from(input.config.max_summaries_per_frame),
+            summary_tasks,
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {
@@ -251,7 +264,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // number is bounded as well as their bytes.
     let mut attempts = 0u32;
     let summaries_before = res.summaries_computed();
-    let max_summaries = u64::from(input.config.max_summaries_per_frame);
+    let max_summaries = u64::from(lod.max_expansion_summaries_per_frame);
     for &k in &expands {
         if cost(batch) >= budget
             || attempts >= lod.max_expansions_per_frame
@@ -282,7 +295,6 @@ pub fn run_frame<S: VoxelSource + Sync>(
     if cost(batch) < budget && !loads.is_empty() {
         let room = (budget - cost(batch)) / mean.max(1) + 1;
         let take = loads.len().min((room as usize).saturating_mul(5) / 4 + 8);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
         let (loaded, full) =
             res.load_bricks(source, &loads[..take], threads, |b| cost(b) < budget, batch);
         report.loaded += loaded;
@@ -297,6 +309,9 @@ pub fn run_frame<S: VoxelSource + Sync>(
         res.growth().carry(&expands, &loads);
     }
 
+    // Subtrees collapsed or replaced, freed a bounded number of records at
+    // a time.
+    report.freed = res.free_buried(input.config.max_frees_per_frame, batch);
     report.upload_bytes = cost(batch);
     // The pressure holds while the shrink pass its last change started runs.
     if input.config.stage == Stage::Distance && !res.settling() {

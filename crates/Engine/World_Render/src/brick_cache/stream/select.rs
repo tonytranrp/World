@@ -444,7 +444,7 @@ pub fn select_split(
         };
         // A replaced chunk not applied yet is rebuilt when it is: nothing
         // in it is worth refining until then.
-        if res.in_waiting_chunk(key) {
+        if res.is_blocked(key) {
             continue;
         }
         if key.level >= 2 {
@@ -505,7 +505,7 @@ pub fn select_split(
     // Candidates carried from earlier frames, if they still apply.
     for key in std::mem::take(&mut growth.carry_expand) {
         let still = res.node_state(key).is_some_and(|n| !n.expanded)
-            && !res.in_waiting_chunk(key)
+            && !res.is_blocked(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             let priority = if forced(key.level) {
@@ -518,7 +518,7 @@ pub fn select_split(
     }
     for key in std::mem::take(&mut growth.carry_load) {
         let still = res.node_state(key).is_some_and(|n| !n.brick_resident)
-            && !res.in_waiting_chunk(key)
+            && !res.is_blocked(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             load.push((projected_pixels(shape.origin, key, view), key));
@@ -543,6 +543,11 @@ pub fn select_split(
         let Some(node) = res.node_state(key) else {
             continue;
         };
+        // The walk may have queued it before a burial took it out of the
+        // tree; the graveyard frees it.
+        if res.in_buried(key) {
+            continue;
+        }
         let px = projected_pixels(shape.origin, key, view);
         let scale = if key.level >= 2 { pressure } else { 1.0 };
         let keep = px >= lod.detail_pixels * scale * lod.hysteresis;

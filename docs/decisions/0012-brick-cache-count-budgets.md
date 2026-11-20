@@ -46,8 +46,8 @@ and tests stay deterministic.
   Applying one drops everything the cache held below the chunk and
   summarizes it afresh; stage 1 refines it again.
 - **Changes are queued and applied nearest first under
-  `max_summaries_per_frame`** (2048 node summaries, each over up to 64
-  children). A changed brick is charged the cached summaries on its path
+  `max_summaries_per_frame`** (8192 node summaries, each over up to 64
+  children; 2048 at first, see below). A changed brick is charged the cached summaries on its path
   it forgets (at least one), since the path is summarized again when it is
   rewritten. A replaced chunk is summarized a grandchild at a time, across
   frames if needed, and applied once that is done; a chunk replaced again
@@ -82,7 +82,9 @@ and tests stay deterministic.
   expanded ancestor, the whole group only when the ancestor's mask
   changed.
 - **Expansions:** at most `lod.max_expansions_per_frame` (128), and only
-  while they have computed fewer than `max_summaries_per_frame` summaries;
+  while they have computed fewer than
+  `lod.max_expansion_summaries_per_frame` summaries (2048; they shared
+  `max_summaries_per_frame` until that rose to 8192);
   the rest are carried, as upload-limited candidates already were.
 - **Growth queues only children that can need work.** Each entry keeps
   the slots of its children that have records and, at level 2, of those
@@ -97,9 +99,30 @@ and tests stay deterministic.
   `lod.max_collapses_per_frame` collapses (256), resuming there. A
   pressure change restarts it at the growth budget and holds the pressure
   until that pass is done, instead of walking the whole table at once.
-- The residency table reserves what a full node pool typically holds
-  (7/16 of its records), so it never rehashes mid-walk; `stats` counts
-  node groups and brick ids instead of scanning.
+- **Collapsed and replaced subtrees are freed under
+  `max_frees_per_frame`** (16,384 records). A collapse or an applied
+  chunk only takes the node's children out of the table into a
+  graveyard; their groups, bricks and descendants are freed oldest first,
+  that many entries freed or taken out of the table a frame (at most 64
+  more), and nothing below the node is refined, loaded, collapsed or
+  evicted until they are; freeing the last of them starts a new growth
+  pass, since stage 1 skipped that subtree. A collapse counted against
+  `max_collapses_per_frame` could
+  still free a whole refined region: on a long 8 m/s walk one frame
+  applied five chunks that held 236,000 records (58 ms) during a pressure
+  change. An edit below such a node waits until its old entries are
+  freed.
+- **The residency table is split into small maps**: levels 1 and 2 by
+  their level-3 ancestor (at most 4,160 entries each), the rest in a top
+  map, and a small map that empties is dropped. A single table first
+  rehashed a million entries mid-walk (over 100 ms); reserving it up front
+  (7/16 of the node pool's records) then failed on long walks: the
+  collapses of a node pool pressure change left about 450,000 tombstones,
+  and the next insertion that found no room resized 1.38 million entries
+  to 3.67 million buckets in one go (282 ms; 296 and 310 ms frames at
+  frames 3145 and 3201 of two 6,000-frame 8 m/s walks). Growing or
+  rehashing one small map costs at most its own few thousand entries.
+  `stats` counts node groups and brick ids instead of scanning.
 
 ## Alternatives considered
 
@@ -135,21 +158,43 @@ and tests stay deterministic.
   175 and 21 to 35 holes on average, against 151 to 167 and 11 to 30,
   likely because faster frames take more CPU time from the generation
   workers.
-- At 8 m/s the change queue holds 700 to 1,200 changes (far coarse
-  chunks wait longest); at 4 m/s 300 to 800. A larger
-  `max_summaries_per_frame` (4096) keeps it near empty for about 4 ms more
-  per frame.
+- **A replaced chunk's grandchildren are summarized in up to 8 tasks**
+  on the brick cache's own task pool (`summary_threads`, 0 for one per
+  pool thread; threads are made once, and a panic in a task is raised
+  again),
+  only for level-4 chunks, whose grandchildren are level-2 nodes,
+  as many as the budget allows, counted exactly before any is computed
+  (one summary for each grandchild and one for each of its mixed
+  children); the summaries are a pure function of the snapshot, so the
+  threads change nothing but the time. With 2048 summaries a frame, one
+  thread, the queue never caught up on long 8 m/s walks: counted per 100
+  frames, the warming used the whole budget every frame (about 205,700)
+  while chunks arrived at 2 to 3 a frame, about 1,500 to 2,500 summaries
+  a frame, and pending reached 2,400 to 4,000 by frame 4,000. At 8192 on
+  8 threads it stays at 0 to 6 through 6,000 frames, and the frame mean
+  went down (17.3 to 15.3-15.5 ms on the long walks, about 1 ms lower in
+  1,500-frame walks at 4 and 8 m/s), since the same work takes less wall
+  time; p95 and p99 rose by up to 1 to 2 ms. The threads compete with the
+  residency's generation workers while the world fills: holes in the
+  first 15 s run 5 to 30% higher (185 to 190 and 42 to 49 in the first
+  two 5-second intervals at 8 m/s, against 157 to 175 and 30 to 39) and
+  the full-detail sphere settles about 2 s later, then holes stay at 0.
+  Warming on half the threads cost more frame time (p95 and p99 2 to 5 ms
+  higher) without fewer holes, both with threads spawned per call and
+  with 4 tasks on the persistent pool (mean +1, p95 +2 ms, holes 184 and
+  31 to 38 against 183 to 185 and 34 to 41). Running the tasks on Bevy's
+  compute task pool did lower the early holes (second interval 20 to 24
+  against 20 to 25 for mac-floor-perf) but made frames wait on Bevy's own
+  tasks (p95 5 to 7 ms higher), so the brick cache keeps its own pool of
+  up to 8 threads, made once.
 - `run_frame` now averages 11 to 13 ms while walking: about 6 ms of stage 1
   visits (cache-missing table lookups), 4 ms of changes, 1.5 ms of
   expansions. Fewer visits trade refinement latency for time, as in 0010;
   a CPU mirror of the pool walked by index remains the option for the
   per-visit cost.
-- Reserving the residency table costs its full size at startup: 2^21
-  buckets of 113 bytes (a 16-byte key, a 96-byte entry, a control byte),
-  about 237 MB, on the floor tier and 2^22, about 474 MB, on the PC tier.
-  macOS only maps pages as they are touched, but Windows counts the whole
-  allocation as committed memory. 2^21 is the smallest power of two that
-  held the floor walks (up to 1.45 million entries; 2^20 buckets hold
-  917,000), so the floor reserve is what the table grew to anyway; the PC
-  reserve follows its larger node pool and is untested by a walk. A
-  smaller entry would shrink both.
+- The split table reserves nothing up front: it grows with the entries
+  (113 bytes a slot: a 16-byte key, a 96-byte entry, a control byte),
+  about 160 to 230 MB at the floor walks' 1.3 to 1.45 million entries,
+  instead of a fixed 237 MB (floor) or 474 MB (PC) reservation that
+  Windows would count as committed. Lookups of levels 1 and 2 hash twice,
+  once into a map of small maps that stays in cache.
