@@ -24,9 +24,11 @@
 //! - **Shrink** (collapse and evict) must look at every record, so it is a
 //!   plain resumable walk.
 //!
-//! Growth is a function of the view and the table alone, so a new pass
-//! starts only once the camera moved more than `regrow_voxels` from where
-//! the last one started, or the table changed since (see [`GrowthState`]).
+//! Both are functions of the view, the pressure and the table alone, so a
+//! new pass of either starts only once the camera moved more than
+//! `regrow_voxels` from where that half's last pass started, the pixel
+//! angle changed, or the table changed since (see [`GrowthState`]). A still
+//! camera over a settled cache walks nothing.
 //! Nodes expanded while a pass runs rejoin it, so their children are judged
 //! by the same pass.
 //!
@@ -177,10 +179,15 @@ impl PartialOrd for Pending {
     }
 }
 
-/// Stage 1's growth across frames: the pass in progress, when it started,
-/// and the candidates the upload budget has not taken yet.
+/// Stage 1 across frames: the growth pass in progress, when it and the last
+/// shrink pass started, and the candidates the upload budget has not taken
+/// yet.
 #[derive(Clone, Debug, Default)]
 pub struct GrowthState {
+    /// The view the last shrink pass started with.
+    shrink_last: Option<ViewPoint>,
+    /// The table changed since the last shrink pass started.
+    shrink_changed: bool,
     /// The view the last pass started with.
     last: Option<ViewPoint>,
     /// The table changed since the last pass started.
@@ -194,18 +201,38 @@ pub struct GrowthState {
     carry_load: Vec<NodeKey>,
 }
 
+/// Whether a pass that last started at `last` must start again for `view`.
+fn pass_due(last: Option<ViewPoint>, changed: bool, view: &ViewPoint, regrow_voxels: f32) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    let moved2: f32 = (0..3).map(|a| (view.eye[a] - last.eye[a]).powi(2)).sum();
+    changed || last.pixel_angle != view.pixel_angle || moved2 > regrow_voxels * regrow_voxels
+}
+
 impl GrowthState {
     /// Whether a new pass must start for `view`: none ran yet, the table
     /// changed, the pixel angle changed or the eye moved more than
     /// `regrow_voxels` since the last pass started.
     pub fn due(&self, view: &ViewPoint, regrow_voxels: f32) -> bool {
-        let Some(last) = self.last else {
-            return true;
-        };
-        let moved2: f32 = (0..3).map(|a| (view.eye[a] - last.eye[a]).powi(2)).sum();
-        self.changed
-            || last.pixel_angle != view.pixel_angle
-            || moved2 > regrow_voxels * regrow_voxels
+        pass_due(self.last, self.changed, view, regrow_voxels)
+    }
+
+    /// Whether a new shrink pass must start for `view`, by the same rule.
+    pub fn shrink_due(&self, view: &ViewPoint, regrow_voxels: f32) -> bool {
+        pass_due(self.shrink_last, self.shrink_changed, view, regrow_voxels)
+    }
+
+    /// Starts a shrink pass for `view`.
+    pub fn shrink_ran(&mut self, view: ViewPoint) {
+        self.shrink_last = Some(view);
+        self.shrink_changed = false;
+    }
+
+    /// Something outside the table makes shrinking worth another look (stage
+    /// 2's request holds expire with time).
+    pub fn shrink_changed(&mut self) {
+        self.shrink_changed = true;
     }
 
     /// Starts a pass for `view`, dropping the rest of any pass in progress.
@@ -216,9 +243,11 @@ impl GrowthState {
         self.active = true;
     }
 
-    /// The table changed: a new pass starts once the current one is done.
+    /// The table changed: a new pass of each half starts once its current
+    /// one is done.
     pub fn changed(&mut self) {
         self.changed = true;
+        self.shrink_changed = true;
     }
 
     /// A pass is in progress.
@@ -256,7 +285,8 @@ pub fn select(res: &Residency, view: &ViewPoint, lod: &LodTuning) -> Selection {
 /// in progress, then visits at most `max_visits` nodes of the pass in
 /// progress; the candidates it finds join those carried from earlier
 /// frames that still apply. Shrink visits at most `max_visits` records of
-/// the walk in `walk` (a new walk from the root when it is empty).
+/// the walk in `walk`, which starts again from the root when it is empty
+/// and a shrink pass is due.
 /// `pressure` (at least 1) raises the detail threshold of levels 2 and up,
 /// whose expansions take node pool records; bricks keep theirs. Records
 /// removed since they were queued are skipped.
@@ -399,7 +429,8 @@ pub fn select_budgeted(
     }
 
     // Shrink: everything, resumably.
-    if walk.is_empty() {
+    if walk.is_empty() && growth.shrink_due(view, lod.regrow_voxels) {
+        growth.shrink_ran(*view);
         walk.push(shape.root());
     }
     let mut visits = 0u32;
@@ -488,6 +519,33 @@ mod tests {
         assert!(g.due(&near, 0.0), "0 runs every frame once moved");
         g.changed();
         assert!(g.due(&view, 16.0), "the table changed");
+    }
+
+    #[test]
+    fn shrink_reruns_after_moves_and_changes_only() {
+        let view = ViewPoint {
+            eye: [0.0, 0.0, 0.0],
+            pixel_angle: 0.01,
+        };
+        let mut g = GrowthState::default();
+        assert!(g.shrink_due(&view, 16.0), "never ran");
+        g.shrink_ran(view);
+        assert!(!g.shrink_due(&view, 16.0));
+        g.ran(view);
+        assert!(
+            !g.shrink_due(&view, 16.0),
+            "a growth pass is not a shrink pass"
+        );
+        let far = ViewPoint {
+            eye: [0.0, 17.0, 0.0],
+            ..view
+        };
+        assert!(g.shrink_due(&far, 16.0));
+        g.changed();
+        assert!(g.shrink_due(&view, 16.0), "the table changed");
+        g.shrink_ran(view);
+        g.shrink_changed();
+        assert!(g.shrink_due(&view, 16.0), "asked to look again");
     }
 
     #[test]

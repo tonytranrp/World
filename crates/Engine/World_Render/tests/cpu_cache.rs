@@ -585,6 +585,61 @@ fn candidates_the_budget_turns_away_are_carried_until_done() {
     assert_eq!((tight.0, tight.1), (roomy.0, roomy.1));
 }
 
+/// Once the cache has settled under a still camera, stage 1 walks nothing:
+/// no growth pass and no shrink pass, until the camera moves.
+#[test]
+fn a_still_camera_over_a_settled_cache_walks_nothing() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let mut batch = UploadBatch::default();
+    let mut frame = 0;
+    let mut step = |res: &mut world_render::internals::residency::Residency, view: ViewPoint| {
+        frame += 1;
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        let report = run_frame(res, &input, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        report
+    };
+    for _ in 0..60 {
+        step(&mut res, view);
+    }
+    for _ in 0..3 {
+        let report = step(&mut res, view);
+        assert_eq!(report.loaded + report.expanded + report.collapsed, 0);
+        assert!(res.take_walk().is_empty(), "a shrink walk is running");
+        assert!(!res.growth().is_active(), "a growth pass is running");
+    }
+    // Moving far away: the passes run again and the detail follows.
+    let moved = ViewPoint {
+        eye: [0.0, 0.0, -20000.0],
+        ..view
+    };
+    let mut work = 0;
+    for _ in 0..5 {
+        let r = step(&mut res, moved);
+        work += r.loaded + r.expanded + r.collapsed + r.evicted;
+    }
+    assert!(work > 0, "nothing followed the camera");
+}
+
 /// From the default camera, stage 1 refines the debug scene down to resident
 /// bricks within a few frames and the result stays consistent.
 #[test]

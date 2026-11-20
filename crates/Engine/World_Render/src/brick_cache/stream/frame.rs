@@ -111,6 +111,10 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // Stage work, decided before edits so their reserve is known. Under node
     // pool pressure stage 1 asks for coarser nodes.
     let lod = &input.config.lod;
+    if input.config.stage == Stage::RayGuided {
+        // Request holds expire with time, not with the view or the table.
+        res.growth().shrink_changed();
+    }
     let selection = match input.view {
         Some(view) => {
             let visits = if res.take_full_shrink() {
