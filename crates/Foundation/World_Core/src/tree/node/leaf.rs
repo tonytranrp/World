@@ -198,18 +198,73 @@ pub(crate) enum PackedLeaf {
 /// material, else exactly the materials present, ascending, at the minimal
 /// index width.
 pub(crate) fn encode(voxels: &Voxels) -> PackedLeaf {
-    // The distinct solid materials in order of first appearance. Leaves
-    // rarely hold more than a few, and runs of one material are common, so
-    // a check against the previous voxel skips most of the scans.
-    let mut mask = 0u64;
+    // Branch-free passes first, 16 voxels at a time so they vectorize: the
+    // solid mask and the smallest and largest solid material. Most leaves
+    // stop at one of the two common shapes below.
+    let mask = bits(voxels, |m| m != 0);
+    if mask == 0 {
+        return PackedLeaf::Inline(Record::AIR);
+    }
+    let (mut lo, mut hi) = (u16::MAX, 0u16);
+    for &m in voxels {
+        lo = lo.min(if m.is_air() { u16::MAX } else { m.0 });
+        hi = hi.max(m.0);
+    }
+    if lo == hi {
+        return PackedLeaf::Inline(Record::single(mask, MaterialId(lo)));
+    }
+    // Exactly two materials: one index bit per solid voxel, set for `hi`.
+    let others = bits(voxels, |m| m != 0 && m != lo && m != hi);
+    if others == 0 {
+        let high = bits(voxels, |m| m == hi);
+        return two_materials(mask, MaterialId(lo), MaterialId(hi), high);
+    }
+    many_materials(voxels, mask)
+}
+
+/// Bit `slot` set where `test` holds for voxel `slot`'s material id.
+#[inline(always)]
+fn bits(voxels: &Voxels, test: impl Fn(u16) -> bool) -> u64 {
+    let mut out = 0u64;
+    for (i, chunk) in voxels.chunks_exact(16).enumerate() {
+        let mut word = 0u16;
+        for (j, m) in chunk.iter().enumerate() {
+            word |= u16::from(test(m.0)) << j;
+        }
+        out |= u64::from(word) << (16 * i);
+    }
+    out
+}
+
+/// The palette leaf of solid voxels `mask` made of `lo` and `hi` (`lo < hi`),
+/// with `hi` where `high` is set.
+fn two_materials(mask: u64, lo: MaterialId, hi: MaterialId, high: u64) -> PackedLeaf {
+    // Index `k` is the bit of the `k`-th solid voxel.
+    let mut indices = 0u64;
+    for (k, slot) in slots(mask).enumerate() {
+        indices |= (high >> slot & 1) << k;
+    }
+    let mut words = [0u32; MAX_PALETTE_BLOCK];
+    words[0] = header(2, 1);
+    words[1] = u32::from(lo.0) | u32::from(hi.0) << 16;
+    words[2] = indices as u32;
+    words[3] = (indices >> 32) as u32;
+    let len = 2 + index_words(mask.count_ones() as usize, 1);
+    PackedLeaf::Palette {
+        mask,
+        block: PaletteBlock { words, len },
+    }
+}
+
+/// The palette leaf of solid voxels `mask` holding three or more materials.
+fn many_materials(voxels: &Voxels, mask: u64) -> PackedLeaf {
+    // The distinct solid materials in order of first appearance; runs of
+    // one material skip the scan.
     let mut distinct = [MaterialId::AIR; MAX_PALETTE];
     let mut len = 0;
     let mut last = MaterialId::AIR;
-    for (slot, &m) in (0..).zip(voxels) {
-        if m.is_air() {
-            continue;
-        }
-        mask |= 1 << slot;
+    for slot in slots(mask) {
+        let m = voxels[slot as usize];
         if m != last {
             last = m;
             if !distinct[..len].contains(&m) {
@@ -217,12 +272,6 @@ pub(crate) fn encode(voxels: &Voxels) -> PackedLeaf {
                 len += 1;
             }
         }
-    }
-    if mask == 0 {
-        return PackedLeaf::Inline(Record::AIR);
-    }
-    if len == 1 {
-        return PackedLeaf::Inline(Record::single(mask, distinct[0]));
     }
     let palette = &mut distinct[..len];
     palette.sort_unstable();
@@ -415,7 +464,7 @@ mod tests {
         fn encode_matches_the_reference(
             // Few materials with long runs, like terrain, up to every slot
             // its own material.
-            spread in 1u16..80,
+            spread in proptest::prop_oneof![1u16..5, 1u16..80],
             run in 1usize..20,
             seed: u64,
         ) {
