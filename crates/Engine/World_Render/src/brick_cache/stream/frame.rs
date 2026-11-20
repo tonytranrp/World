@@ -13,7 +13,9 @@
 //! nearest first until they have computed `max_summaries_per_frame`
 //! node summaries; at most `lod.max_expansions_per_frame` nodes are
 //! expanded, and only while they too have computed fewer summaries than
-//! that; the shrink walk takes `lod.max_shrink_visits_per_frame` records.
+//! that; the shrink walk takes `lod.max_shrink_visits_per_frame` records;
+//! the records of collapsed or replaced subtrees are freed
+//! `max_frees_per_frame` at a time.
 //! The rest waits for later frames.
 
 use world_core::tree::VoxelSource;
@@ -92,6 +94,8 @@ pub struct FrameReport {
     pub changes_applied: u32,
     /// Changes left for later frames by the summary budget.
     pub changes_pending: u32,
+    /// Records of collapsed or replaced subtrees freed this frame.
+    pub freed: u32,
     /// Bytes of the serialized upload.
     pub upload_bytes: u64,
     /// Victims to ask the eviction pass for, if it should run.
@@ -300,6 +304,9 @@ pub fn run_frame<S: VoxelSource + Sync>(
         res.growth().carry(&expands, &loads);
     }
 
+    // Subtrees collapsed or replaced, freed a bounded number of records at
+    // a time.
+    report.freed = res.free_buried(input.config.max_frees_per_frame, batch);
     report.upload_bytes = cost(batch);
     // The pressure holds while the shrink pass its last change started runs.
     if input.config.stage == Stage::Distance && !res.settling() {

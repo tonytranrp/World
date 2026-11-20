@@ -118,6 +118,11 @@ pub struct BrickCacheConfig {
     /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
     /// needs 1,500 to 2,500 a frame. `1..=16777216`.
     pub max_summaries_per_frame: u32,
+    /// Records whose groups and bricks are freed per frame after a collapse
+    /// or a replaced chunk took them out of the tree; the rest wait, and
+    /// nothing below them is refined until they are freed. A refined 16 m
+    /// chunk can hold over 100,000. `256..=16777216`.
+    pub max_frees_per_frame: u32,
     /// Show a small built-in scene while nothing feeds the renderer a world.
     pub debug_scene: bool,
     /// Animate a carve in the debug scene, to exercise edit uploads.
@@ -157,6 +162,7 @@ impl Default for BrickCacheConfig {
                 max_collapses_per_frame: 256,
             },
             max_summaries_per_frame: 8192,
+            max_frees_per_frame: 16384,
             debug_scene: true,
             debug_scene_edits: true,
         }
@@ -254,6 +260,12 @@ impl ConfigAsset for BrickCacheConfig {
             "max_summaries_per_frame",
             self.max_summaries_per_frame.into(),
             1.0,
+            16777216.0,
+        );
+        range(
+            "max_frees_per_frame",
+            self.max_frees_per_frame.into(),
+            256.0,
             16777216.0,
         );
         range(

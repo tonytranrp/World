@@ -127,6 +127,15 @@ pub struct Residency {
     warming: HashMap<NodeKey, u32>,
     /// Node summaries computed so far, the unit of the change budget.
     summarized: u64,
+    /// Entries taken out of the tree by a collapse or a replaced chunk and
+    /// not freed yet, with the node they were taken from: freeing a large
+    /// subtree is spread over frames (see [`free_buried`](Self::free_buried)).
+    /// Their descendants stay in the table under their keys until freed.
+    graveyard: Vec<(NodeKey, NodeKey, Entry)>,
+    /// The nodes with descendants still in the graveyard or below it, and
+    /// how many graveyard entries each has left. Nothing below them is
+    /// refined until they are freed.
+    burying: HashMap<NodeKey, u32>,
     nodes: NodeSpace,
     bricks: BrickSpace,
     ids: IdSpace,
@@ -211,6 +220,8 @@ impl Residency {
             pending_chunks: HashSet::default(),
             warming: HashMap::default(),
             summarized: 0,
+            graveyard: Vec::new(),
+            burying: HashMap::default(),
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
             bricks: BrickSpace::new(&layout.segments, layout.allocs_per_segment),
             ids: IdSpace::new(layout.brick_ids),
@@ -809,6 +820,7 @@ impl Residency {
 
     /// Drops everything and writes the root from `source`, not expanded.
     pub fn reset<S: VoxelSource>(&mut self, source: &S, batch: &mut UploadBatch) {
+        self.free_buried(u32::MAX, batch);
         let root = self.shape.root();
         if let Some(e) = self.entries.remove(&root) {
             self.release(root, e, batch);
@@ -841,7 +853,7 @@ impl Residency {
         if e.group.is_some() {
             return Err(Refused::AlreadyDone);
         }
-        if self.in_waiting_chunk(key) {
+        if self.is_blocked(key) {
             return Err(Refused::Waiting);
         }
         let view = view_at(source, key);
@@ -871,14 +883,92 @@ impl Residency {
         if e.group.is_none() {
             return Err(Refused::AlreadyDone);
         }
-        let mut cleared = e;
-        cleared.brick = None;
-        self.release(key, cleared, batch);
+        self.bury_children(key);
+        if let Some(g) = e.group {
+            self.nodes.free(g);
+        }
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.group = None;
         }
         self.write_record(key, e.record.unlinked(), batch);
         Ok(())
+    }
+
+    /// Takes the children of `key` out of the tree into the graveyard:
+    /// their groups and bricks, and their descendants, are freed later
+    /// under a budget. The caller rewrites or frees the group that held
+    /// their records.
+    fn bury_children(&mut self, key: NodeKey) {
+        let Some(e) = self.entries.get(&key) else {
+            return;
+        };
+        let mut kids = e.kids;
+        while kids != 0 {
+            let slot = kids.trailing_zeros();
+            kids &= kids - 1;
+            let ck = key.child(slot);
+            if let Some(ce) = self.remove_entry(ck) {
+                self.graveyard.push((key, ck, ce));
+                *self.burying.entry(key).or_default() += 1;
+            }
+        }
+    }
+
+    /// Frees up to `max` buried entries (their groups and bricks), taking
+    /// their children out of the table into the graveyard in turn. Returns
+    /// how many were freed. A node is no longer burying once everything
+    /// below it is freed.
+    pub fn free_buried(&mut self, max: u32, batch: &mut UploadBatch) -> u32 {
+        let mut freed = 0;
+        while freed < max {
+            let Some((tag, key, e)) = self.graveyard.pop() else {
+                break;
+            };
+            if let Some(g) = e.group {
+                let mut kids = e.kids;
+                while kids != 0 {
+                    let slot = kids.trailing_zeros();
+                    kids &= kids - 1;
+                    let ck = key.child(slot);
+                    // Its parent left the table already: no masks to keep.
+                    if let Some(ce) = self.entries.remove(&ck) {
+                        self.graveyard.push((tag, ck, ce));
+                        *self.burying.entry(tag).or_default() += 1;
+                    }
+                }
+                self.nodes.free(g);
+            }
+            if let Some(b) = e.brick {
+                self.free_brick(b, batch);
+            }
+            if let Some(left) = self.burying.get_mut(&tag) {
+                *left -= 1;
+                if *left == 0 {
+                    self.burying.remove(&tag);
+                }
+            }
+            freed += 1;
+        }
+        freed
+    }
+
+    /// Entries in the graveyard, not counting their descendants.
+    pub fn buried(&self) -> usize {
+        self.graveyard.len()
+    }
+
+    /// Whether `key` lies below a node whose descendants are still being
+    /// freed: its table entry may be one of them.
+    pub fn in_buried(&self, key: NodeKey) -> bool {
+        !self.burying.is_empty()
+            && (key.level()..self.shape.root_level())
+                .any(|level| self.burying.contains_key(&key.ancestor(level + 1)))
+    }
+
+    /// Whether stage 1 must leave `key` alone: it lies in a replaced chunk
+    /// that waits, or below a node whose descendants are being freed.
+    pub fn is_blocked(&self, key: NodeKey) -> bool {
+        self.in_waiting_chunk(key) || self.in_buried(key)
     }
 
     /// Uploads the brick of level-1 node `key`. Returns the block's bytes.
@@ -897,7 +987,7 @@ impl Residency {
         if e.brick.is_some() {
             return Err(Refused::AlreadyDone);
         }
-        if self.in_waiting_chunk(key) {
+        if self.is_blocked(key) {
             return Err(Refused::Waiting);
         }
         let view = view_at(source, key);
@@ -933,7 +1023,7 @@ impl Residency {
         for &key in keys {
             let ok = key.level == 1
                 && self.entries.get(&key).is_some_and(|e| e.brick.is_none())
-                && !self.in_waiting_chunk(key);
+                && !self.is_blocked(key);
             if !ok {
                 continue;
             }
@@ -1031,7 +1121,7 @@ impl Residency {
     /// block it was chosen with (the readback is frames old).
     pub fn evict_victim(&mut self, id: u32, block: u32, batch: &mut UploadBatch) -> bool {
         match (self.key_of_id(id), self.block_of_id(id)) {
-            (Some(key), Some(current)) if current.pack() == block => {
+            (Some(key), Some(current)) if current.pack() == block && !self.in_buried(key) => {
                 self.evict_brick(key, batch).is_ok()
             }
             _ => false,
@@ -1142,6 +1232,12 @@ impl Residency {
             }
             worked = true;
             let done = match change {
+                Change::Brick(k) if self.in_buried(k) => {
+                    // Its old entries are still being freed: it applies
+                    // once they are.
+                    rest.push(change);
+                    continue;
+                }
                 Change::Brick(k) if self.in_waiting_chunk(k) => {
                     // Its chunk is rebuilt when applied; only the edited
                     // marks carry over.
@@ -1157,7 +1253,7 @@ impl Residency {
                     let ready =
                         self.warm_chunk(source, c, max_summaries.saturating_sub(spent), threads);
                     if ready {
-                        self.apply_chunk(source, c, batch);
+                        self.apply_chunk(source, c);
                     }
                     ready
                 }
@@ -1326,23 +1422,16 @@ impl Residency {
 
     /// The first half of applying a replaced chunk, once its grandchildren
     /// are summarized: it and its path forget their summaries, everything
-    /// resident below it is dropped (its group stays, to be rewritten), and
-    /// it is summarized from the source.
-    fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, batch: &mut UploadBatch) {
+    /// resident below it is buried (freed under a budget; its group stays,
+    /// to be rewritten), and it is summarized from the source.
+    fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey) {
         self.pending_chunks.remove(&c);
         self.warming.remove(&c);
         for level in c.level()..=self.shape.root_level() {
             self.forget_summary(c.ancestor(level));
         }
-        if let Some(e) = self.entries.get(&c)
-            && e.group.is_some()
-        {
-            let kids = e.kids;
-            for slot in 0..64 {
-                if kids & (1u64 << slot) != 0 {
-                    self.drop_subtree(c.child(slot), batch);
-                }
-            }
+        if self.entries.get(&c).is_some_and(|e| e.group.is_some()) {
+            self.bury_children(c);
         }
         let view = view_at(source, c);
         if content(&view) == Content::Branch {
@@ -1361,8 +1450,16 @@ impl Residency {
         segments: &[&[u32]],
         table: &[u32],
     ) -> Result<(), String> {
-        let expanded = self.entries.values().filter(|e| e.group.is_some()).count();
-        let bricks = self.entries.values().filter(|e| e.brick.is_some()).count();
+        let held = self
+            .entries
+            .values()
+            .chain(self.graveyard.iter().map(|(_, _, e)| e));
+        let (expanded, bricks) = held.fold((0, 0), |(g, b), e| {
+            (
+                g + usize::from(e.group.is_some()),
+                b + usize::from(e.brick.is_some()),
+            )
+        });
         let stats = self.stats();
         if (stats.expanded, stats.bricks) != (expanded, bricks) {
             return Err(format!(
@@ -1386,6 +1483,11 @@ impl Residency {
         let mut keys = self.keys();
         keys.sort_unstable();
         for key in keys {
+            // Descendants of buried entries, freed under a budget: out of
+            // the tree already.
+            if self.in_buried(key) {
+                continue;
+            }
             let e = self.entries[&key];
             let stale = affected(self, key);
             let pool = nodes.get(e.index as usize).copied();

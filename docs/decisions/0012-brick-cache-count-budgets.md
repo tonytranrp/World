@@ -97,6 +97,16 @@ and tests stay deterministic.
   `lod.max_collapses_per_frame` collapses (256), resuming there. A
   pressure change restarts it at the growth budget and holds the pressure
   until that pass is done, instead of walking the whole table at once.
+- **Collapsed and replaced subtrees are freed under
+  `max_frees_per_frame`** (16,384 records). A collapse or an applied
+  chunk only takes the node's children out of the table into a
+  graveyard; their groups, bricks and descendants are freed that many a
+  frame, and nothing below the node is refined, loaded or evicted until
+  they are. A collapse counted against `max_collapses_per_frame` could
+  still free a whole refined region: on a long 8 m/s walk one frame
+  applied five chunks that held 236,000 records (58 ms) during a pressure
+  change. An edit below such a node waits until its old entries are
+  freed.
 - **The residency table is split into small maps**: levels 1 and 2 by
   their level-3 ancestor (at most 4,160 entries each), the rest in a top
   map, and a small map that empties is dropped. A single table first

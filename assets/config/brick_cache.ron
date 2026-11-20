@@ -76,6 +76,11 @@
     // computed on up to 8 threads. Walking at 8 m/s needs 1,500 to 2,500 a
     // frame. 1..=16777216
     max_summaries_per_frame: 8192,
+    // Records whose groups and bricks are freed per frame after a collapse or
+    // a replaced chunk took them out of the tree; the rest wait, and nothing
+    // below them is refined until they are freed. A refined 16 m chunk can
+    // hold over 100,000. 256..=16777216
+    max_frees_per_frame: 16384,
     // A small built-in scene while nothing feeds the renderer a world.
     debug_scene: true,
     // Animate a carve in the debug scene, exercising edit uploads.

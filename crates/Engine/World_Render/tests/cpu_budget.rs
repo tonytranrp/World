@@ -1510,3 +1510,79 @@ fn warming_on_threads_matches_warming_on_one() {
     };
     assert!(run(1) == run(8), "threads changed the result");
 }
+
+/// Collapsing large subtrees frees their records a bounded number at a
+/// time (`max_frees_per_frame`), never a whole refined region in one frame
+/// (236,000 records, 58 ms, once on a long walk); nothing below them is
+/// refined meanwhile, and the table ends exact and refines again.
+#[test]
+fn collapsed_subtrees_are_freed_a_bounded_number_a_frame() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let max_frees = 1000u32;
+    let max_collapses = 2u32;
+    let mut config = BrickCacheConfig {
+        max_frees_per_frame: max_frees,
+        ..Default::default()
+    };
+    config.lod.max_collapses_per_frame = max_collapses;
+    config.lod.max_expansions_per_frame = 1 << 20;
+    config.max_summaries_per_frame = 1 << 24;
+    let near = ViewPoint {
+        eye: [1024.0, -8.0, 1024.0],
+        pixel_angle: 1e-4,
+    };
+    let far = ViewPoint {
+        eye: [1024.0, -8.0, -200000.0],
+        pixel_angle: 0.5,
+    };
+    let mut frame = 1;
+    let mut run = |res: &mut Residency, pools: &mut CpuPools, view: ViewPoint, frames: u32| {
+        let mut most_dropped = 0usize;
+        for _ in 0..frames {
+            let before = res.stats().entries;
+            let mut batch = UploadBatch::default();
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 64 << 20,
+                victim_capacity: 64,
+            };
+            run_frame(res, &input, &mut batch);
+            apply_cpu(pools, &batch);
+            verify(res, &snap, pools);
+            most_dropped = most_dropped.max(before.saturating_sub(res.stats().entries));
+            frame += 1;
+        }
+        most_dropped
+    };
+    run(&mut res, &mut pools, near, 40);
+    let refined = res.stats().expanded;
+    assert!(res.stats().entries > 10_000, "{:?}", res.stats());
+    // Far away: everything below the always-expanded levels collapses.
+    let dropped = run(&mut res, &mut pools, far, 120);
+    assert!(
+        dropped as u32 <= max_frees + 64 * max_collapses,
+        "{dropped} records left the table in one frame"
+    );
+    assert_eq!(res.buried(), 0, "everything was freed");
+    assert!(res.stats().expanded < refined / 4, "{:?}", res.stats());
+    // Back: the region refines again.
+    run(&mut res, &mut pools, near, 60);
+    assert_eq!(res.stats().expanded, refined);
+}
