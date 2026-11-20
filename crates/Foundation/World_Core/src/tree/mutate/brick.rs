@@ -63,12 +63,13 @@ impl Writer<'_> {
 
     /// Overwrites leaf `slot` of a stored level-1 node with `new` where that
     /// keeps the node canonical without repacking: the slot already holds a
-    /// stored record that is not full, and `new` is neither air nor full. A
-    /// full leaf changes which leaves are defaults, and only full leaves can
-    /// make the node collapse, so those always repack. Returns whether it
-    /// wrote.
+    /// stored record that is not a full single-material leaf, and `new` is
+    /// neither air nor one. Full single-material leaves decide which leaves
+    /// are defaults, and only they can make the node collapse, so those
+    /// always repack; a full leaf of several materials is an ordinary record.
+    /// Returns whether it wrote.
     pub(super) fn patch_record(&mut self, node: Node, slot: u32, new: Record) -> bool {
-        if new.mask == 0 || new.mask == u64::MAX || node.mask & bit(slot) == 0 {
+        if new.mask == 0 || new.uniform().is_some() || node.mask & bit(slot) == 0 {
             return false;
         }
         let header = self.header(node);
@@ -76,7 +77,10 @@ impl Writer<'_> {
             return false;
         }
         let at = node.base + header.record_offset(node.mask, slot) as u32;
-        if Record::read(self.store().block(at, RECORD_WORDS)).mask == u64::MAX {
+        if Record::read(self.store().block(at, RECORD_WORDS))
+            .uniform()
+            .is_some()
+        {
             return false;
         }
         self.store_mut().write_block(at, &new.words());
@@ -153,19 +157,34 @@ impl Writer<'_> {
 /// full leaves, ties to the lower id) and its leaves, and one record per
 /// other non-air leaf.
 pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
-    let mask = (0..)
-        .zip(records)
-        .filter(|(_, r)| r.mask != 0)
-        .fold(0u64, |m, (slot, _)| m | bit(slot));
+    // One pass: the mask, the full single-material leaves, and whether they
+    // are all one material (then that is the default, or the whole brick).
+    let mut mask = 0u64;
+    let mut full = 0u64;
+    let mut first: Option<MaterialId> = None;
+    let mut mixed = false;
+    for (slot, r) in (0..).zip(records) {
+        if r.mask == 0 {
+            continue;
+        }
+        mask |= bit(slot);
+        if let Some(m) = r.uniform() {
+            full |= bit(slot);
+            match first {
+                None => first = Some(m),
+                Some(f) => mixed |= f != m,
+            }
+        }
+    }
     if mask == 0 {
         return Packed::Filled(MaterialId::AIR);
     }
-    if let Some(material) = records[0].uniform()
-        && records.iter().all(|&r| r == records[0])
-    {
-        return Packed::Filled(material);
-    }
-    let header = default_leaves(records);
+    let header = match first {
+        Some(material) if !mixed && full == u64::MAX => return Packed::Filled(material),
+        Some(default) if !mixed => BrickHeader { full, default },
+        Some(_) => default_leaves(records),
+        None => BrickHeader::default(),
+    };
     let mut words = [0; MAX_BLOCK_LEN];
     words[..BRICK_HEADER_WORDS].copy_from_slice(&header.words());
     let mut len = BRICK_HEADER_WORDS;
