@@ -258,11 +258,15 @@ impl ChunkSource {
                 each(slot, LeafFill::Uniform(material));
                 continue;
             }
-            let carving = cell.as_ref().map(|(caves, corners)| {
-                let f = field.unwrap_or_else(|| block_field(corners, leaf_min, [0, 1, 2, 3]));
-                (*caves, Some(f))
-            });
-            self.fill_leaf(leaf_min, lx + 4 * ox, lz + 4 * oz, carving, &mut voxels);
+            let (ix, iz) = (lx + 4 * ox, lz + 4 * oz);
+            match &cell {
+                Some((caves, corners)) => {
+                    let f =
+                        field.get_or_insert_with(|| block_field(corners, leaf_min, [0, 1, 2, 3]));
+                    self.fill_leaf(leaf_min, ix, iz, Carving::Field(caves, f), &mut voxels);
+                }
+                None => self.fill_leaf(leaf_min, ix, iz, Carving::None, &mut voxels),
+            }
             each(slot, LeafFill::Voxels(&voxels));
         }
     }
@@ -277,27 +281,69 @@ impl ChunkSource {
         if !(inside.contains(&local_x) && inside.contains(&local_z)) {
             return self.leaf_at_edge(min, voxels);
         }
-        let carving = self.leaf_caves(min).map(|c| {
-            // Inside one cell the 64 field values share their interpolation.
-            let field = c
-                .corners
-                .map(|corners| block_field(&corners, min, [0, 1, 2, 3]));
-            (c.caves, field)
-        });
-        self.fill_leaf(min, local_x as usize, local_z as usize, carving, voxels);
+        let (x, z) = (local_x as usize, local_z as usize);
+        match self.leaf_caves(min) {
+            None => self.fill_leaf(min, x, z, Carving::None, voxels),
+            Some(LeafCaves {
+                caves,
+                corners: Some(corners),
+            }) => {
+                // Inside one cell the 64 field values share their
+                // interpolation.
+                let field = block_field(&corners, min, [0, 1, 2, 3]);
+                self.fill_leaf(min, x, z, Carving::Field(caves, &field), voxels);
+            }
+            Some(LeafCaves {
+                caves,
+                corners: None,
+            }) => self.fill_leaf(min, x, z, Carving::PerVoxel(caves), voxels),
+        }
     }
 
     /// The voxels of the leaf at `min`, whose footprint starts at chunk-local
-    /// `(local_x, local_z)` inside the chunk's. `carving` is `None` when no
-    /// voxel can be carved, else the caves and the leaf's field (`[z][y][x]`,
-    /// see [`block_field`]), or `None` to compute each voxel's own.
+    /// `(local_x, local_z)` inside the chunk's, carved as `carving` says.
+    #[inline]
     fn fill_leaf(
         &self,
         min: VoxelPos,
         local_x: usize,
         local_z: usize,
-        carving: Option<(&Caves, Option<[[[f32; 4]; 4]; 4]>)>,
+        carving: Carving<'_>,
         voxels: &mut [MaterialId; 64],
+    ) {
+        match carving {
+            Carving::None => self.fill_with(min, local_x, local_z, None, voxels, |_, _| false),
+            Carving::Field(caves, f) => {
+                let carved = |[x, y, z]: [usize; 3], _: &Column| f[z][y][x] < 0.0;
+                self.fill_with(min, local_x, local_z, Some(caves), voxels, carved)
+            }
+            Carving::PerVoxel(caves) => {
+                let carved = |[x, y, z]: [usize; 3], column: &Column| {
+                    let at = |v: i32, d: usize| v.wrapping_add(d as i32);
+                    caves.carved(
+                        VoxelPos::new(at(min.x, x), at(min.y, y), at(min.z, z)),
+                        column,
+                    )
+                };
+                self.fill_with(min, local_x, local_z, Some(caves), voxels, carved)
+            }
+        }
+    }
+
+    /// [`fill_leaf`](Self::fill_leaf) with `carved(voxel, column)` telling
+    /// whether voxel `(x, y, z)` of the leaf, at a height `caves` may carve,
+    /// is carved. `Column::material_at` becomes three thresholds on `y`; the
+    /// carving is applied without branches, since which voxels a cave wall
+    /// takes is unpredictable.
+    #[inline(always)]
+    fn fill_with(
+        &self,
+        min: VoxelPos,
+        local_x: usize,
+        local_z: usize,
+        caves: Option<&Caves>,
+        voxels: &mut [MaterialId; 64],
+        carved: impl Fn([usize; 3], &Column) -> bool,
     ) {
         let layers = self.columns.layers();
         let ys: [i64; 4] = std::array::from_fn(|y| i64::from(min.y.wrapping_add(y as i32)));
@@ -306,13 +352,13 @@ impl ChunkSource {
         for z in 0..4 {
             let row = &self.columns.columns()[first + z * n..][..4];
             for (x, column) in row.iter().enumerate() {
-                // `Column::material_at` as three thresholds on `y`.
                 let height = i64::from(column.height);
                 let cover_from = height - i64::from(column.surface_depth);
                 let soil_from = height - i64::from(column.soil_depth);
-                let carvable = carving.map(|(caves, _)| caves.carvable_range(column));
+                // Heights that may be carved; empty without caves.
+                let (lo, hi) = caves.map_or((0, 0), |caves| caves.carvable_range(column));
                 for (y, &at) in ys.iter().enumerate() {
-                    let mut material = if at >= height {
+                    let material = if at >= height {
                         MaterialId::AIR
                     } else if at >= cover_from {
                         column.surface
@@ -321,27 +367,9 @@ impl ChunkSource {
                     } else {
                         layers.bedrock
                     };
-                    if let (Some((caves, field)), Some((lo, hi))) = (&carving, carvable)
-                        && !material.is_air()
-                        && lo <= at
-                        && at < hi
-                    {
-                        let carved = match field {
-                            Some(f) => f[z][y][x] < 0.0,
-                            None => {
-                                let pos = VoxelPos::new(
-                                    min.x.wrapping_add(x as i32),
-                                    min.y.wrapping_add(y as i32),
-                                    min.z.wrapping_add(z as i32),
-                                );
-                                caves.carved(pos, column)
-                            }
-                        };
-                        if carved {
-                            material = MaterialId::AIR;
-                        }
-                    }
-                    voxels[x + 4 * y + 16 * z] = material;
+                    // Carving an air voxel leaves it air.
+                    let carve = (lo <= at) & (at < hi) & carved([x, y, z], column);
+                    voxels[x + 4 * y + 16 * z] = if carve { MaterialId::AIR } else { material };
                 }
             }
         }
@@ -495,6 +523,17 @@ fn build_pyramid(columns: &[Column]) -> Vec<Vec<Span>> {
         n = m;
     }
     pyramid
+}
+
+/// How the voxels of one leaf are carved.
+#[derive(Clone, Copy)]
+enum Carving<'a> {
+    /// Not at all.
+    None,
+    /// By the caves, from the leaf's field (`[z][y][x]`, see [`block_field`]).
+    Field(&'a Caves, &'a [[[f32; 4]; 4]; 4]),
+    /// By the caves, each voxel from its own lattice corners.
+    PerVoxel(&'a Caves),
 }
 
 /// The cave context of one leaf.
