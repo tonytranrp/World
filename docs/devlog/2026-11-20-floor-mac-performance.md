@@ -139,3 +139,36 @@ sphere's 280) after the first 40 s and the runs are too noisy to compare.
 What remains is per-stacked-chunk work World_Gen's ChunkSource does again
 (copying the columns and rebuilding their pyramid, about 10 ms) and the
 cave grid and carving of buried chunks.
+
+## Faster generation, and App Nap
+
+World_Gen now builds chunks in about half the time with identical output
+(`terrain_tree` benches: a surface chunk with caves 130 to 62 ms, an
+underground one 122 to 58 ms, columns 24.6 to 15.6 ms; decision 0011).
+
+Walks with the screen locked first showed the merged build collapsing after
+about 30 s: frames of 150 to 800 ms and chunk generation at 0.4 to 1.2 s.
+The cause was not the engine. The game's CPU use fell from about 510% to
+70 to 140% at the same moment, with no thermal limit and free memory: App
+Nap had lowered the priority of the hidden process. Continuous updates do
+not prevent that. Fixed-length runs now hold an `NSProcessInfo` activity
+(`app/src/startup/awake.rs`), and the collapse is gone. Earlier walk numbers
+in this entry may include App Nap stretches; the residency hole counts are
+the least affected, the slowest frames the most.
+
+mac-floor, 1500 frames, both builds with the App Nap fix, alternating runs:
+
+| | Before the merges | After |
+|---|---|---|
+| Sphere first settled | 17 to 21 s | 7.1 s |
+| Holes at 4 m/s after 10 s | 33 to 62, then falling | 0 |
+| Holes at 8 m/s after 10 s | 97 to 108, never caught up | 0 to 1 |
+| Steady frames, 4 m/s | 16.8 to 17.9 ms mean, p95 28 | 20.6 to 21.5 ms, p95 32 to 36 |
+| Steady frames, 8 m/s | 19.4 to 19.7 ms, max 105 | 23.8 to 24.2 ms, max 247 |
+
+The renderer now streams a complete world instead of a half-empty one, which
+costs about 4 ms a frame. The slowest frames come from the brick cache, whose
+per-frame budget counts upload bytes but not CPU: a frame can expand 800 to
+2,500 nodes (25 to 90 ms), an edit costs about 7 ms per dirty brick, and a
+growth pass pushes about 230,000 children into its queue, which the visit
+budget does not count.
