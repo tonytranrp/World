@@ -58,6 +58,8 @@ pub enum Done {
         refused: bool,
         error: Option<String>,
         source: LoadSource,
+        /// How long the worker spent on it, in microseconds.
+        micros: u64,
     },
     Saved {
         coord: ChunkCoord,
@@ -359,6 +361,7 @@ enum Ran {
 fn run(shared: &Shared, job: WorkJob) -> Ran {
     match job {
         WorkJob::Load(coord, warm, saved) => {
+            let start = std::time::Instant::now();
             let loaded = match &saved {
                 Ok(saved) => jobs::load(&shared.generators, coord, warm.as_ref(), saved),
                 Err(e) => jobs::unreadable(&shared.generators, coord, e),
@@ -369,6 +372,7 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 refused: loaded.refused,
                 error: loaded.error,
                 source: loaded.source,
+                micros: start.elapsed().as_micros() as u64,
             })
         }
         WorkJob::Save(coord, data, set_aside) => {

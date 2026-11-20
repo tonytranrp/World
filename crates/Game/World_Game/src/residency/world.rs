@@ -141,6 +141,10 @@ pub struct ResidencyStats {
     pub generated: usize,
     pub warm_hits: usize,
     pub disk_loads: usize,
+    /// Worker time spent on generated loads since the world opened, in
+    /// microseconds, and the longest one.
+    pub generated_micros: u64,
+    pub generated_max_micros: u64,
 }
 
 const MIB: usize = 1 << 20;
@@ -228,6 +232,8 @@ struct Counters {
     generated: usize,
     warm_hits: usize,
     disk_loads: usize,
+    generated_micros: u64,
+    generated_max_micros: u64,
 }
 
 /// The chunk-aligned boxes of `region`, one per chunk it touches.
@@ -437,6 +443,8 @@ impl StreamedWorld {
             generated: self.counters.generated,
             warm_hits: self.counters.warm_hits,
             disk_loads: self.counters.disk_loads,
+            generated_micros: self.counters.generated_micros,
+            generated_max_micros: self.counters.generated_max_micros,
         }
     }
 
@@ -844,12 +852,18 @@ impl StreamedWorld {
                 refused,
                 error,
                 source,
+                micros,
             } => {
                 self.loading.remove(&coord);
+                let n = &mut self.counters;
                 match source {
-                    LoadSource::Warm => self.counters.warm_hits += 1,
-                    LoadSource::Saved => self.counters.disk_loads += 1,
-                    LoadSource::Generated => self.counters.generated += 1,
+                    LoadSource::Warm => n.warm_hits += 1,
+                    LoadSource::Saved => n.disk_loads += 1,
+                    LoadSource::Generated => {
+                        n.generated += 1;
+                        n.generated_micros += micros;
+                        n.generated_max_micros = n.generated_max_micros.max(micros);
+                    }
                 }
                 if let Some(e) = error {
                     self.errors.push(e);
