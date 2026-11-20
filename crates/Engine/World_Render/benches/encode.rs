@@ -10,6 +10,10 @@
 //!
 //! - `load_bricks`: loading every brick of the terrain into pools, with the
 //!   encoder on 1 and on 8 threads, the path a frame takes.
+//! - `changes`: applying one replaced chunk (a generated surface chunk with
+//!   caves, and a coarse one), the work the residency hands the cache each
+//!   time it swaps a chunk; bounded per frame by
+//!   `max_change_summaries_per_frame`.
 //!
 //! Deterministic input.
 
@@ -248,6 +252,67 @@ fn load_bricks(c: &mut Criterion) {
     group.finish();
 }
 
+fn changes(c: &mut Criterion) {
+    use world_core::tree::CHUNK_LEVEL;
+    use world_gen::{ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
+    use world_render::internals::residency::Change;
+    let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
+        .expect("the default config is valid");
+    // The chunk holding the surface in the middle of a central column.
+    let probe = ChunkCoord::new(512, 0, 512).unwrap().min_voxel();
+    let (x, z) = (probe.x + 512, probe.z + 512);
+    let height = generator.column(x, z).unwrap().height;
+    let coord = ChunkCoord::containing(VoxelPos::new(x, height, z)).unwrap();
+    let min = coord.min_voxel();
+    let full = {
+        let mut t = VoxelTree::new();
+        t.build_region(CHUNK_LEVEL, min, &generator.chunk_source(coord))
+            .unwrap();
+        t
+    };
+    let coarse = {
+        let columns = generator.coarse_columns(coord, 2).unwrap();
+        let mut t = VoxelTree::new();
+        t.build_region(CHUNK_LEVEL, min, &CoarseSource::new(columns))
+            .unwrap();
+        t
+    };
+    let layout = PoolLayout {
+        node_count: 1 << 20,
+        segments: vec![256 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 18,
+        upload_budget: 1 << 30,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let mut group = c.benchmark_group("changes");
+    group.sample_size(20);
+    for (name, tree) in [("surface_chunk", &full), ("coarse_chunk", &coarse)] {
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let mut res = Residency::new(shape, &layout).unwrap();
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        // Expand the path down to the chunk, as stage 1 keeps it.
+        let key = NodeKey::containing(shape.local(min).unwrap(), CHUNK_LEVEL);
+        for level in (CHUNK_LEVEL + 1..=shape.root_level()).rev() {
+            let _ = res.expand(&snap, key.ancestor(level), &mut batch);
+        }
+        let mut apply = |res: &mut Residency| {
+            batch.clear();
+            res.queue_changes([Change::Chunk(key)]);
+            res.apply_changes(&snap, None, u64::MAX, |_| true, &mut batch)
+        };
+        let once = apply(&mut res);
+        eprintln!("changes/{name}: {} summaries per change", once.summarized);
+        group.throughput(Throughput::Elements(once.summarized));
+        group.bench_function(name, |b| b.iter(|| apply(&mut res)));
+    }
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(std::time::Duration::from_millis(500))
@@ -257,6 +322,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = encode, allocators, residency, load_bricks
+    targets = encode, allocators, residency, load_bricks, changes
 }
 criterion_main!(benches);

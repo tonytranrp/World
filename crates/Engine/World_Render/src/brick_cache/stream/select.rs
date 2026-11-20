@@ -21,8 +21,9 @@
 //!   best-first: the nodes covering the most pixels are visited first, so a
 //!   pass the budget splits finds the nearest work in its first frame.
 //!   Candidates the upload budget turns away are carried to the next frame.
-//! - **Shrink** (collapse and evict) must look at every record, so it is a
-//!   plain resumable walk.
+//! - **Shrink** (collapse and evict) must look at every expanded node and
+//!   resident brick, so it is a plain resumable walk; it skips children
+//!   without records and level-1 children without bricks.
 //!
 //! Both are functions of the view, the pressure and the table alone, so a
 //! new pass of either starts only once the camera moved more than
@@ -486,7 +487,14 @@ pub fn select_budgeted(
             let forced = key.level() >= always;
             if node.expanded {
                 if forced || keep {
-                    push_children(walk, key, node.mask);
+                    // Only children with records can shrink; of a level-2
+                    // node's, only those with resident bricks.
+                    let kids = if key.level == 2 {
+                        node.bricks
+                    } else {
+                        node.kids
+                    };
+                    push_children(walk, key, kids);
                 } else {
                     out.collapse.push(key);
                 }

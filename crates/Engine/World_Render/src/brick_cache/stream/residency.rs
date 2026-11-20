@@ -25,7 +25,7 @@ use super::key::{NodeKey, Shape, view_at};
 use super::select::GrowthState;
 use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
-    Content, Summary, Tally, content, exact_summary, node_volume,
+    Content, Summary, Tally, content, count_voxels, exact_summary, node_volume,
 };
 use crate::brick_cache::format::{BrickRef, GpuNode, ROOT_NODE};
 use crate::brick_cache::pool::alloc::{BrickAlloc, BrickSpace, IdSpace, NodeAlloc, NodeSpace};
@@ -107,6 +107,10 @@ pub struct Residency {
     /// Replaced chunks among them: their summaries are not computed until
     /// they are applied (see [`summary`](Self::summary)).
     pending_chunks: HashSet<NodeKey>,
+    /// Waiting replaced chunks being summarized ahead of their application,
+    /// a share of the budget per frame: the next grandchild to summarize,
+    /// as `child slot * 64 + grandchild slot` (4096 when done).
+    warming: HashMap<NodeKey, u32>,
     /// Node summaries computed so far, the unit of the change budget.
     summarized: u64,
     nodes: NodeSpace,
@@ -116,6 +120,8 @@ pub struct Residency {
     id_keys: Vec<Option<NodeKey>>,
     frame: u32,
     tally: Tally,
+    /// Tallies for summaries of branches, reused down the recursion.
+    spare_tallies: Vec<Tally>,
     /// Stage 1's walk in progress: nodes still to visit (see
     /// [`select_budgeted`](super::select::select_budgeted)).
     walk: Vec<NodeKey>,
@@ -186,6 +192,7 @@ impl Residency {
             edited: HashSet::default(),
             pending: Vec::new(),
             pending_chunks: HashSet::default(),
+            warming: HashMap::default(),
             summarized: 0,
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
             bricks: BrickSpace::new(&layout.segments, layout.allocs_per_segment),
@@ -193,6 +200,7 @@ impl Residency {
             id_keys: vec![None; layout.brick_ids as usize],
             frame: 1,
             tally: Tally::default(),
+            spare_tallies: Vec::new(),
             walk: Vec::new(),
             growth: GrowthState::default(),
             pressure: 1.0,
@@ -455,15 +463,24 @@ impl Residency {
                 material: m,
                 solid: node_volume(key.level()),
             },
+            Content::Leaf | Content::Branch if key.level <= 1 => {
+                // The scratch tally: no allocation per brick.
+                self.tally.clear();
+                let level = if kind == Content::Leaf { 0 } else { 1 };
+                count_voxels(view, level, &mut self.tally);
+                self.tally.summary()
+            }
             Content::Leaf => exact_summary(view, 0),
-            Content::Branch if key.level == 1 => exact_summary(view, 1),
             Content::Branch => {
-                let mut tally = Tally::default();
+                let mut tally = self.spare_tallies.pop().unwrap_or_default();
+                tally.clear();
                 for (slot, child) in view.children() {
                     let c = self.summary(key.child(slot), child);
                     tally.add(c.material, c.solid);
                 }
-                tally.summary()
+                let s = tally.summary();
+                self.spare_tallies.push(tally);
+                s
             }
         };
         if kind == Content::Branch {
@@ -683,6 +700,7 @@ impl Residency {
         self.chunk_summaries.clear();
         self.pending.clear();
         self.pending_chunks.clear();
+        self.warming.clear();
         self.walk.clear();
         self.growth.changed();
         self.write_root(source, batch);
@@ -906,14 +924,16 @@ impl Residency {
     }
 
     /// Queues changes of the source; [`apply_changes`](Self::apply_changes)
-    /// applies them. A change already waiting is not queued twice.
+    /// applies them. A change already waiting is not queued twice, but a
+    /// chunk replaced again starts its summaries over.
     pub fn queue_changes(&mut self, changes: impl IntoIterator<Item = Change>) {
         let mut seen: HashSet<Change> = self.pending.iter().copied().collect();
         for c in changes {
+            if let Change::Chunk(k) = c {
+                self.warming.remove(&k);
+                self.pending_chunks.insert(k);
+            }
             if seen.insert(c) {
-                if let Change::Chunk(k) = c {
-                    self.pending_chunks.insert(k);
-                }
                 self.pending.push(c);
             }
         }
@@ -925,10 +945,11 @@ impl Residency {
     }
 
     /// Applies queued changes, nearest to `eye` first (in key order without
-    /// one), until applying them has computed `max_summaries` node
-    /// summaries; at least one is applied when any wait. The rest wait for
-    /// the next call, and until then the records above them describe the
-    /// content they had before.
+    /// one), until they have computed `max_summaries` node summaries. A
+    /// replaced chunk is summarized first, a grandchild at a time and across
+    /// calls if the budget runs out (at least one grandchild per call), and
+    /// applied once that is done. The rest wait for the next call, and until
+    /// then the records above them describe the content they had before.
     ///
     /// A changed brick: `reupload` decides, in that order, which resident
     /// changed bricks are uploaded again (it gets the block bytes the brick
@@ -959,15 +980,33 @@ impl Residency {
         let root_level = self.shape.root_level();
         let mut groups = std::collections::BTreeSet::new();
         let mut applied = 0usize;
-        for &change in &order {
-            if applied > 0 && self.summarized - start >= max_summaries {
-                break;
+        let mut worked = false;
+        let mut rest = Vec::new();
+        for change in order {
+            let spent = self.summarized - start;
+            if worked && spent >= max_summaries {
+                rest.push(change);
+                continue;
+            }
+            worked = true;
+            let done = match change {
+                Change::Brick(k) => {
+                    self.apply_brick(source, k, &mut reupload, batch);
+                    true
+                }
+                Change::Chunk(c) => {
+                    let ready = self.warm_chunk(source, c, max_summaries.saturating_sub(spent));
+                    if ready {
+                        self.apply_chunk(source, c, batch);
+                    }
+                    ready
+                }
+            };
+            if !done {
+                rest.push(change);
+                continue;
             }
             applied += 1;
-            match change {
-                Change::Brick(k) => self.apply_brick(source, k, &mut reupload, batch),
-                Change::Chunk(c) => self.apply_chunk(source, c, batch),
-            }
             let k = change.key();
             // A replaced chunk rewrites its own group too.
             for level in k.level().max(2)..=root_level {
@@ -977,7 +1016,7 @@ impl Residency {
                 }
             }
         }
-        self.pending = order.split_off(applied);
+        self.pending = rest;
 
         // Every expanded ancestor rewrites its group, bottom-up.
         for a in groups {
@@ -1040,12 +1079,62 @@ impl Residency {
         }
     }
 
-    /// The first half of applying a replaced chunk: it and its path forget
-    /// their summaries, everything resident below it is dropped (its group
-    /// stays, to be rewritten), and it is summarized from the source.
+    /// Summarizes the grandchildren of the replaced chunk `c` (and each
+    /// child once its grandchildren are done) from where the last call
+    /// stopped, until `budget` summaries were computed (at least one
+    /// grandchild). The first call forgets what the chunk's old content
+    /// cached. Returns whether every grandchild is done.
+    fn warm_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, budget: u64) -> bool {
+        const DONE: u32 = 64 * 64;
+        let next = match self.warming.get(&c) {
+            Some(&n) => n,
+            None => {
+                self.chunk_summaries.remove(&c);
+                0
+            }
+        };
+        let view = view_at(source, c);
+        if c.level < 3 || content(&view) != Content::Branch {
+            self.warming.insert(c, DONE);
+            return true;
+        }
+        let start = self.summarized;
+        let mut next = next;
+        let mut progressed = false;
+        while next < DONE {
+            if progressed && self.summarized - start >= budget {
+                break;
+            }
+            let (s1, s2) = (next / 64, next % 64);
+            let child = view.child(s1);
+            if view.mask() & (1u64 << s1) == 0 || content(&child) != Content::Branch {
+                next = (s1 + 1) * 64;
+                continue;
+            }
+            if child.mask() & (1u64 << s2) != 0 {
+                let grandchild = child.child(s2);
+                if content(&grandchild) == Content::Branch {
+                    self.summary(c.child(s1).child(s2), grandchild);
+                    progressed = true;
+                }
+            }
+            next += 1;
+            if next % 64 == 0 {
+                // From the cached grandchildren.
+                self.summary(c.child(s1), child);
+            }
+        }
+        self.warming.insert(c, next);
+        next >= DONE
+    }
+
+    /// The first half of applying a replaced chunk, once its grandchildren
+    /// are summarized: it and its path forget their summaries, everything
+    /// resident below it is dropped (its group stays, to be rewritten), and
+    /// it is summarized from the source.
     fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, batch: &mut UploadBatch) {
         self.pending_chunks.remove(&c);
-        self.chunk_summaries.remove(&c);
+        self.warming.remove(&c);
         for level in c.level()..=self.shape.root_level() {
             self.forget_summary(c.ancestor(level));
         }

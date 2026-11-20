@@ -129,10 +129,10 @@ pub fn count_voxels<N: NodeView>(node: N, level: u32, tally: &mut Tally) {
 /// zero), so every path gives the voxel-by-voxel answer.
 pub fn count_leaf<N: NodeView>(leaf: &N, tally: &mut Tally) {
     let mask = leaf.mask();
-    if let [m] = leaf.palette().as_slice() {
-        tally.add(*m, u64::from(mask.count_ones()));
-    } else if let Some(block) = leaf.palette_block() {
+    if let Some(block) = leaf.palette_block() {
         count_palette_block(block, mask, tally);
+    } else if let [m] = leaf.palette().as_slice() {
+        tally.add(*m, u64::from(mask.count_ones()));
     } else {
         for slot in 0..64 {
             tally.add(leaf.voxel(slot), 1);
@@ -147,10 +147,23 @@ pub fn count_leaf<N: NodeView>(leaf: &N, tally: &mut Tally) {
 pub fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
     let len = (block[0] & PALETTE_LEN_MASK) as usize;
     let bits = (block[0] >> PALETTE_BITS_SHIFT) & 0xFF;
-    let mut counts = [0u64; 64];
+    let material = |i: usize| {
+        let word = block.get(1 + i / 2).copied().unwrap_or(0);
+        MaterialId((word >> (16 * (i % 2))) as u16)
+    };
+    let solid = leaf_mask.count_ones();
+    if bits == 0 {
+        // Every index is 0.
+        if len > 0 {
+            tally.add(material(0), u64::from(solid));
+        }
+        return;
+    }
+    // At most 64 voxels, so a byte per palette entry holds any count.
+    let mut counts = [0u8; 64];
     let indices = &block[1 + len.div_ceil(2)..];
     let index_mask = (1u32 << bits) - 1;
-    for k in 0..leaf_mask.count_ones() {
+    for k in 0..solid {
         let at = k * bits;
         let index = indices
             .get((at / 32) as usize)
@@ -160,10 +173,8 @@ pub fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
         }
     }
     for (i, &count) in counts.iter().enumerate().take(len) {
-        let word = block.get(1 + i / 2).copied().unwrap_or(0);
-        let material = MaterialId((word >> (16 * (i % 2))) as u16);
         if count > 0 {
-            tally.add(material, count);
+            tally.add(material(i), u64::from(count));
         }
     }
 }

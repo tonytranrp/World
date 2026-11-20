@@ -26,6 +26,7 @@ proptest.workspace = true
 criterion.workspace = true
 wesl.workspace = true
 image.workspace = true
+world_gen.workspace = true
 
 # CPU-side hot paths: encoder throughput, allocator operations.
 [[bench]]

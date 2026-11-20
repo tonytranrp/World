@@ -171,8 +171,8 @@ fn a_replaced_chunk_is_rebuilt_from_its_new_content() {
 }
 
 /// Changes whose summaries exceed the per-frame budget wait: each frame
-/// applies at least one, nearest the camera first, and once all are applied
-/// the table matches the source exactly.
+/// makes progress on the nearest, and once all are applied the table
+/// matches the source exactly.
 #[test]
 fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
     let mut tree = slab();
@@ -210,7 +210,7 @@ fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
                 config: &config,
             },
         );
-        assert_eq!(r.changes_applied, 1, "{r:?}");
+        assert!(r.changes_applied <= 1, "{r:?}");
         for (i, &m) in CHUNKS.iter().enumerate() {
             let now = res.record(chunk_key(m)).map(|r| r.material()) == Some(chunk_material(m));
             if now && !before[i] {
@@ -221,9 +221,9 @@ fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
         if r.changes_pending == 0 {
             break;
         }
-        assert!(frame < 20, "the changes never drained");
+        assert!(frame < 40, "the changes never drained");
     }
-    assert_eq!(frame, 14, "one change per frame");
+    assert!(frame > 14, "the budget spread the changes over frames");
     applied_order.sort_unstable();
     assert_eq!(applied_order, [0, 1, 2, 3], "each applied once");
     verify(&mut res, &snap, &pools);
@@ -244,19 +244,27 @@ fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
         eye: [near.x as f32 + 40.0, 0.0, near.z as f32 + 40.0],
         pixel_angle: 1e-6,
     };
-    let r = step(
-        &mut res,
-        &mut pools,
-        10,
-        Frame {
-            source: &snap,
-            dirty: &[],
-            chunks: &CHUNKS,
-            view: Some(view),
-            config: &config,
-        },
-    );
-    assert_eq!((r.changes_applied, r.changes_pending), (1, 3), "{r:?}");
+    let mut frame = 10;
+    loop {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &CHUNKS } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        frame += 1;
+        if r.changes_applied > 0 {
+            assert_eq!((r.changes_applied, r.changes_pending), (1, 3), "{r:?}");
+            break;
+        }
+        assert!(frame < 20, "nothing was applied");
+    }
     let material = |min: VoxelPos| res.record(chunk_key(min)).map(|r| r.material());
     assert_eq!(
         material(near),
@@ -266,6 +274,72 @@ fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
     for &m in &CHUNKS[..3] {
         assert_eq!(material(m), Some(MaterialId(1)), "{m:?} waits");
     }
+}
+
+/// A replaced chunk too large for one frame's budget is summarized over
+/// several frames, each within the budget plus one grandchild's summaries
+/// (at most 65) and the chunk's own path once it is applied.
+#[test]
+fn a_large_replaced_chunk_is_summarized_across_frames() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let budget = 20u64;
+    let config = BrickCacheConfig {
+        max_change_summaries_per_frame: budget as u32,
+        ..Default::default()
+    };
+    // A rough slab over a 256 x 256 footprint: 16 mixed level-2 nodes of
+    // mixed bricks.
+    let min = CHUNKS[3];
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(VoxelPos::new(0, -16, 0), VoxelPos::new(256, -2, 256)),
+            MaterialId(3),
+        )
+        .unwrap();
+    for x in (0..256).step_by(5) {
+        for z in (0..256).step_by(7) {
+            other.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    tree.insert_chunk(min, other.chunk_data(min).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    let key = NodeKey::containing(shape.local(min).unwrap(), 4);
+    let mixed = count_mixed(view_at(&snap, key), 4);
+    assert!(mixed > 3 * budget, "{mixed} mixed nodes");
+    let mins = [min];
+    let mut frame = 10;
+    loop {
+        let before = res.summaries_computed();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &mins } else { &[] },
+                view: None,
+                config: &config,
+            },
+        );
+        let spent = res.summaries_computed() - before;
+        let slack = 65 + u64::from(shape.root_level()) + 64;
+        assert!(spent <= budget + slack, "frame {frame}: {spent} summaries");
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert_eq!(r.changes_applied, 0, "applied only once summarized");
+        assert!(frame < 200, "never applied");
+    }
+    assert!(frame > 13, "spread over frames");
+    verify(&mut res, &snap, &pools);
 }
 
 /// An edit recomputes one summary per level on its path, however much of

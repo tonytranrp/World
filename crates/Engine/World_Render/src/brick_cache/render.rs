@@ -304,9 +304,14 @@ pub fn run_brick_cache(
     let shape = state.residency.shape();
     let layout = state.pools.layout.clone();
 
+    let ray_guided = config.0.stage == Stage::RayGuided;
     for readback in state.ring.collect(wgpu_device) {
-        let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
-        state.requests = requests;
+        // Stage 1 ignores requests: decoding and sorting a full block costs
+        // milliseconds a frame.
+        if ray_guided {
+            let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
+            state.requests = requests;
+        }
         if !readback.victims.is_empty() {
             let (victims, _) =
                 decode_victims(&readback.victims, layout.victim_capacity, layout.brick_ids);
