@@ -210,6 +210,8 @@ pub struct GrowthState {
     carry_load: Vec<NodeKey>,
     /// Pops and pushes the last growth step made.
     visits: u32,
+    /// Records the last shrink step took.
+    shrink_visits: u32,
 }
 
 /// Whether a pass that last started at `last` must start again for `view`.
@@ -277,6 +279,11 @@ impl GrowthState {
         self.visits
     }
 
+    /// Records the last shrink step took off its walk.
+    pub fn last_shrink_visits(&self) -> u32 {
+        self.shrink_visits
+    }
+
     /// Node `key`, just expanded, rejoins the pass in progress so its
     /// children are judged. Without a pass in progress the next pass will.
     pub fn rejoin(&mut self, key: NodeKey, pixels: f32) {
@@ -322,15 +329,40 @@ pub fn select_budgeted(
     max_visits: u32,
 ) -> Selection {
     select_split(
-        res, walk, growth, view, lod, pressure, max_visits, max_visits,
+        res,
+        walk,
+        growth,
+        view,
+        lod,
+        pressure,
+        Budgets::visits(max_visits),
     )
 }
 
-/// [`select_budgeted`] with separate visit budgets for growth and shrink.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two halves' state and budgets"
-)]
+/// What one call of [`select_split`] may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    /// Growth queue pops and pushes.
+    pub growth_visits: u32,
+    /// Records the shrink walk takes.
+    pub shrink_visits: u32,
+    /// Collapses the shrink walk may find; it stops at the last one and
+    /// resumes there, since releasing a subtree costs per record.
+    pub collapses: u32,
+}
+
+impl Budgets {
+    /// Both walks at `visits`, collapses unbounded.
+    pub fn visits(visits: u32) -> Self {
+        Self {
+            growth_visits: visits,
+            shrink_visits: visits,
+            collapses: u32::MAX,
+        }
+    }
+}
+
+/// [`select_budgeted`] with separate budgets for growth and shrink.
 pub fn select_split(
     res: &Residency,
     walk: &mut Vec<NodeKey>,
@@ -338,9 +370,9 @@ pub fn select_split(
     view: &ViewPoint,
     lod: &LodTuning,
     pressure: f32,
-    max_visits: u32,
-    max_shrink_visits: u32,
+    budgets: Budgets,
 ) -> Selection {
+    let max_visits = budgets.growth_visits;
     let shape = res.shape();
     let always = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
     let mut out = Selection::default();
@@ -499,7 +531,7 @@ pub fn select_split(
         walk.push(shape.root());
     }
     let mut visits = 0u32;
-    while visits < max_shrink_visits {
+    while visits < budgets.shrink_visits && out.collapse.len() < budgets.collapses as usize {
         let Some(key) = walk.pop() else {
             break;
         };
@@ -530,6 +562,7 @@ pub fn select_split(
             out.evict.push(key);
         }
     }
+    growth.shrink_visits = visits;
     let by_priority =
         |a: &(f32, NodeKey), b: &(f32, NodeKey)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
     expand.sort_by(by_priority);

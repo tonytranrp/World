@@ -22,7 +22,7 @@ use world_core::{BrickPos, VoxelPos};
 use super::batch::UploadBatch;
 use super::key::NodeKey;
 use super::residency::{Change, Refused, Residency};
-use super::select::{ViewPoint, projected_pixels, select_split};
+use super::select::{Budgets, ViewPoint, projected_pixels, select_split};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -132,8 +132,12 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let selection = match input.view {
         Some(view) => {
-            let shrink_visits = if res.take_full_shrink() {
-                u32::MAX
+            // A pressure change's shrink pass walks at the growth budget, so
+            // its collapses land within a few frames.
+            let settling = res.settling();
+            let shrink_visits = if settling {
+                lod.max_visits_per_frame
+                    .max(lod.max_shrink_visits_per_frame)
             } else {
                 lod.max_shrink_visits_per_frame
             };
@@ -147,9 +151,15 @@ pub fn run_frame<S: VoxelSource + Sync>(
                 &view,
                 lod,
                 pressure,
-                lod.max_visits_per_frame,
-                shrink_visits,
+                Budgets {
+                    growth_visits: lod.max_visits_per_frame,
+                    shrink_visits,
+                    collapses: lod.max_collapses_per_frame,
+                },
             );
+            if settling && walk.is_empty() {
+                res.settled();
+            }
             res.put_walk(walk);
             res.put_growth(growth);
             s
@@ -288,7 +298,8 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
 
     report.upload_bytes = cost(batch);
-    if input.config.stage == Stage::Distance {
+    // The pressure holds while the shrink pass its last change started runs.
+    if input.config.stage == Stage::Distance && !res.settling() {
         let before = res.pressure();
         let since = input.frame.wrapping_sub(res.pressure_raised_at());
         let after = adapt_pressure(before, res.node_fill(), report.refused_nodes > 0, since);

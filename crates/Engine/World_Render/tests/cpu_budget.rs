@@ -609,3 +609,118 @@ fn a_growth_pass_survives_small_moves() {
     select_budgeted(&res, &mut walk, &mut growth, &large, &lod, 1.0, 2);
     assert_eq!(growth.started_at(), Some(large), "a large move restarts it");
 }
+
+/// No frame collapses more than `lod.max_collapses_per_frame` nodes, and a
+/// camera that leaves the scene still ends with everything collapsed that
+/// a roomy limit collapses.
+#[test]
+fn a_frame_never_collapses_more_than_its_budget() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let near = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let far = ViewPoint {
+        eye: [0.0, 0.0, -20000.0],
+        ..near
+    };
+    let run = |limit: u32| {
+        let mut config = BrickCacheConfig::default();
+        config.lod.max_collapses_per_frame = limit;
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut most = 0;
+        for frame in 1..=400 {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(if frame <= 60 { near } else { far }),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 24 << 20,
+                victim_capacity: 64,
+            };
+            let r = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            most = most.max(r.collapsed);
+        }
+        verify(&mut res, &snap, &pools);
+        let s = res.stats();
+        (most, s.expanded, s.bricks)
+    };
+    let roomy = run(1 << 20);
+    let tight = run(2);
+    assert!(
+        roomy.0 > 2,
+        "the roomy run collapses more per frame: {roomy:?}"
+    );
+    assert!(tight.0 <= 2, "{tight:?}");
+    assert_eq!((tight.1, tight.2), (roomy.1, roomy.2));
+}
+
+/// The shrink pass a node pool pressure change starts walks at the growth
+/// budget, never the whole table in one frame, and the pressure holds while
+/// it runs.
+#[test]
+fn a_pressure_change_shrinks_within_the_visit_budget() {
+    use world_render::internals::layout::PoolLayout;
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let mut config = BrickCacheConfig::default();
+    // Small enough that a shrink pass over this scene spans frames.
+    config.lod.max_visits_per_frame = 64;
+    config.lod.max_shrink_visits_per_frame = 16;
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let layout = PoolLayout {
+        node_count: 5 << 9,
+        node_groups: 5 << 7,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    let mut settling_frames = 0;
+    for frame in 1..=400 {
+        let pressure = res.pressure();
+        let settling = res.settling();
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        assert!(res.growth().last_shrink_visits() <= 64, "frame {frame}");
+        // Held through every frame whose shrink step used its whole budget,
+        // so the pass is still running.
+        if settling && res.growth().last_shrink_visits() == 64 {
+            settling_frames += 1;
+            assert_eq!(res.pressure(), pressure, "frame {frame}: held");
+        }
+    }
+    assert!(res.pressure() > 1.0, "the small pool raised the pressure");
+    assert!(
+        settling_frames > 0,
+        "a pressure change started a shrink pass"
+    );
+    assert!(!res.settling(), "and it finished");
+    verify(&mut res, &snap, &pools);
+}

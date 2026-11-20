@@ -76,8 +76,13 @@ pub struct LodTuning {
     /// next frame. `1..=1048576`.
     pub max_expansions_per_frame: u32,
     /// Records the shrink walk (collapse, evict) examines per frame; it
-    /// only frees memory, so it may lag behind growth. `256..=16777216`.
+    /// only frees memory, so it may lag behind growth. A pass started by
+    /// node pool pressure takes `max_visits_per_frame` if that is larger.
+    /// `256..=16777216`.
     pub max_shrink_visits_per_frame: u32,
+    /// Nodes the shrink walk collapses per frame at most (each releases its
+    /// subtree); it resumes where it stopped. `1..=1048576`.
+    pub max_collapses_per_frame: u32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -147,6 +152,7 @@ impl Default for BrickCacheConfig {
                 restart_voxels: 128.0,
                 max_expansions_per_frame: 128,
                 max_shrink_visits_per_frame: 4096,
+                max_collapses_per_frame: 256,
             },
             max_summaries_per_frame: 2048,
             debug_scene: true,
@@ -259,6 +265,12 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.max_shrink_visits_per_frame.into(),
             256.0,
             16777216.0,
+        );
+        range(
+            "lod.max_collapses_per_frame",
+            self.lod.max_collapses_per_frame.into(),
+            1.0,
+            1048576.0,
         );
         range(
             "lod.max_expansions_per_frame",

@@ -133,9 +133,10 @@ pub struct Residency {
     /// Stage 1's detail threshold multiplier under node pool pressure (see
     /// `frame::adapt_pressure`); 1 when the pool has room.
     pressure: f32,
-    /// The next shrink walk runs whole: the pressure just changed, and its
-    /// collapses should land before it is judged again.
-    full_shrink: bool,
+    /// The pressure just changed and the shrink pass it started is still
+    /// running: it walks at the growth budget, and the pressure holds until
+    /// its collapses have landed.
+    settling: bool,
     /// The frame the pressure last rose.
     pressure_raised_at: u32,
 }
@@ -214,7 +215,7 @@ impl Residency {
             walk: Vec::new(),
             growth: GrowthState::default(),
             pressure: 1.0,
-            full_shrink: false,
+            settling: false,
             pressure_raised_at: 0,
         })
     }
@@ -233,11 +234,13 @@ impl Residency {
         self.frame
     }
 
+    /// O(1): every expanded node holds one node group and every resident
+    /// brick one brick id ([`verify`](Self::verify) checks both).
     pub fn stats(&self) -> ResidencyStats {
         ResidencyStats {
             entries: self.entries.len(),
-            expanded: self.entries.values().filter(|e| e.group.is_some()).count(),
-            bricks: self.entries.values().filter(|e| e.brick.is_some()).count(),
+            expanded: self.nodes.groups() as usize,
+            bricks: self.ids.in_use() as usize,
             node_fill: self.nodes.fill(),
             brick_fill: self.bricks.fill(),
             brick_bytes: self.bricks.used_bytes(),
@@ -303,10 +306,13 @@ impl Residency {
         self.pressure
     }
 
-    /// Sets the pressure; a change makes the next shrink walk run whole.
+    /// Sets the pressure; a change starts a new shrink pass at once and
+    /// holds the pressure until it is done (see [`settling`](Self::settling)).
     pub fn set_pressure(&mut self, pressure: f32) {
         if pressure != self.pressure {
-            self.full_shrink = true;
+            self.settling = true;
+            self.walk.clear();
+            self.growth.shrink_changed();
         }
         self.pressure = pressure;
     }
@@ -320,9 +326,14 @@ impl Residency {
         self.pressure_raised_at = frame;
     }
 
-    /// Whether the next shrink walk should run whole; clears the request.
-    pub fn take_full_shrink(&mut self) -> bool {
-        std::mem::take(&mut self.full_shrink)
+    /// Whether the shrink pass a pressure change started is still running.
+    pub fn settling(&self) -> bool {
+        self.settling
+    }
+
+    /// The shrink pass a pressure change started is done.
+    pub fn settled(&mut self) {
+        self.settling = false;
     }
 
     pub fn is_expanded(&self, key: NodeKey) -> bool {
@@ -675,6 +686,49 @@ impl Residency {
         Ok(())
     }
 
+    /// Rewrites the records of the children of expanded node `key` (whose
+    /// view is `view`, a branch) in `slots`, which are the only ones whose
+    /// content may have changed. When its mask changed, the group's layout
+    /// did too, and the whole group is written again.
+    fn rewrite_children<N: NodeView>(
+        &mut self,
+        key: NodeKey,
+        view: N,
+        slots: u64,
+        batch: &mut UploadBatch,
+    ) -> Result<(), Refused> {
+        let Some(e) = self.entries.get(&key) else {
+            return Ok(());
+        };
+        let Some(group) = e.group else {
+            return Ok(());
+        };
+        let mask = view.mask();
+        if slots == u64::MAX || mask != e.record.mask() || group.len != mask.count_ones().max(1) {
+            return self.write_group(key, view, batch);
+        }
+        // A changed slot that became air changed the mask: all are set.
+        let mut todo = slots & mask;
+        while todo != 0 {
+            let slot = todo.trailing_zeros();
+            todo &= todo - 1;
+            let ck = key.child(slot);
+            let child = view.child(slot);
+            let branch = content(&child) == Content::Branch;
+            if !branch && self.entries.contains_key(&ck) {
+                self.drop_subtree(ck, batch);
+            }
+            let index = group.first + (mask & ((1u64 << slot) - 1)).count_ones();
+            if let Some(record) = self.child_record(ck, child) {
+                if branch {
+                    self.put_entry(ck, index, record);
+                }
+                batch.write_node(index, record);
+            }
+        }
+        Ok(())
+    }
+
     /// Rewrites the root record from the source.
     fn write_root<S: VoxelSource>(&mut self, source: &S, batch: &mut UploadBatch) {
         let root = self.shape.root();
@@ -994,16 +1048,19 @@ impl Residency {
         let mut order = std::mem::take(&mut self.pending);
         if let Some(eye) = eye {
             let origin = self.shape.origin;
-            order.sort_by(|a, b| {
-                let da = super::select::distance(origin, a.key(), eye);
-                let db = super::select::distance(origin, b.key(), eye);
-                da.total_cmp(&db).then(a.key().cmp(&b.key()))
+            // Distances are never negative, so their bits sort like them.
+            order.sort_by_cached_key(|c| {
+                let d = super::select::distance(origin, c.key(), eye);
+                (d.to_bits(), c.key())
             });
         } else {
             order.sort_by_key(|c| c.key());
         }
         let root_level = self.shape.root_level();
-        let mut groups = std::collections::BTreeSet::new();
+        // Expanded ancestors of the applied changes, bottom-up, with the
+        // slots of their children on the changed paths (all of them for a
+        // replaced chunk's own group).
+        let mut groups: std::collections::BTreeMap<NodeKey, u64> = Default::default();
         let mut applied = 0usize;
         let mut worked = false;
         let mut rest = Vec::new();
@@ -1033,24 +1090,30 @@ impl Residency {
             }
             applied += 1;
             let k = change.key();
-            // A replaced chunk rewrites its own group too.
             for level in k.level().max(2)..=root_level {
                 let a = k.ancestor(level);
                 if self.is_expanded(a) {
-                    groups.insert(a);
+                    let slots = if a == k {
+                        u64::MAX
+                    } else {
+                        1u64 << k.ancestor(level - 1).slot_in_parent()
+                    };
+                    *groups.entry(a).or_default() |= slots;
                 }
             }
         }
         self.pending = rest;
 
-        // Every expanded ancestor rewrites its group, bottom-up.
-        for a in groups {
+        // Every expanded ancestor rewrites the records of its children on
+        // the changed paths, bottom-up (its whole group when its mask
+        // changed).
+        for (a, slots) in groups {
             if !self.entries.contains_key(&a) {
                 continue; // dropped by a lower rewrite
             }
             let view = view_at(source, a);
             if content(&view) == Content::Branch {
-                let _ = self.write_group(a, view, batch);
+                let _ = self.rewrite_children(a, view, slots, batch);
             } else if let Some(&e) = self.entries.get(&a) {
                 let mut cleared = e;
                 cleared.brick = None;
@@ -1190,6 +1253,15 @@ impl Residency {
         segments: &[&[u32]],
         table: &[u32],
     ) -> Result<(), String> {
+        let expanded = self.entries.values().filter(|e| e.group.is_some()).count();
+        let bricks = self.entries.values().filter(|e| e.brick.is_some()).count();
+        let stats = self.stats();
+        if (stats.expanded, stats.bricks) != (expanded, bricks) {
+            return Err(format!(
+                "{} groups and {} brick ids in use, the table holds {expanded} and {bricks}",
+                stats.expanded, stats.bricks
+            ));
+        }
         let mut keys = self.keys();
         keys.sort_unstable();
         for key in keys {

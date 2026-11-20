@@ -61,8 +61,13 @@
         // 1..=1048576
         max_expansions_per_frame: 128,
         // Records the shrink walk (collapse, evict) examines per frame; it
-        // only frees memory, so it may lag behind growth. 256..=16777216
+        // only frees memory, so it may lag behind growth. A pass started by
+        // node pool pressure takes max_visits_per_frame if that is larger.
+        // 256..=16777216
         max_shrink_visits_per_frame: 4096,
+        // Nodes the shrink walk collapses per frame at most (each releases
+        // its subtree); it resumes where it stopped. 1..=1048576
+        max_collapses_per_frame: 256,
     ),
     // Node summaries (each over up to 64 children) that applying edits and
     // replaced chunks may compute per frame, and again that expansions may;
