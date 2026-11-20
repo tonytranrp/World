@@ -13,6 +13,9 @@ use world_gen::TerrainConfig;
 use super::config::ResidencyConfig;
 use super::world::StreamedWorld;
 
+/// The time between updates in these tests, in seconds.
+const FRAME: f32 = 1.0 / 60.0;
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("world_residency_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -43,7 +46,7 @@ fn eye_at(world: &StreamedWorld, x: i32, z: i32) -> VoxelPos {
 /// Updates until everything around `eye` is loaded and nothing is in flight.
 fn settle(world: &mut StreamedWorld, eye: VoxelPos) {
     for _ in 0..2000 {
-        world.update(eye);
+        world.update(eye, FRAME);
         let s = world.stats();
         if world.is_settled(eye) && s.loading == 0 && s.saving == 0 {
             return;
@@ -162,7 +165,7 @@ fn edits_survive_a_crash_through_the_log() {
             .fill_box(VoxelBox::from_min_size(above, [8; 3]), MaterialId(1))
             .unwrap();
         // One frame syncs the log; then the process "crashes" (no save).
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let log = std::fs::read(dir.join("edits.wvl")).unwrap();
     assert_eq!(read_log(&log).unwrap().0.len(), 2, "both edits logged");
@@ -234,7 +237,7 @@ fn coarse_columns_surround_the_player() {
     );
     let eye = eye_at(&world, 5000, 5000);
     for _ in 0..50 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let s = world.stats();
     assert!(s.coarse_columns >= 9, "{s:?}");
@@ -310,7 +313,7 @@ fn the_render_tree_shows_loaded_chunks_and_coarse_beyond() {
     let eye = eye_at(&world, 3000, -4000);
     settle(&mut world, eye);
     for _ in 0..30 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     let render = world.render_snapshot();
     let full = world.snapshot();
@@ -381,7 +384,7 @@ fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
     };
     let mut batch = UploadBatch::default();
     for frame in 1..=120 {
-        world.update(eye);
+        world.update(eye, FRAME);
         let snapshot = world.render_snapshot();
         let dirty = world_core::DirtyBricks::from_unsorted(world.take_changes().render_bricks);
         let input = FrameInput {
@@ -424,7 +427,7 @@ fn destruction_shows_from_afar_once_its_chunk_is_written() {
     let eye = eye_at(&world, 6000, -6000);
     settle(&mut world, eye);
     for _ in 0..30 {
-        world.update(eye);
+        world.update(eye, FRAME);
     }
     // A 1 m cube 2.5 m under the ground, aligned to coarse cells.
     let ground = world.generator().column(eye.x, eye.z).unwrap().height;
@@ -445,7 +448,7 @@ fn destruction_shows_from_afar_once_its_chunk_is_written() {
     let away = eye_at(&world, eye.x + 56 * 64, eye.z);
     settle(&mut world, away);
     for _ in 0..10 {
-        world.update(away);
+        world.update(away, FRAME);
     }
     assert_eq!(world.snapshot().lookup(centre), None, "evicted");
     assert!(world.stats().saved_chunks >= 1);
@@ -662,7 +665,7 @@ fn a_large_log_is_folded_into_region_files_at_a_checkpoint() {
             }
         }
         world.apply(&edits).unwrap();
-        world.update(eye);
+        world.update(eye, FRAME);
         assert!(world.stats().saving >= 1, "the checkpoint writes the chunk");
         // An edit while the checkpoint runs stays in the log.
         late = Edit::new(
@@ -670,7 +673,7 @@ fn a_large_log_is_folded_into_region_files_at_a_checkpoint() {
             MaterialId(6),
         );
         world.apply(&[late]).unwrap();
-        world.update(eye);
+        world.update(eye, FRAME);
         let s = world.stats();
         assert_eq!(s.checkpoints, 1, "{s:?}");
         assert!(s.log_bytes < 1024, "{s:?}");
@@ -745,7 +748,7 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
 
     // An evicted chunk waiting for its write still counts toward the cap.
     let away = eye_at(&world, eye.x + 200 * 64, eye.z);
-    world.update(away);
+    world.update(away, FRAME);
     let s = world.stats();
     assert!(s.saving >= 1 && s.saving_bytes > 0, "{s:?}");
     assert_eq!(s.hot_bytes, world.hot_bytes_walked());
@@ -760,7 +763,7 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
     let sphere = super::plan::sphere(aside, 16.0).len();
     assert!(world.stats().loaded > sphere, "{:?}", world.stats());
     world.config_mut().hot_cap_mib = 0;
-    world.update(aside);
+    world.update(aside, FRAME);
     assert_eq!(world.stats().loaded, sphere);
     assert_eq!(world.stats().hot_bytes, world.hot_bytes_walked());
     std::fs::remove_dir_all(&dir).unwrap();

@@ -24,6 +24,7 @@ use world_render::prelude::VoxelWorldFeed;
 
 pub use autopilot::Autopilot;
 pub use config::ResidencyConfig;
+use world::ResidencyStats;
 pub use world::StreamedWorld;
 
 use crate::player::PlayerCamera;
@@ -122,7 +123,7 @@ fn update_world(
         *opened_at = Some(time.elapsed_secs());
     }
     let eye = eye_voxel(transform);
-    world.0.update(eye);
+    world.0.update(eye, time.delta_secs());
     if let Some(start) = *opened_at
         && world.0.is_settled(eye)
     {
@@ -190,19 +191,30 @@ fn place_on_ground(
     *placed = true;
 }
 
-/// Logs the residency figures every few seconds.
-fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<f32>) {
+/// Logs the residency figures every few seconds: what is held, and over the
+/// interval the mean number of holes in the full-detail sphere (all of them
+/// and those ahead of the player's motion) and where loaded chunks came from.
+fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, ResidencyStats)>) {
     let Some(world) = world else {
         return;
     };
+    if world.is_added() {
+        *last = (time.elapsed_secs(), ResidencyStats::default());
+    }
     let now = time.elapsed_secs();
-    if now - *last < 5.0 {
+    if now - last.0 < 5.0 {
         return;
     }
-    *last = now;
     let s = world.0.stats();
+    let p = std::mem::replace(&mut *last, (now, s)).1;
+    let updates = s.updates.saturating_sub(p.updates).max(1) as f64;
+    let mean = |sum: u64, before: u64| sum.saturating_sub(before) as f64 / updates;
+    let v = world.0.velocity_m_s();
     debug!(
-        "world: {} chunks loaded ({} edited, {} loading, {} saving), {:.0} MiB hot,          {} warm ({:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting",
+        "world: {} chunks loaded ({} edited, {} loading, {} saving), {:.0} MiB hot, \
+         {} warm ({:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
+         interval: holes {:.1} mean ({:.1} ahead), {} now, loads {} generated / {} warm / \
+         {} disk, speed {:.1} m/s",
         s.loaded,
         s.edited,
         s.loading,
@@ -214,6 +226,13 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<f32>) {
         s.coarse_bytes as f64 / 1048576.0,
         s.saved_chunks,
         s.pending_chunks,
+        mean(s.hole_sum, p.hole_sum),
+        mean(s.hole_ahead_sum, p.hole_ahead_sum),
+        s.holes,
+        s.generated - p.generated.min(s.generated),
+        s.warm_hits - p.warm_hits.min(s.warm_hits),
+        s.disk_loads - p.disk_loads.min(s.disk_loads),
+        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
     );
 }
 

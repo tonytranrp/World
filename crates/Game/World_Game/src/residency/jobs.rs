@@ -82,6 +82,17 @@ impl Generators {
     }
 }
 
+/// Where a loaded chunk's content came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadSource {
+    /// Decompressed from the warm cache.
+    Warm,
+    /// Decoded from its region file records.
+    Saved,
+    /// Generated from the seed.
+    Generated,
+}
+
 /// A loaded chunk, ready to join the world. Its content is what the warm
 /// cache, the region file or the generator holds, so it needs no saving
 /// until it changes.
@@ -93,6 +104,7 @@ pub struct Loaded {
     /// before anything replaces it.
     pub refused: bool,
     pub error: Option<String>,
+    pub source: LoadSource,
 }
 
 /// Generates the chunk at `coord` into detached data.
@@ -137,6 +149,7 @@ pub fn load(
                         data,
                         refused: false,
                         error: None,
+                        source: LoadSource::Warm,
                     };
                 }
             }
@@ -187,6 +200,7 @@ pub fn load(
                     data,
                     refused,
                     error,
+                    source: LoadSource::Saved,
                 };
             }
             Err(e) => {
@@ -199,6 +213,7 @@ pub fn load(
         data: generate(generators.current(), coord),
         refused,
         error,
+        source: LoadSource::Generated,
     }
 }
 

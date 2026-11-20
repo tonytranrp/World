@@ -91,9 +91,104 @@ pub fn disc(eye: VoxelPos, radius_m: f32) -> Vec<(u32, u32)> {
     out.into_iter().map(|(_, c)| c).collect()
 }
 
+/// The player's velocity, estimated from successive eye positions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Motion {
+    last: Option<VoxelPos>,
+    /// Voxels per second, smoothed.
+    velocity: [f32; 3],
+}
+
+impl Motion {
+    /// Takes the eye position `dt_secs` after the previous one. The estimate
+    /// follows the measured velocity with a time constant of about
+    /// `smoothing_secs` (0 follows it at once), in a rational form with no
+    /// platform math functions, so every machine computes the same values.
+    /// A step longer than `jump` voxels is a teleport, not motion, and
+    /// resets the estimate.
+    pub fn observe(&mut self, eye: VoxelPos, dt_secs: f32, smoothing_secs: f32, jump: f32) {
+        let Some(last) = self.last.replace(eye) else {
+            return;
+        };
+        if dt_secs.is_nan() || dt_secs <= 0.0 {
+            return;
+        }
+        let step = [eye.x - last.x, eye.y - last.y, eye.z - last.z].map(|d| d as f32);
+        if length(step) > jump {
+            self.velocity = [0.0; 3];
+            return;
+        }
+        let alpha = dt_secs / (smoothing_secs.max(0.0) + dt_secs);
+        for (v, s) in self.velocity.iter_mut().zip(step) {
+            *v += alpha * (s / dt_secs - *v);
+        }
+    }
+
+    /// The smoothed velocity, in voxels per second.
+    pub fn velocity(&self) -> [f32; 3] {
+        self.velocity
+    }
+
+    /// Whether `chunk`'s centre lies ahead of `eye` along the motion. Nothing
+    /// is ahead while standing still.
+    pub fn is_ahead(&self, eye: VoxelPos, chunk: ChunkCoord) -> bool {
+        let min = chunk.min_voxel();
+        let half = (CHUNK_SIZE / 2) as f32;
+        let d = [
+            min.x as f32 + half - eye.x as f32,
+            min.y as f32 + half - eye.y as f32,
+            min.z as f32 + half - eye.z as f32,
+        ];
+        let v = self.velocity;
+        d[0] * v[0] + d[1] * v[1] + d[2] * v[2] > 0.0
+    }
+}
+
+fn length(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_follows_steady_walking_and_resets_on_a_teleport() {
+        let mut motion = Motion::default();
+        let dt = 1.0 / 60.0;
+        // 4 m/s along +x is 256 voxels per second; steps alternate 4 and 5
+        // voxels as a real eye's integer position does.
+        let mut x = 0;
+        for i in 0..600 {
+            x += if i % 2 == 0 { 4 } else { 5 };
+            motion.observe(VoxelPos::new(x, 100, 0), dt, 0.25, 1000.0);
+        }
+        let v = motion.velocity();
+        assert!((v[0] - 270.0).abs() < 10.0, "{v:?}");
+        assert!(v[1].abs() < 1e-3 && v[2].abs() < 1e-3, "{v:?}");
+        let eye = VoxelPos::new(x, 100, 0);
+        let ahead = ChunkCoord::containing(VoxelPos::new(x + 2048, 100, 0)).unwrap();
+        let behind = ChunkCoord::containing(VoxelPos::new(x - 2048, 100, 0)).unwrap();
+        assert!(motion.is_ahead(eye, ahead));
+        assert!(!motion.is_ahead(eye, behind));
+
+        motion.observe(VoxelPos::new(x + 5000, 100, 0), dt, 0.25, 1000.0);
+        assert_eq!(motion.velocity(), [0.0; 3], "a jump is not motion");
+        assert!(!motion.is_ahead(eye, ahead));
+    }
+
+    #[test]
+    fn standing_still_decays_the_estimate() {
+        let mut motion = Motion::default();
+        let dt = 0.1;
+        motion.observe(VoxelPos::new(0, 0, 0), dt, 0.0, 1e9);
+        motion.observe(VoxelPos::new(100, 0, 0), dt, 0.0, 1e9);
+        assert_eq!(motion.velocity(), [1000.0, 0.0, 0.0], "no smoothing");
+        for _ in 0..100 {
+            motion.observe(VoxelPos::new(100, 0, 0), dt, 0.5, 1e9);
+        }
+        assert!(motion.velocity()[0].abs() < 1e-3, "{:?}", motion.velocity());
+    }
 
     #[test]
     fn a_64_metre_sphere_holds_the_chunks_whose_centre_is_inside() {

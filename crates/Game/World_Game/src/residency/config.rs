@@ -36,6 +36,8 @@ pub struct ResidencyConfig {
     /// Where region files and the edit log live, relative to the working
     /// directory.
     pub save_dir: String,
+    /// The player's velocity is averaged over about this long, in seconds.
+    pub velocity_smoothing_secs: f32,
 }
 
 impl Default for ResidencyConfig {
@@ -53,6 +55,7 @@ impl Default for ResidencyConfig {
             grafts_per_frame: 8,
             log_checkpoint_kib: 16384,
             save_dir: "saves/world".into(),
+            velocity_smoothing_secs: 0.5,
         }
     }
 }
@@ -87,6 +90,12 @@ impl ConfigAsset for ResidencyConfig {
             self.log_checkpoint_kib.into(),
             64.0,
             1_048_576.0,
+        );
+        range(
+            "velocity_smoothing_secs",
+            self.velocity_smoothing_secs.into(),
+            0.0,
+            10.0,
         );
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());

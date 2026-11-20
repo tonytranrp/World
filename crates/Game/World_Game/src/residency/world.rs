@@ -27,8 +27,8 @@ use world_core::{Edit, EditError, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_gen::{CHUNK_SIZE, ChunkCoord, Generator, GeneratorVersion, TerrainConfig};
 
 use super::config::ResidencyConfig;
-use super::jobs::{Generators, WarmChunk};
-use super::plan;
+use super::jobs::{Generators, LoadSource, WarmChunk};
+use super::plan::{self, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
 
@@ -118,6 +118,20 @@ pub struct ResidencyStats {
     pub checkpoints: usize,
     /// Bytes in the edit log.
     pub log_bytes: u64,
+    /// Chunks within the full-detail radius that were not loaded at the last
+    /// update.
+    pub holes: usize,
+    /// Of those, the ones ahead of the player's motion.
+    pub holes_ahead: usize,
+    /// `holes` and `holes_ahead` summed over every update, and the number
+    /// of updates, for averages over an interval.
+    pub hole_sum: u64,
+    pub hole_ahead_sum: u64,
+    pub updates: u64,
+    /// Chunk loads since the world opened, by where their content came from.
+    pub generated: usize,
+    pub warm_hits: usize,
+    pub disk_loads: usize,
 }
 
 /// Compressed chunks as their region files hold them, kept in RAM after
@@ -212,6 +226,22 @@ pub struct StreamedWorld {
     write_failures: usize,
     changes: WorldChanges,
     errors: Vec<String>,
+    motion: Motion,
+    /// Load and hole figures for [`ResidencyStats`].
+    counters: Counters,
+}
+
+/// Running figures reported in [`ResidencyStats`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    holes: usize,
+    holes_ahead: usize,
+    hole_sum: u64,
+    hole_ahead_sum: u64,
+    updates: u64,
+    generated: usize,
+    warm_hits: usize,
+    disk_loads: usize,
 }
 
 /// The chunk-aligned boxes of `region`, one per chunk it touches.
@@ -304,6 +334,8 @@ impl StreamedWorld {
             write_failures: 0,
             changes: WorldChanges::default(),
             errors: Vec::new(),
+            motion: Motion::default(),
+            counters: Counters::default(),
         };
         for record in replay {
             match record {
@@ -403,7 +435,22 @@ impl StreamedWorld {
             writes: self.writes_submitted,
             checkpoints: self.checkpoints,
             log_bytes: self.wal_bytes,
+            holes: self.counters.holes,
+            holes_ahead: self.counters.holes_ahead,
+            hole_sum: self.counters.hole_sum,
+            hole_ahead_sum: self.counters.hole_ahead_sum,
+            updates: self.counters.updates,
+            generated: self.counters.generated,
+            warm_hits: self.counters.warm_hits,
+            disk_loads: self.counters.disk_loads,
         }
+    }
+
+    /// The player's smoothed velocity, in metres per second.
+    pub fn velocity_m_s(&self) -> [f32; 3] {
+        self.motion
+            .velocity()
+            .map(|v| v / world_core::consts::VOXELS_PER_METER as f32)
     }
 
     /// Whether every chunk within the full-detail radius of `eye` is loaded.
@@ -413,8 +460,15 @@ impl StreamedWorld {
             .all(|c| self.loaded.contains_key(c))
     }
 
-    /// One frame of residency around `eye`.
-    pub fn update(&mut self, eye: VoxelPos) {
+    /// One frame of residency around `eye`, `dt_secs` after the previous
+    /// one (successive positions give the player's velocity).
+    pub fn update(&mut self, eye: VoxelPos, dt_secs: f32) {
+        self.motion.observe(
+            eye,
+            dt_secs,
+            self.config.velocity_smoothing_secs,
+            plan::voxels(self.config.evict_radius_m),
+        );
         for done in self.pool.drain() {
             self.finish(done, eye);
         }
@@ -794,8 +848,14 @@ impl StreamedWorld {
                 data,
                 refused,
                 error,
+                source,
             } => {
                 self.loading.remove(&coord);
+                match source {
+                    LoadSource::Warm => self.counters.warm_hits += 1,
+                    LoadSource::Saved => self.counters.disk_loads += 1,
+                    LoadSource::Generated => self.counters.generated += 1,
+                }
                 if let Some(e) = error {
                     self.errors.push(e);
                 }
@@ -988,7 +1048,9 @@ impl StreamedWorld {
 
     fn request_loads(&mut self, eye: VoxelPos) {
         let in_flight_cap = (self.config.workers.max(1) as usize) * 4;
-        for coord in plan::sphere(eye, self.config.full_radius_m) {
+        let sphere = plan::sphere(eye, self.config.full_radius_m);
+        self.count_holes(eye, &sphere);
+        for coord in sphere {
             if self.loaded.contains_key(&coord)
                 || self.loading.contains(&coord)
                 || self.ready.iter().any(|(c, _, _)| *c == coord)
@@ -1019,6 +1081,26 @@ impl StreamedWorld {
                 saved: self.saved.contains(&coord),
             });
         }
+    }
+
+    /// Records the chunks of the full-detail `sphere` around `eye` that are
+    /// not loaded.
+    fn count_holes(&mut self, eye: VoxelPos, sphere: &[ChunkCoord]) {
+        let (mut holes, mut ahead) = (0, 0);
+        for &c in sphere {
+            if !self.loaded.contains_key(&c) {
+                holes += 1;
+                if self.motion.is_ahead(eye, c) {
+                    ahead += 1;
+                }
+            }
+        }
+        let n = &mut self.counters;
+        n.holes = holes;
+        n.holes_ahead = ahead;
+        n.hole_sum += holes as u64;
+        n.hole_ahead_sum += ahead as u64;
+        n.updates += 1;
     }
 
     /// RAM held by full-detail chunks: the loaded ones and evicted ones

@@ -14,7 +14,7 @@ use world_core::serialize::region::RecordKind;
 use world_core::tree::ChunkData;
 use world_gen::ChunkCoord;
 
-use super::jobs::{self, Generators, WarmChunk};
+use super::jobs::{self, Generators, LoadSource, WarmChunk};
 use super::store::{RegionStore, SavedChunk};
 
 /// What the main thread asks for.
@@ -50,6 +50,7 @@ pub enum Done {
         data: ChunkData,
         refused: bool,
         error: Option<String>,
+        source: LoadSource,
     },
     Saved {
         coord: ChunkCoord,
@@ -336,6 +337,7 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 data: loaded.data,
                 refused: loaded.refused,
                 error: loaded.error,
+                source: loaded.source,
             })
         }
         WorkJob::Save(coord, data, set_aside) => {
