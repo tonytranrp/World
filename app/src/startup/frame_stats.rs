@@ -79,17 +79,35 @@ pub fn windows(frame_ms: &[f64]) -> (&[f64], &[f64]) {
     rest.split_at(split)
 }
 
-/// Frame times recorded so far, in milliseconds.
+/// Frame times recorded so far, in milliseconds, and where to write them.
 #[derive(Resource, Default)]
-pub struct FrameTimes(pub Vec<f64>);
-
-pub fn record(time: Res<Time<Real>>, mut times: ResMut<FrameTimes>) {
-    times.0.push(time.delta_secs_f64() * 1000.0);
+pub struct FrameTimes {
+    pub ms: Vec<f64>,
+    pub csv: Option<std::path::PathBuf>,
 }
 
-/// Logs both windows.
+pub fn record(time: Res<Time<Real>>, mut times: ResMut<FrameTimes>) {
+    times.ms.push(time.delta_secs_f64() * 1000.0);
+}
+
+/// One frame time per line, frame 1 first.
+pub fn to_lines(frame_ms: &[f64]) -> String {
+    let mut out = String::with_capacity(frame_ms.len() * 8);
+    for ms in frame_ms {
+        out.push_str(&format!("{ms:.3}\n"));
+    }
+    out
+}
+
+/// Logs both windows, and writes every frame time when asked to.
 pub fn report(times: &FrameTimes) {
-    let (loading, steady) = windows(&times.0);
+    if let Some(path) = &times.csv {
+        match std::fs::write(path, to_lines(&times.ms)) {
+            Ok(()) => info!("frame times written to {}", path.display()),
+            Err(e) => warn!("could not write frame times to {}: {e}", path.display()),
+        }
+    }
+    let (loading, steady) = windows(&times.ms);
     if let Some(s) = Summary::of(loading) {
         info!("frame times, loading (frames 2-{}): {s}", loading.len() + 1);
     }
@@ -140,6 +158,12 @@ mod tests {
         assert_eq!(loading.last(), Some(&100.0));
         assert_eq!(steady.first(), Some(&101.0));
         assert_eq!(steady.len(), 500);
+    }
+
+    #[test]
+    fn lines_hold_one_frame_each() {
+        assert_eq!(to_lines(&[1.0, 22.125]), "1.000\n22.125\n");
+        assert_eq!(to_lines(&[]), "");
     }
 
     #[test]

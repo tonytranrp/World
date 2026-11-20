@@ -14,6 +14,7 @@ pub struct Config {
     pub list_adapters: bool,
     pub exit_after_frames: Option<u32>,
     pub screenshot: Option<std::path::PathBuf>,
+    pub frame_times: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -24,6 +25,7 @@ impl Default for Config {
             list_adapters: false,
             exit_after_frames: None,
             screenshot: None,
+            frame_times: None,
         }
     }
 }
@@ -41,6 +43,7 @@ impl Config {
             list_adapters: cli.list_adapters,
             exit_after_frames: cli.exit_after_frames,
             screenshot: cli.screenshot.clone(),
+            frame_times: cli.frame_times.clone(),
         }
     }
 }

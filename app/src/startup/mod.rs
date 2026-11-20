@@ -121,8 +121,15 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
     hot_probe::build(&mut app);
 
     if let Some(frames) = config.exit_after_frames {
-        app.insert_resource(ExitAfter(frames))
-            .init_resource::<frame_stats::FrameTimes>()
+        // Automated runs (benchmarks, screenshots, CI) must not depend on
+        // window focus: Bevy's default lets an unfocused window wait on a
+        // timer, which macOS App Nap stretches to seconds in the background.
+        app.insert_resource(bevy::winit::WinitSettings::continuous())
+            .insert_resource(ExitAfter(frames))
+            .insert_resource(frame_stats::FrameTimes {
+                csv: config.frame_times.clone(),
+                ..default()
+            })
             .add_systems(Update, (frame_stats::record, exit_after_frames).chain());
         if let Some(path) = &config.screenshot {
             app.insert_resource(ScreenshotAt {
