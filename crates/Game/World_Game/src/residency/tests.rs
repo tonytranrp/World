@@ -1204,3 +1204,33 @@ fn buried_chunks_load_after_the_visible_ones_around_them() {
     let (again, _) = joined("buried_again", 48.0);
     assert_eq!(again, delayed);
 }
+
+#[test]
+fn underground_no_chunk_is_put_off() {
+    let joined = |name: &str, delay_m: f32| {
+        let dir = temp_dir(name);
+        let mut world = open(
+            &dir,
+            ResidencyConfig {
+                full_radius_m: 32.0,
+                evict_radius_m: 40.0,
+                buried_delay_m: delay_m,
+                ..config(0)
+            },
+        );
+        // Well below the surface, as in a deep cave or shaft.
+        let surface = eye_at(&world, -2500, 4500);
+        let eye = VoxelPos::new(
+            surface.x,
+            surface.y - 100 * VOXELS_PER_METER as i32,
+            surface.z,
+        );
+        let order = settle_joined(&mut world, eye);
+        let _ = std::fs::remove_dir_all(&dir);
+        order
+    };
+    assert_eq!(
+        joined("underground_off", 0.0),
+        joined("underground_on", 48.0)
+    );
+}

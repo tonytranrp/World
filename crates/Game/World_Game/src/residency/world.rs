@@ -1264,7 +1264,16 @@ impl StreamedWorld {
             c.prefetch_lookahead_secs,
             plan::voxels(c.evict_radius_m),
         );
-        let delay = |chunk| self.load_delay(chunk);
+        // A player underground sees the rock around them, not the surface
+        // overhead: no chunk is put off then.
+        let underground = ChunkCoord::containing(eye).is_some_and(|c| self.load_delay(c) > 0.0);
+        let delay = |chunk| {
+            if underground {
+                0.0
+            } else {
+                self.load_delay(chunk)
+            }
+        };
         let mut order = plan::load_priority(eye, predicted, &sphere, delay);
         if let Some(predicted) = predicted
             && self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB

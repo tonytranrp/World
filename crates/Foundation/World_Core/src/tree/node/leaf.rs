@@ -502,6 +502,13 @@ mod tests {
             // Few materials with long runs, like terrain, up to every slot
             // its own material.
             spread in proptest::prop_oneof![1u16..5, 1u16..80, 60u16..400],
+            // Ids from air up to KEEP (u16::MAX), which saturation makes
+            // common at the top.
+            base in proptest::prop_oneof![
+                proptest::strategy::Just(0u16),
+                1000u16..2000,
+                (u16::MAX - 400)..=u16::MAX,
+            ],
             run in 1usize..20,
             seed: u64,
         ) {
@@ -516,7 +523,7 @@ mod tests {
             let mut m = MaterialId::AIR;
             for (slot, v) in voxels.iter_mut().enumerate() {
                 if slot % run == 0 {
-                    m = MaterialId((next() % u64::from(spread)) as u16);
+                    m = MaterialId(base.saturating_add((next() % u64::from(spread)) as u16));
                 }
                 *v = m;
             }

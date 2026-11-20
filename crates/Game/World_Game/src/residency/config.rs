@@ -146,6 +146,10 @@ impl ConfigAsset for ResidencyConfig {
             16384.0,
         );
         range("buried_delay_m", self.buried_delay_m.into(), 0.0, 1024.0);
+        if (1..8).contains(&self.column_cache_mib) {
+            // Less than one footprint (8 MiB) holds none.
+            problems.push("column_cache_mib must be 0 (off) or at least 8".into());
+        }
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());
         }
