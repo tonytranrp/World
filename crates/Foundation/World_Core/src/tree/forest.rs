@@ -99,6 +99,7 @@ impl Forest {
     }
 
     /// A live chunk. Panics on a free id, which no stored word holds.
+    #[inline]
     pub fn chunk(&self, id: u32) -> &Chunk {
         self.chunks[id as usize]
             .as_ref()

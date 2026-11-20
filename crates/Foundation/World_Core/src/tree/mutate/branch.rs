@@ -28,6 +28,7 @@ impl Writer<'_> {
     }
 
     /// Child `slot` of a stored node at level 2 or higher.
+    #[inline]
     pub(super) fn child(&self, node: Node, slot: u32) -> Child {
         if node.mask & bit(slot) == 0 {
             return Child::Air;
