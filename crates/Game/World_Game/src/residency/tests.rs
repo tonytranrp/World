@@ -765,3 +765,40 @@ fn the_hot_total_is_kept_without_walking_the_tree() {
     assert_eq!(world.stats().hot_bytes, world.hot_bytes_walked());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn save_all_keeps_the_log_when_a_write_fails() {
+    use world_core::serialize::region::REGION_CHUNKS;
+    let dir = temp_dir("write_fails");
+    let mut world = open(&dir, config(0));
+    let eye = eye_at(&world, -6000, -2500);
+    settle(&mut world, eye);
+    let target = VoxelPos::new(eye.x, eye.y + 30, eye.z);
+    let edit = Edit::new(target, MaterialId(3));
+    world.apply(&[edit]).unwrap();
+    // A directory where the chunk's region file goes makes its write fail.
+    let region = world_gen::ChunkCoord::containing(target)
+        .unwrap()
+        .to_array()
+        .map(|v| v / REGION_CHUNKS);
+    let blocker = dir.join(format!("r.{}.{}.{}.wvr", region[0], region[1], region[2]));
+    std::fs::create_dir_all(&blocker).unwrap();
+    assert!(world.save_all().is_err());
+    assert_eq!(world.stats().edited, 1, "still unsaved");
+    drop(world);
+    let log = std::fs::read(dir.join("edits.wvl")).unwrap();
+    assert_eq!(
+        read_log(&log).unwrap().0,
+        vec![WalRecord::Edits(vec![edit])],
+        "the log still holds the edit"
+    );
+
+    // Once the region file can be written, the edit comes back from the log.
+    std::fs::remove_dir_all(&blocker).unwrap();
+    let mut world = open(&dir, config(0));
+    assert_eq!(world.stats().pending_chunks, 1);
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(target), MaterialId(3));
+    world.save_all().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

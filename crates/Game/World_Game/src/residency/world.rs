@@ -208,6 +208,8 @@ pub struct StreamedWorld {
     checkpoint_sequence: u64,
     checkpoints: usize,
     writes_submitted: usize,
+    /// Chunk writes that failed since the world opened.
+    write_failures: usize,
     changes: WorldChanges,
     errors: Vec<String>,
 }
@@ -299,6 +301,7 @@ impl StreamedWorld {
             checkpoint_sequence: 0,
             checkpoints: 0,
             writes_submitted: 0,
+            write_failures: 0,
             changes: WorldChanges::default(),
             errors: Vec::new(),
         };
@@ -508,7 +511,9 @@ impl StreamedWorld {
     pub fn save_all(&mut self) -> io::Result<()> {
         let errors_before = self.errors.len();
         self.drain_all();
-        // Writes that failed earlier are tried again.
+        // Writes that failed earlier are tried again; from here on any
+        // failure keeps the log.
+        let failures_before = self.write_failures;
         self.retry_failed_writes();
         self.drain_all();
         // Chunks with waiting edits are loaded here, so their edits land in
@@ -524,9 +529,14 @@ impl StreamedWorld {
                 continue;
             }
             if let Some(w) = self.writes.get_mut(&c) {
+                // Nothing is in flight after the drain: the entry is a failed
+                // write, and its content now rejoins (and is written below).
                 if let Some((data, bytes)) = w.held.take() {
                     self.held_bytes -= bytes;
                     self.ready.push_back((c, data, true));
+                }
+                if !w.in_flight {
+                    self.writes.remove(&c);
                 }
                 continue;
             }
@@ -541,11 +551,22 @@ impl StreamedWorld {
         self.graft_all_ready();
         self.save_edited();
         self.drain_all();
-        if !self.writes.is_empty() {
+        // The log is the only copy of anything not written: it is kept
+        // unless every change reached a region file.
+        let unsaved = self.loaded.values().filter(|s| s.edited).count();
+        if self.write_failures != failures_before
+            || !self.writes.is_empty()
+            || unsaved > 0
+            || !self.pending.is_empty()
+        {
             let errors = self.errors[errors_before.min(self.errors.len())..].join("; ");
             return Err(io::Error::other(format!(
-                "{} chunks could not be written: {errors}",
-                self.writes.len()
+                "the edit log is kept: {} failed writes, {} writes outstanding, {} edited \
+                 chunks unsaved, {} chunks with waiting edits: {errors}",
+                self.write_failures - failures_before,
+                self.writes.len(),
+                unsaved,
+                self.pending.len()
             )));
         }
         self.wal.reset()?;
@@ -678,18 +699,15 @@ impl StreamedWorld {
         let Some(checkpoint) = self.checkpoint.take() else {
             return;
         };
-        let result = self.wal.reset().and_then(|()| {
-            self.wal
-                .append(&WalRecord::Checkpoint(checkpoint.sequence))?;
-            for record in checkpoint.relog.iter().chain(&checkpoint.tail) {
-                self.wal.append(record)?;
-            }
-            self.wal.sync()
-        });
-        if let Err(e) = result {
-            self.errors.push(format!("edit log checkpoint: {e}"));
-        } else {
-            self.checkpoints += 1;
+        // The new log replaces the old one atomically, so a crash or a
+        // failure leaves one of the two whole.
+        let mut records = Vec::with_capacity(1 + checkpoint.relog.len() + checkpoint.tail.len());
+        records.push(WalRecord::Checkpoint(checkpoint.sequence));
+        records.extend(checkpoint.relog);
+        records.extend(checkpoint.tail);
+        match self.wal.replace(&records) {
+            Ok(()) => self.checkpoints += 1,
+            Err(e) => self.errors.push(format!("edit log checkpoint: {e}")),
         }
         self.wal_bytes = file_len(&self.wal_path);
         self.checkpoint_at = self.wal_bytes + self.checkpoint_size();
@@ -842,6 +860,7 @@ impl StreamedWorld {
         match error {
             Some(e) => {
                 self.errors.push(format!("saving chunk {coord:?}: {e}"));
+                self.write_failures += 1;
                 self.abort_checkpoint();
             }
             None => {
