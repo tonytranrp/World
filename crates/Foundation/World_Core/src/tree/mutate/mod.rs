@@ -205,16 +205,16 @@ impl Writer<'_> {
         &mut self,
         existing: Option<(u32, Node)>,
         level: u32,
-        packed: Packed<N>,
+        packed: &Packed<N>,
     ) -> Child {
         match (packed, existing) {
-            (Packed::Filled(material), existing) => {
+            (&Packed::Filled(material), existing) => {
                 if let Some((index, node)) = existing {
                     self.release(index, node, level);
                 }
                 Child::filled(material)
             }
-            (Packed::NotResident, existing) => {
+            (&Packed::NotResident, existing) => {
                 if let Some((index, node)) = existing {
                     self.release(index, node, level);
                 }

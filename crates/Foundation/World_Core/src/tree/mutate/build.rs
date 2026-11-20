@@ -41,14 +41,14 @@ impl<'a> Builder<'a> {
     /// records made by [`leaf`](Self::leaf) (or air and uniform records). Air
     /// or one uniform material collapses into a filled child.
     pub fn brick(&mut self, records: &Records) -> Child {
-        self.writer.write(None, 1, brick::pack(records))
+        self.writer.write(None, 1, &brick::pack(records))
     }
 
     /// The child at `level` (2 and up) made of these 64 canonical children.
     /// Air, one uniform material or all not resident collapses.
     pub fn branch(&mut self, level: u32, children: &Children) -> Child {
         debug_assert!(level >= 2, "level-1 nodes are built from leaf records");
-        self.writer.write(None, level, branch::pack(children))
+        self.writer.write(None, level, &branch::pack(children))
     }
 
     /// Whether a chunk is open.
@@ -162,7 +162,7 @@ impl Writer<'_> {
         let mut children = self.children(child);
         let replaced = self.graft(children[slot], level - 1, target_level, target, make)?;
         children[slot] = replaced;
-        Some(self.write(existing, level, branch::pack(&children)))
+        Some(self.write(existing, level, &branch::pack(&children)))
     }
 }
 

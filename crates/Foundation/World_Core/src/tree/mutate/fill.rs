@@ -122,7 +122,7 @@ impl Writer<'_> {
                 records[slot as usize] = self.store_leaf(old, new);
                 changed = true;
             }
-            return changed.then(|| self.write(existing, 1, brick::pack(&records)));
+            return changed.then(|| self.write(existing, 1, &brick::pack(&records)));
         }
 
         let mut children = self.children(child);
@@ -134,7 +134,7 @@ impl Writer<'_> {
                 changed = true;
             }
         }
-        changed.then(|| self.write(existing, level, branch::pack(&children)))
+        changed.then(|| self.write(existing, level, &branch::pack(&children)))
     }
 }
 

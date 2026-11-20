@@ -72,7 +72,7 @@ impl Writer<'_> {
         Some(match children {
             // Every changed child was rebuilt in place: this node's words stand.
             None => child,
-            Some(children) => self.write(existing, level, super::branch::pack(&children)),
+            Some(children) => self.write(existing, level, &super::branch::pack(&children)),
         })
     }
 
@@ -116,7 +116,7 @@ impl Writer<'_> {
         Some(match records {
             // Every changed leaf was rewritten in place: the mask stands.
             None => child,
-            Some(records) => self.write(existing, 1, brick::pack(&records)),
+            Some(records) => self.write(existing, 1, &brick::pack(&records)),
         })
     }
 
