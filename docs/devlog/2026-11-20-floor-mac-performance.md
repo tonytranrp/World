@@ -89,3 +89,27 @@ the first run outside Windows: the first `dx serve --hot-patch` build took
 reported 2.8 s for the patch). dx was built from source against a static
 OpenSSL 3.5 (`OPENSSL_DIR=$HOME/.local/openssl OPENSSL_STATIC=1 cargo install
 dioxus-cli --version 0.7.10 --locked`), since there is no Homebrew here.
+
+## Warm cache and prefetch
+
+Decision 0006's warm tier now also holds unedited chunks evicted from the
+hot tier (LZ4, least recently used first, edited chunks aging four times
+slower), and the residency loads along the player's velocity: the chunks
+ahead first, then a lookahead sphere around the predicted position.
+Compression runs only when loads leave workers idle.
+
+On this Mac residency is bound by generation, not order: about 6 to 8
+chunks a second with the renderer competing, 57 to 290 ms per chunk, so
+even at 4 m/s the full-detail sphere is about half empty while walking.
+Prefetching moved the holes ahead of the player (12 m/s over 1500 frames:
+185 to 157 holes per frame, 117 to 90 ahead) but did not remove them. A
+chunk back from the warm cache takes 23 to 120 ms instead (an all-air
+chunk 14 µs against 37 ms generated); the straight-line autopilot never
+returns, so the walks show no warm hits. Surface chunks before buried ones,
+or more workers, are the next things to try.
+
+An independent review found two problems, fixed before merging: chunks
+waiting to be compressed kept the hot total over its cap, so eviction took
+another batch every frame; and a region file that failed to read was
+treated as holding no edits, then kept warm, so a later save could
+overwrite them. 622 tests pass on the Radeon, golden images match.
