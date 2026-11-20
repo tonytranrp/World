@@ -1378,7 +1378,10 @@ impl Residency {
             }
         };
         let view = view_at(source, c);
-        if c.level < 3 || content(&view) != Content::Branch {
+        // Grandchildren are summarized as level-2 nodes (`summarize_level2`),
+        // so only a level-4 chunk is warmed; a smaller tree's chunk (its
+        // root) is summarized whole when applied.
+        if c.level != 4 || content(&view) != Content::Branch {
             self.warming.insert(c, DONE);
             return true;
         }
@@ -1657,7 +1660,8 @@ fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
     }
 }
 
-/// The summaries of the level-2 nodes `keys` and of their mixed children,
+/// The summaries of the level-2 nodes `keys` (only level 2: a uniform
+/// child weighs a level-1 node's volume) and of their mixed children,
 /// computed on up to `threads` scoped threads: for each node, its mixed
 /// children's then its own, as [`Residency::summary`] computes them with
 /// nothing cached. Pure, so the result does not depend on the threads.
@@ -1670,6 +1674,7 @@ fn summarize_level2<S: VoxelSource + Sync>(
         let mut out = Vec::new();
         let mut tally = Tally::default();
         for &key in chunk {
+            debug_assert_eq!(key.level, 2, "summarize_level2 weighs level-1 children");
             let view = view_at(source, key);
             let mut node = Tally::default();
             for (slot, child) in view.children() {

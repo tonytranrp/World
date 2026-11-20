@@ -1477,30 +1477,83 @@ fn the_shipped_budget_keeps_up_with_a_walks_chunk_stream() {
     drain(&mut res, &mut pools, 200, &snap, (&[], &[]), view, &config);
 }
 
-/// Summaries computed on several threads are exactly those computed on
-/// one: the pools and the table come out identical.
+/// Expands every node of `source` the table holds, without loading bricks:
+/// a record for every mixed node.
+fn grow_records<S: VoxelSource>(res: &mut Residency, source: &S, pools: &mut CpuPools) {
+    let mut batch = UploadBatch::default();
+    loop {
+        let mut changed = false;
+        for k in res.keys() {
+            if k.level >= 2 && !res.is_expanded(k) {
+                changed |= res.expand(source, k, &mut batch).is_ok();
+            }
+        }
+        apply_cpu(pools, &batch);
+        batch.clear();
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// The records of `res` against those of a fresh cache grown over
+/// `source`, whose summaries are computed one node at a time from nothing:
+/// every key the fresh cache has, with the record's mask and material.
+fn records_match_a_fresh_cache<S: VoxelSource>(res: &Residency, source: &S) {
+    let shape = Shape::of(source);
+    let (mut fresh, mut pools) = roomy_cache(shape);
+    let mut batch = UploadBatch::default();
+    fresh.reset(source, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut fresh, source, &mut pools);
+    let describe = |r: &Residency, k: NodeKey| r.record(k).map(|r| (r.mask(), r.material()));
+    let diffs: Vec<_> = fresh
+        .keys()
+        .into_iter()
+        .filter(|&k| describe(res, k) != describe(&fresh, k))
+        .map(|k| (k, describe(res, k), describe(&fresh, k)))
+        .take(5)
+        .collect();
+    assert!(
+        diffs.is_empty(),
+        "records differ from a fresh cache: {diffs:?}"
+    );
+}
+
+/// A replaced chunk summarized over many calls, on one thread or eight,
+/// gives the records a fresh cache gives, and both give identical pools.
 #[test]
-fn warming_on_threads_matches_warming_on_one() {
+fn warming_on_threads_matches_a_fresh_cache() {
     use world_render::internals::residency::Change;
     let run = |threads: usize| {
         let mut tree = slab();
         let snap = tree.snapshot();
         let shape = Shape::of(&snap);
         let (mut res, mut pools) = roomy_cache(shape);
-        make_resident(&mut res, &snap, &mut pools);
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        grow_records(&mut res, &snap, &mut pools);
         let c = VoxelPos::new(0, -1024, 0);
-        tree.insert_chunk(c, rough_slab(256, 0).chunk_data(c).unwrap())
-            .unwrap();
+        tree.insert_chunk(c, chunk_slab(c, 5)).unwrap();
         let snap = tree.snapshot();
         let key = NodeKey::containing(shape.local(c).unwrap(), 4);
         let mut batch = UploadBatch::default();
         res.queue_changes([Change::Chunk(key)]);
-        // A budget that splits the chunk's summaries over several calls.
+        let mut calls = 0;
         while res.pending_changes() > 0 {
             res.apply_changes(&snap, None, 300, threads, |_| true, &mut batch);
+            calls += 1;
         }
+        assert!(
+            calls > 5,
+            "{calls} calls: the budget should split the chunk"
+        );
+        res.free_buried(u32::MAX, &mut batch);
         apply_cpu(&mut pools, &batch);
+        grow_records(&mut res, &snap, &mut pools);
         verify(&mut res, &snap, &pools);
+        records_match_a_fresh_cache(&res, &snap);
         (
             res.summaries_computed(),
             res.keys(),
@@ -1509,6 +1562,48 @@ fn warming_on_threads_matches_warming_on_one() {
         )
     };
     assert!(run(1) == run(8), "threads changed the result");
+}
+
+/// In a tree whose chunk level is 3 (a 4-level source), a replaced chunk's
+/// summaries are still those of a fresh cache: uniform leaves weigh 64
+/// voxels, not a level-1 node's 4096. (Ported from the third review.)
+#[test]
+fn a_level3_chunk_summarizes_like_a_fresh_cache() {
+    use world_core::DenseGrid;
+    use world_render::internals::residency::Change;
+    let mut g = DenseGrid::new(4, VoxelPos::new(0, 0, 0));
+    let shape = Shape::of(&g);
+    assert_eq!(shape.root_level(), 3);
+    let (mut res, mut pools) = roomy_cache(shape);
+    let mut batch = UploadBatch::default();
+    g.set(VoxelPos::new(100, 100, 100), MaterialId(5));
+    g.set(VoxelPos::new(101, 100, 100), MaterialId(6));
+    res.reset(&g, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &g, &mut pools);
+    // In the brick at the origin: a uniform leaf of 1 and two leaves of 60
+    // voxels of 2.
+    for x in 0..4 {
+        for y in 0..4 {
+            for z in 0..4 {
+                g.set(VoxelPos::new(x, y, z), MaterialId(1));
+                if (x, y, z) != (0, 0, 0) && (x, y, z) != (1, 0, 0) {
+                    g.set(VoxelPos::new(x + 4, y, z), MaterialId(2));
+                    g.set(VoxelPos::new(x + 8, y, z), MaterialId(2));
+                }
+            }
+        }
+    }
+    g.set(VoxelPos::new(20, 0, 0), MaterialId(3));
+    let mut batch = UploadBatch::default();
+    res.queue_changes([Change::Chunk(shape.root())]);
+    while res.pending_changes() > 0 {
+        res.apply_changes(&g, None, u64::MAX, 8, |_| true, &mut batch);
+    }
+    res.free_buried(u32::MAX, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &g, &mut pools);
+    records_match_a_fresh_cache(&res, &g);
 }
 
 /// Collapsing large subtrees frees their records a bounded number at a
