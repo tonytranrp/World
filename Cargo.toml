@@ -50,6 +50,11 @@ bevy-inspector-egui = { version = "0.38.0", default-features = false, features =
 # Testing engine
 proptest = "1.12"
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+# Chunk compression (decision 0006): LZ4 for the warm in-RAM tier, pure-Rust
+# zstd (already in the lockfile through Bevy) for region files. Safe modes
+# only; lz4_flex 0.12.1 fixed RUSTSEC-2026-0041.
+lz4_flex = { version = "0.12.1", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
 serde_json = "1"

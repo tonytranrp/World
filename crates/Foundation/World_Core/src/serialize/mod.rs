@@ -53,7 +53,10 @@
 //! before it builds anything, so a rejected input never costs more than one
 //! pass over its own bytes. It allocates nothing but the tree it returns.
 
+pub mod codec;
 mod read;
+pub mod region;
+pub mod wal;
 mod write;
 
 use std::fmt;
