@@ -10,9 +10,10 @@
 //!
 //! A whole walk visits every resident record, one table lookup each, which
 //! is too much for one frame once the table holds hundreds of thousands of
-//! records. [`select_budgeted`] splits it in two, and both halves visit at
-//! most `lod.max_visits_per_frame` records per frame and resume where they
-//! stopped:
+//! records. [`select_split`] splits it in two, each with its own budget per
+//! frame (growth `lod.max_visits_per_frame`, shrink
+//! `lod.max_shrink_visits_per_frame` and `lod.max_collapses_per_frame`),
+//! and both resume where they stopped:
 //!
 //! - **Growth** (expand and load) only descends into nodes that want
 //!   refining. A child's cells are a quarter of its parent's and never
@@ -40,6 +41,9 @@
 //! children with records of their own are queued, and of a level-2 node's
 //! only those whose bricks are not resident, so a settled region costs one
 //! visit per expanded node instead of one per child.
+//!
+//! Nodes in a replaced chunk that waits to be applied are skipped: it is
+//! rebuilt when applied.
 //!
 //! A growth pass or a shrink pass run to completion under one view gives
 //! exactly [`select`]'s answer.

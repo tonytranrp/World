@@ -12,9 +12,14 @@
 //!   slot order, and its record is internal with `ref = first`.
 //! - A level-1 entry with a brick has a brick record pointing at its block,
 //!   whose words equal the encoding of the current source content.
-//! - Masks and materials always describe the current source: an edit
-//!   rewrites the records on its path in the same batch, and a changed brick
-//!   that cannot be uploaded is made not resident, never left stale.
+//! - Once every queued change is applied, masks and materials describe the
+//!   current source: applying a change rewrites the records on its path in
+//!   the same batch, and a changed brick that cannot be uploaded is made not
+//!   resident, never left stale. Changes wait in a queue under a per-frame
+//!   budget (decision 0012); until one is applied, the records it touches
+//!   describe the content before it.
+//! - Every expanded entry holds one node group, every resident brick one
+//!   brick id, and each entry's child masks match its children's entries.
 
 use bevy::platform::collections::{HashMap, HashSet};
 use world_core::MaterialId;
