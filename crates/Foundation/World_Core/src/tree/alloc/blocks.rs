@@ -1,5 +1,7 @@
 //! Word block allocation: blocks of 1 to 192 words, recycled by exact size.
 
+use std::sync::Arc;
+
 use super::MAX_BLOCK_LEN;
 use super::pages::Pages;
 
@@ -14,8 +16,12 @@ use super::pages::Pages;
 pub(super) struct WordBlocks {
     /// One past the highest word ever handed out.
     end: u32,
-    /// `free[len - 1]` holds the bases of free blocks of `len` words.
-    free: [Vec<u32>; MAX_BLOCK_LEN],
+    /// `free[len - 1]` holds the bases of free blocks of `len` words, or is
+    /// `None` when there are none. Each list is shared until written, so
+    /// cloning the allocator (the first write to a chunk after a snapshot)
+    /// copies reference counts, and a write then copies only the list it
+    /// takes from or adds to.
+    free: [Option<Arc<Vec<u32>>>; MAX_BLOCK_LEN],
     live_words: usize,
     free_words: usize,
 }
@@ -24,7 +30,7 @@ impl Default for WordBlocks {
     fn default() -> Self {
         Self {
             end: 0,
-            free: std::array::from_fn(|_| Vec::new()),
+            free: std::array::from_fn(|_| None),
             live_words: 0,
             free_words: 0,
         }
@@ -39,7 +45,10 @@ impl WordBlocks {
             (1..=MAX_BLOCK_LEN).contains(&len),
             "a word block holds 1 to {MAX_BLOCK_LEN} words, not {len}"
         );
-        let base = match self.free[len - 1].pop() {
+        let base = match self.free[len - 1]
+            .as_mut()
+            .and_then(|v| Arc::make_mut(v).pop())
+        {
             Some(base) => {
                 self.free_words -= len;
                 base
@@ -56,9 +65,13 @@ impl WordBlocks {
             base as usize + len <= self.end as usize,
             "block was never allocated"
         );
-        self.free[len - 1].push(base);
+        self.push_free(len, base);
         self.live_words -= len;
         self.free_words += len;
+    }
+
+    fn push_free(&mut self, len: usize, base: u32) {
+        Arc::make_mut(self.free[len - 1].get_or_insert_with(Default::default)).push(base);
     }
 
     pub fn live_words(&self) -> usize {
@@ -74,7 +87,7 @@ impl WordBlocks {
         let offset = self.end as usize % N;
         if offset != 0 && offset + len > N {
             let rest = N - offset;
-            self.free[rest - 1].push(self.end);
+            self.push_free(rest, self.end);
             self.free_words += rest;
             self.end += rest as u32;
         }
