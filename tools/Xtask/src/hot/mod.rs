@@ -122,6 +122,16 @@ fn check_dx(wanted: &str) -> Result<(), String> {
         .output()
         .map_err(|_| format!("dx is not installed. Install it with:\n  {install}"))?;
     let text = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        // A dx that cannot start (a prebuilt binary missing a shared library,
+        // such as Homebrew's OpenSSL) says why on stderr only.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().take(3).collect::<Vec<_>>().join("\n  ");
+        return Err(format!(
+            "dx --version failed ({}):\n  {reason}\nReinstall it from source with:\n  {install}",
+            output.status
+        ));
+    }
     match parse_dx_version(&text) {
         Some(found) if found == wanted => Ok(()),
         Some(found) => Err(format!(
