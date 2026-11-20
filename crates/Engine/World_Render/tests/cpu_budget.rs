@@ -1006,3 +1006,271 @@ fn a_waiting_change_below_keeps_its_ancestors_resident() {
     );
     verify(&mut res, &snap, &pools);
 }
+
+/// A frame whose only change is an edit inside a waiting chunk (which only
+/// marks its path edited) leaves the root's record on the mask its group
+/// is laid out for, even when the waiting chunk changes the root's mask.
+/// (Ported from the second review.)
+#[test]
+fn an_edit_folded_into_a_waiting_chunk_keeps_the_root_on_its_layout() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let root = shape.root();
+    let old_mask = res.record(root).unwrap().mask();
+    // A chunk in a level-8 child of the root that was air.
+    let c = VoxelPos::new(-524288, -1024, 0);
+    let ck = NodeKey::containing(shape.local(c).unwrap(), 4);
+    tree.insert_chunk(c, rough_slab(c.x, c.z).chunk_data(c).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    {
+        use world_core::tree::NodeView;
+        assert_ne!(
+            view_at(&snap, root).mask(),
+            old_mask,
+            "the root's mask changes"
+        );
+    }
+    let brick = BrickPos::containing(VoxelPos::new(c.x + 3, -5, c.z + 3));
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[brick],
+            chunks: &[c],
+            view: None,
+            config: &config,
+        },
+    );
+    assert!(res.in_waiting_chunk(ck), "the chunk still waits");
+    verify(&mut res, &snap, &pools);
+}
+
+/// The setup of `a_waiting_change_below_keeps_its_ancestors_resident`: c0
+/// resident, c1 (same level-5 node, air) replaced and waiting, c3 (another
+/// level-5 node of the same level-6 node, air) replaced and applied first,
+/// so the level-5 node above c0 and c1 keeps its record.
+fn keep_level5(
+    tree: &mut VoxelTree,
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    shape: Shape,
+    config: &BrickCacheConfig,
+    view: ViewPoint,
+) -> u32 {
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    let (c1, c3) = (VoxelPos::new(1024, -1024, 0), VoxelPos::new(4096, -1024, 0));
+    tree.insert_chunk(c1, rough_slab(1024, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c3, replacement_at(c3)).unwrap();
+    let snap = tree.snapshot();
+    let both = [c1, c3];
+    let mut frame = 10;
+    while !res.has_record(key(c3)) {
+        step(
+            res,
+            pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config,
+            },
+        );
+        frame += 1;
+        assert!(frame < 30, "c3 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    let l5 = key(c1).parent();
+    {
+        use world_core::tree::NodeView;
+        assert_ne!(
+            res.record(l5).map(|r| r.mask()),
+            Some(view_at(&snap, l5).mask()),
+            "the level-5 node kept its record"
+        );
+    }
+    frame
+}
+
+/// Runs frames until the queue is empty, then 20 more for stage 1,
+/// verifying after each (fully once nothing is pending).
+fn drain<S: VoxelSource + Sync>(
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    mut frame: u32,
+    source: &S,
+    first: (&[BrickPos], &[VoxelPos]),
+    view: ViewPoint,
+    config: &BrickCacheConfig,
+) {
+    let start = frame;
+    loop {
+        let (dirty, chunks) = if frame == start {
+            first
+        } else {
+            (&[][..], &[][..])
+        };
+        let r = step(
+            res,
+            pools,
+            frame,
+            Frame {
+                source,
+                dirty,
+                chunks,
+                view: Some(view),
+                config,
+            },
+        );
+        verify(res, source, pools);
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < start + 400, "the queue never drained");
+    }
+    for f in frame..frame + 20 {
+        step(
+            res,
+            pools,
+            f,
+            Frame {
+                source,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                config,
+            },
+        );
+        verify(res, source, pools);
+    }
+}
+
+/// A kept record is rewritten once the change below it applies: draining
+/// the queue leaves a table that verifies fully.
+#[test]
+fn a_kept_record_is_rewritten_once_the_queue_drains() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    let snap = tree.snapshot();
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (&[], &[]),
+        view,
+        &config,
+    );
+    let c0 = NodeKey::containing(shape.local(VoxelPos::new(0, -1024, 0)).unwrap(), 4);
+    assert!(res.is_expanded(c0));
+}
+
+/// A kept record whose waiting chunk is replaced back by air before it
+/// applies: the queue drains to a table that verifies fully.
+#[test]
+fn a_kept_record_survives_its_chunk_being_reverted() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let c1 = VoxelPos::new(1024, -1024, 0);
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    // Back to air before it applies.
+    tree.fill_box(VoxelBox::from_min_size(c1, [1024; 3]), MaterialId::AIR)
+        .unwrap();
+    let snap = tree.snapshot();
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (&[], &[c1]),
+        view,
+        &config,
+    );
+}
+
+/// A kept record, then an edit below it (a whole brick carved out and one
+/// voxel changed) that applies before the waiting chunk: every frame
+/// verifies, and fully once the queue is drained.
+#[test]
+fn a_kept_record_survives_an_edit_below_it() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    let mut edits = Vec::new();
+    for x in 0..16 {
+        for y in -16..0 {
+            for z in 0..16 {
+                edits.push(world_core::Edit::new(
+                    VoxelPos::new(x, y, z),
+                    MaterialId::AIR,
+                ));
+            }
+        }
+    }
+    edits.push(world_core::Edit::new(
+        VoxelPos::new(40, -5, 40),
+        MaterialId(2),
+    ));
+    let dirty = tree.apply(&edits).unwrap();
+    let snap = tree.snapshot();
+    let near = ViewPoint {
+        eye: [5.0, -5.0, 5.0],
+        pixel_angle: 1e-6,
+    };
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (dirty.as_slice(), &[]),
+        near,
+        &config,
+    );
+}

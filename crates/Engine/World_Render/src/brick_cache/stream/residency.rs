@@ -777,13 +777,17 @@ impl Residency {
         Ok(())
     }
 
-    /// Rewrites the root record from the source.
+    /// Rewrites the root record from the source, by the rule of
+    /// [`group_record`](Self::group_record): a root whose group is still
+    /// laid out for another mask (nothing on its path was rewritten, as
+    /// when the only change applied was folded into a waiting chunk) keeps
+    /// its record.
     fn write_root<S: VoxelSource>(&mut self, source: &S, batch: &mut UploadBatch) {
         let root = self.shape.root();
         let view = source.root();
         let record = match content(&view) {
             Content::Air => GpuNode::internal(0, 0, MaterialId::AIR, false),
-            _ => self.child_record(root, view).unwrap_or(GpuNode::internal(
+            _ => self.group_record(root, view).unwrap_or(GpuNode::internal(
                 0,
                 0,
                 MaterialId::AIR,
