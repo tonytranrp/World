@@ -29,11 +29,9 @@ pub fn representative<N: NodeView>(node: N, level: u32) -> MaterialId {
 
 /// Adds the solid voxels under `node` (tree level `level`) to `counts`.
 fn count<N: NodeView>(node: N, level: u32, counts: &mut BTreeMap<MaterialId, u128>) {
-    // TODO(NotResident, decision 0006): a not-resident child has no voxels
-    // to count; add an arm that skips it (or carries its stored material)
-    // when the variant lands. Kept exhaustive so the compiler asks.
+    // A child that is not resident has no voxels to count.
     match node.kind() {
-        NodeKind::Air => {}
+        NodeKind::Air | NodeKind::NotResident => {}
         NodeKind::Uniform(m) => {
             // 64^(level + 1) voxels; level is below 15, so this fits in u128.
             *counts.entry(m).or_default() += 1u128 << (6 * (level + 1));

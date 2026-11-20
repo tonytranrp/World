@@ -90,6 +90,7 @@ mod tests {
             level: 0,
             face,
             material: MaterialId(material),
+            resident: true,
             t: 1.0,
         })
     }

@@ -136,11 +136,17 @@ pub struct TraceHit {
     /// at full resolution).
     pub voxel: VoxelPos,
     /// The level of the cell the hit was taken at: it is `4^level` voxels
-    /// wide; 0 is a voxel. Equals the trace's stop level.
+    /// wide; 0 is a voxel. Equals the trace's stop level, except for a cell
+    /// that is not resident, which is as wide as the unloaded region.
     pub level: u32,
     pub face: Face,
-    /// The voxel's material, or the cell's representative material.
+    /// The voxel's material, or the cell's representative material; air for
+    /// a cell that is not resident.
     pub material: MaterialId,
+    /// False when the ray reached a region whose content is not loaded
+    /// (decision 0006): `voxel` and `level` then name that region's cell,
+    /// which is never treated as air.
+    pub resident: bool,
     /// Distance along the ray, in units of the direction's length.
     pub t: f32,
 }

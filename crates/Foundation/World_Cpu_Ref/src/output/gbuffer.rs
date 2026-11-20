@@ -131,6 +131,7 @@ impl GBuffer {
                         .u32(hit.level)
                         .u32(face_code(hit.face))
                         .u32(u32::from(hit.material.0))
+                        .u32(u32::from(hit.resident))
                         .u32(hit.t.to_bits());
                 }
             }
@@ -147,6 +148,7 @@ fn same(a: &Option<TraceHit>, b: &Option<TraceHit>) -> bool {
                 && a.level == b.level
                 && a.face == b.face
                 && a.material == b.material
+                && a.resident == b.resident
                 && a.t.to_bits() == b.t.to_bits()
         }
         _ => false,
@@ -194,6 +196,7 @@ mod tests {
             level: 0,
             face: Face::NegX,
             material: MaterialId(1),
+            resident: true,
             t: 2.5,
         }
     }

@@ -17,6 +17,8 @@ enum Cell {
     Solid(MaterialId),
     /// The aligned cell of this level (`4^level` voxels wide) is all air.
     Empty { level: u32 },
+    /// The aligned cell of this level is not loaded (decision 0006).
+    NotResident { level: u32 },
 }
 
 /// The nodes on the path to the current voxel: `stack[i]` is the node of
@@ -48,6 +50,7 @@ impl<N: NodeView> Path<N> {
             let root = self.node(0);
             return match root.kind() {
                 NodeKind::Air => Cell::Empty { level: self.levels },
+                NodeKind::NotResident => Cell::NotResident { level: self.levels },
                 NodeKind::Uniform(m) => Cell::Solid(m),
                 NodeKind::Branch | NodeKind::Leaf => {
                     Cell::Solid(representative(root, self.levels - 1))
@@ -57,13 +60,10 @@ impl<N: NodeView> Path<N> {
         loop {
             let node = self.node(self.depth - 1);
             let level = self.levels - self.depth as u32;
-            // TODO(NotResident, decision 0006): when `NodeKind::NotResident`
-            // lands, add one arm here returning a not-resident cell of
-            // `level + 1` (cell and level, no material) and report it as a
-            // distinct hit; never treat it as air. The match is kept
-            // exhaustive so the new variant cannot slip through unnoticed.
             match node.kind() {
                 NodeKind::Air => return Cell::Empty { level: level + 1 },
+                // Unloaded content is never air: the ray stops at it.
+                NodeKind::NotResident => return Cell::NotResident { level: level + 1 },
                 NodeKind::Uniform(m) => return Cell::Solid(m),
                 NodeKind::Branch | NodeKind::Leaf => {
                     let slot = slot(local, level);
@@ -148,7 +148,12 @@ pub(super) fn walk<S: VoxelSource + ?Sized>(
     loop {
         let local: [i64; 3] = std::array::from_fn(|a| axes[a].mirror(v[a]));
         let level = match path.cell(local) {
-            Cell::Solid(material) => return Some(hit(&axes, v, last, material, options)),
+            Cell::Solid(material) => {
+                return Some(hit(&axes, v, last, material, options.stop_level, true));
+            }
+            Cell::NotResident { level } => {
+                return Some(hit(&axes, v, last, MaterialId::AIR, level, false));
+            }
             Cell::Empty { level } => level,
         };
 
@@ -218,13 +223,15 @@ fn enter(axes: &[Axis; 3], v: [i64; 3], size: i64) -> Option<([i64; 3], f32, usi
     Some((entered, t, a))
 }
 
-/// The hit record for solid cell around mirrored voxel `v`.
+/// The hit record for the cell of `level` around mirrored voxel `v`: solid,
+/// or not resident.
 fn hit(
     axes: &[Axis; 3],
     v: [i64; 3],
     last: Option<(f32, usize)>,
     material: MaterialId,
-    options: &TraceOptions,
+    level: u32,
+    resident: bool,
 ) -> TraceHit {
     // Inside the cube, so every coordinate fits in i32 (the source's own
     // bounds are i32).
@@ -235,9 +242,10 @@ fn hit(
     };
     TraceHit {
         voxel: VoxelPos::new(world[0], world[1], world[2]),
-        level: options.stop_level,
+        level,
         face,
         material,
+        resident,
         t,
     }
 }

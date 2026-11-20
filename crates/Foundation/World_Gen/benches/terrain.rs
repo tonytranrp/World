@@ -84,5 +84,45 @@ fn material_queries(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, columns, coarse, point_queries, material_queries);
+/// A whole surface chunk from seed to tree: columns, then a bottom-up build
+/// through `ChunkSource` (decision 0006).
+fn chunk_to_tree(c: &mut Criterion) {
+    let g = generator();
+    let probe = g.columns(chunk());
+    let (lo, hi) = probe.height_range();
+    let min = probe.chunk().min_voxel();
+    let coord = ChunkCoord::containing(world_core::VoxelPos::new(min.x, lo + (hi - lo) / 2, min.z))
+        .expect("inside the world");
+    let mut group = c.benchmark_group("terrain_tree");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(u64::from(CHUNK_SIZE * CHUNK_SIZE)));
+    group.bench_function("chunk_columns_and_build", |b| {
+        b.iter(|| {
+            let source = world_gen::ChunkSource::new(g.columns(black_box(coord)));
+            let mut tree = world_core::VoxelTree::new();
+            tree.build_region(world_core::tree::CHUNK_LEVEL, coord.min_voxel(), &source)
+                .expect("an aligned chunk");
+            tree
+        })
+    });
+    let source = world_gen::ChunkSource::new(g.columns(coord));
+    group.bench_function("chunk_build_only", |b| {
+        b.iter(|| {
+            let mut tree = world_core::VoxelTree::new();
+            tree.build_region(world_core::tree::CHUNK_LEVEL, coord.min_voxel(), &source)
+                .expect("an aligned chunk");
+            tree
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    columns,
+    coarse,
+    point_queries,
+    material_queries,
+    chunk_to_tree
+);
 criterion_main!(benches);
