@@ -13,6 +13,7 @@ pub struct Config {
     pub profile: Profile,
     pub list_adapters: bool,
     pub exit_after_frames: Option<u32>,
+    pub screenshot: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -22,6 +23,7 @@ impl Default for Config {
             profile: Profile::Full,
             list_adapters: false,
             exit_after_frames: None,
+            screenshot: None,
         }
     }
 }
@@ -38,6 +40,7 @@ impl Config {
             },
             list_adapters: cli.list_adapters,
             exit_after_frames: cli.exit_after_frames,
+            screenshot: cli.screenshot.clone(),
         }
     }
 }

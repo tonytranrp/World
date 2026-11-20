@@ -31,6 +31,11 @@ pub struct Cli {
     /// Developer: exit cleanly after this many frames (for automated runs).
     #[arg(long, value_name = "FRAMES")]
     pub exit_after_frames: Option<u32>,
+
+    /// Developer: save a screenshot of the window to this PNG path, shortly
+    /// before `--exit-after-frames` ends the run.
+    #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
+    pub screenshot: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

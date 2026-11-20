@@ -410,7 +410,11 @@ pub fn map_feedback(state: Option<ResMut<BrickCacheState>>) {
 }
 
 /// Logs cache figures every few seconds.
-pub fn log_cache_stats(state: Option<Res<BrickCacheState>>, mut last: Local<u32>) {
+pub fn log_cache_stats(
+    state: Option<Res<BrickCacheState>>,
+    view: Option<Res<CacheViewPoint>>,
+    mut last: Local<u32>,
+) {
     let Some(state) = state else {
         return;
     };
@@ -440,4 +444,10 @@ pub fn log_cache_stats(state: Option<Res<BrickCacheState>>, mut last: Local<u32>
         r.upload_bytes,
         state.ring.skipped,
     );
+    if let Some(v) = view.as_ref().and_then(|v| v.0) {
+        info!(
+            "brick cache view: eye {:?} voxels, {:.2e} rad per pixel",
+            v.eye, v.pixel_angle
+        );
+    }
 }

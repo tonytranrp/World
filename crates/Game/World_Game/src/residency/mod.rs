@@ -12,11 +12,14 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
+
 use bevy::prelude::*;
 use world_core::consts::VOXELS_PER_METER;
-use world_core::{ConfigAsset, VoxelPos};
+use world_core::{ConfigAsset, DirtyBricks, VoxelPos};
 use world_gen::TerrainConfig;
 use world_reload::{AppConfigExt, Config, ConfigOrigin, ConfigRegistry};
+use world_render::prelude::VoxelWorldFeed;
 
 pub use config::ResidencyConfig;
 pub use world::StreamedWorld;
@@ -35,7 +38,14 @@ impl Plugin for ResidencyPlugin {
             .add_config::<TerrainConfig>()
             .add_systems(
                 Update,
-                (open_world, place_on_ground, update_world, log_stats).chain(),
+                (
+                    open_world,
+                    place_on_ground,
+                    update_world,
+                    feed_renderer,
+                    log_stats,
+                )
+                    .chain(),
             )
             .add_systems(Last, save_on_exit);
     }
@@ -127,8 +137,26 @@ fn update_world(
     }
 }
 
-/// Lifts the camera above the terrain once per opened world, if it starts
-/// underground.
+/// Hands the renderer this frame's render tree and the bricks that changed.
+/// A newly opened world replaces whatever the renderer showed.
+fn feed_renderer(world: Option<ResMut<World>>, feed: Option<ResMut<VoxelWorldFeed>>) {
+    let (Some(mut world), Some(mut feed)) = (world, feed) else {
+        return;
+    };
+    let snapshot = Arc::new(world.0.render_snapshot());
+    let changes = world.0.take_changes();
+    if world.is_added() {
+        feed.replace(snapshot);
+    } else {
+        feed.publish(snapshot, &DirtyBricks::from_unsorted(changes.render_bricks));
+    }
+}
+
+/// Puts the camera at eye height above the terrain once per opened world,
+/// where the player stands.
+/// The player's eye above the ground, in metres.
+const EYE_HEIGHT_M: f32 = 1.7;
+
 fn place_on_ground(
     world: Option<Res<World>>,
     mut camera: Query<&mut Transform, With<PlayerCamera>>,
@@ -155,9 +183,7 @@ fn place_on_ground(
         return;
     };
     let ground_m = column.height as f32 / VOXELS_PER_METER as f32;
-    if transform.translation.y < ground_m + 1.8 {
-        transform.translation.y = ground_m + 1.8;
-    }
+    transform.translation.y = ground_m + EYE_HEIGHT_M;
     *placed = true;
 }
 

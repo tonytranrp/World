@@ -122,8 +122,35 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
     if let Some(frames) = config.exit_after_frames {
         app.insert_resource(ExitAfter(frames))
             .add_systems(Update, exit_after_frames);
+        if let Some(path) = &config.screenshot {
+            app.insert_resource(ScreenshotAt {
+                frame: frames.saturating_sub(SCREENSHOT_LEAD_FRAMES).max(1),
+                path: path.clone(),
+            })
+            .add_systems(Update, take_screenshot);
+        }
     }
     app
+}
+
+/// Frames between the screenshot request and the exit, so the capture is
+/// written before the app closes.
+const SCREENSHOT_LEAD_FRAMES: u32 = 30;
+
+#[derive(Resource)]
+struct ScreenshotAt {
+    frame: u32,
+    path: std::path::PathBuf,
+}
+
+fn take_screenshot(at: Res<ScreenshotAt>, mut frames: Local<u32>, mut commands: Commands) {
+    *frames += 1;
+    if *frames == at.frame {
+        use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(at.path.clone()));
+    }
 }
 
 /// Assets from the top-level `assets/` folder. On macOS and Linux the folder

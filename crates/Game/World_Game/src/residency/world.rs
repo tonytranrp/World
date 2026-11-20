@@ -43,6 +43,11 @@ enum PendingEdit {
 /// What changed in the world since the renderer last asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldChanges {
+    /// Bricks of the render tree whose content changed: edited bricks, and
+    /// one brick of every chunk that was swapped (loaded, unloaded, or
+    /// switched between full and coarse), which makes the GPU cache rebuild
+    /// that region from the snapshot.
+    pub render_bricks: Vec<BrickPos>,
     /// Bricks edited in loaded chunks.
     pub bricks: Vec<BrickPos>,
     /// Chunks that joined the tree (every brick of them is new).
@@ -110,6 +115,11 @@ pub struct StreamedWorld {
     generator: Arc<Generator>,
     tree: VoxelTree,
     coarse: VoxelTree,
+    /// What the renderer draws: the loaded chunks of `tree` (shared, not
+    /// copied) and, where those are not loaded, the coarse chunks.
+    render: VoxelTree,
+    /// The coarse chunks by coordinate, to fill the render tree.
+    coarse_chunks: BTreeMap<ChunkCoord, ChunkData>,
     loaded: BTreeMap<ChunkCoord, ChunkState>,
     loading: BTreeSet<ChunkCoord>,
     /// Edited chunks evicted and not yet written, with their content, so a
@@ -185,6 +195,8 @@ impl StreamedWorld {
             generator,
             tree: VoxelTree::unloaded(),
             coarse: VoxelTree::new(),
+            render: VoxelTree::new(),
+            coarse_chunks: BTreeMap::new(),
             loaded: BTreeMap::new(),
             loading: BTreeSet::new(),
             saving: BTreeMap::new(),
@@ -228,12 +240,36 @@ impl StreamedWorld {
         self.tree.snapshot()
     }
 
+    /// What the renderer draws: full detail where loaded, coarse cells
+    /// elsewhere in the coarse ring, air beyond.
+    pub fn render_snapshot(&self) -> TreeSnapshot {
+        self.render.snapshot()
+    }
+
+    /// Puts the current content of chunk `coord` into the render tree: the
+    /// loaded chunk, else its coarse chunk, else air.
+    fn refresh_render(&mut self, coord: ChunkCoord) {
+        let min = coord.min_voxel();
+        let data = if self.loaded.contains_key(&coord) {
+            self.tree.chunk_data(min)
+        } else {
+            self.coarse_chunks.get(&coord).cloned()
+        };
+        let result = match data {
+            Some(data) => self.render.insert_chunk(min, data),
+            None => self.render.take_chunk(min).map(|_| true),
+        };
+        if result.is_ok() {
+            self.changes.render_bricks.push(min.brick());
+        }
+    }
+
     /// The coarse world beyond the full-detail radius.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "read by the World_Render feed once the GPU cache is merged"
+            reason = "the renderer draws the render tree; the coarse tree is for queries and tests"
         )
     )]
     pub fn coarse_snapshot(&self) -> TreeSnapshot {
@@ -241,13 +277,6 @@ impl StreamedWorld {
     }
 
     /// What changed since the last call.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the World_Render feed once the GPU cache is merged"
-        )
-    )]
     pub fn take_changes(&mut self) -> WorldChanges {
         std::mem::take(&mut self.changes)
     }
@@ -321,13 +350,16 @@ impl StreamedWorld {
                 .push(PendingEdit::Edits(edits));
         }
         let bricks = self.tree.apply(&now)?;
+        let mut touched = BTreeSet::new();
         for &edit in &now {
             if let Some(c) = ChunkCoord::containing(edit.pos)
                 && let Some(state) = self.loaded.get_mut(&c)
             {
                 state.edited = true;
+                touched.insert(c);
             }
         }
+        self.share_edits(&touched, bricks.as_slice());
         self.changes.bricks.extend_from_slice(bricks.as_slice());
         Ok(bricks.as_slice().to_vec())
     }
@@ -345,7 +377,10 @@ impl StreamedWorld {
                 if let Some(state) = self.loaded.get_mut(&c) {
                     state.edited = true;
                 }
+                let before = self.changes.bricks.len();
                 self.mark_bricks(part);
+                let marked: Vec<BrickPos> = self.changes.bricks[before..].to_vec();
+                self.share_edits(&BTreeSet::from([c]), &marked);
             } else {
                 self.pending
                     .entry(c)
@@ -403,6 +438,17 @@ impl StreamedWorld {
             return Err(io::Error::other(self.errors.join("; ")));
         }
         self.wal.reset()
+    }
+
+    /// Shares the edited chunks' new content with the render tree, and
+    /// reports the edited bricks for it.
+    fn share_edits(&mut self, chunks: &BTreeSet<ChunkCoord>, bricks: &[BrickPos]) {
+        for &c in chunks {
+            if let Some(data) = self.tree.chunk_data(c.min_voxel()) {
+                let _ = self.render.insert_chunk(c.min_voxel(), data);
+            }
+        }
+        self.changes.render_bricks.extend_from_slice(bricks);
     }
 
     fn log(&mut self, record: &WalRecord) {
@@ -486,9 +532,17 @@ impl StreamedWorld {
                 let mut entry = Vec::new();
                 for (coord, data) in chunks {
                     let bytes = data.bytes();
-                    if self.coarse.insert_chunk(coord.min_voxel(), data).is_ok() {
+                    if self
+                        .coarse
+                        .insert_chunk(coord.min_voxel(), data.clone())
+                        .is_ok()
+                    {
                         entry.push((coord, bytes));
                         self.coarse_bytes += bytes;
+                        self.coarse_chunks.insert(coord, data);
+                        if !self.loaded.contains_key(&coord) {
+                            self.refresh_render(coord);
+                        }
                     }
                 }
                 self.coarse_loaded.insert((x, z), entry);
@@ -531,6 +585,7 @@ impl StreamedWorld {
         }
         self.loaded.insert(coord, state);
         self.changes.loaded.push(coord);
+        self.refresh_render(coord);
     }
 
     fn request_loads(&mut self, eye: VoxelPos) {
@@ -608,6 +663,7 @@ impl StreamedWorld {
             self.pool.submit(Request::Save { coord, data });
         }
         self.changes.unloaded.push(coord);
+        self.refresh_render(coord);
     }
 
     fn update_coarse(&mut self, eye: VoxelPos) {
@@ -648,6 +704,10 @@ impl StreamedWorld {
                 for (coord, bytes) in chunks {
                     let _ = self.coarse.unload(CHUNK_LEVEL, coord.min_voxel());
                     self.coarse_bytes = self.coarse_bytes.saturating_sub(bytes);
+                    self.coarse_chunks.remove(&coord);
+                    if !self.loaded.contains_key(&coord) {
+                        self.refresh_render(coord);
+                    }
                 }
                 self.changes.coarse = true;
             }

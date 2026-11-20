@@ -289,3 +289,110 @@ fn an_overlay_from_another_generator_version_is_refused() {
     assert!(loaded.error.unwrap().contains("version 99"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn the_render_tree_shows_loaded_chunks_and_coarse_beyond() {
+    let dir = temp_dir("render");
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            coarse_radius_m: 48.0,
+            coarse_cell_level: 2,
+            ..config(0)
+        },
+    );
+    let eye = eye_at(&world, 3000, -4000);
+    settle(&mut world, eye);
+    for _ in 0..30 {
+        world.update(eye);
+    }
+    let render = world.render_snapshot();
+    let full = world.snapshot();
+    // Loaded: the render tree reads exactly like the world.
+    let near = VoxelPos::new(eye.x + 7, eye.y - 140, eye.z - 3);
+    assert_eq!(render.get(near), full.get(near));
+    // Beyond the loaded sphere but inside the coarse ring: coarse terrain.
+    let ground = world
+        .generator()
+        .column(eye.x + 2500, eye.z)
+        .unwrap()
+        .height;
+    let far_below = VoxelPos::new(eye.x + 2500, ground - 300, eye.z);
+    assert_eq!(full.lookup(far_below), None, "not loaded at full detail");
+    assert!(!render.get(far_below).is_air(), "coarse cells fill it");
+    let changes = world.take_changes();
+    assert!(!changes.render_bricks.is_empty());
+
+    // Edits reach the render tree, and their bricks are reported.
+    let target = ground_below(&world, eye);
+    let hole = dig(&mut world, target);
+    assert!(
+        hole.iter()
+            .all(|&p| world.render_snapshot().get(p).is_air())
+    );
+    let changes = world.take_changes();
+    assert!(changes.render_bricks.contains(&target.brick()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The GPU cache's stage 1, run on the CPU, fed exactly as the plugin feeds
+/// it while the world streams in: it refines down to bricks around the eye.
+#[test]
+fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
+    use world_render::internals::BrickCacheConfig;
+    use world_render::internals::batch::UploadBatch;
+    use world_render::internals::frame::{FrameInput, run_frame};
+    use world_render::internals::key::Shape;
+    use world_render::internals::layout::PoolLayout;
+    use world_render::internals::residency::Residency;
+    use world_render::internals::select::ViewPoint;
+    let dir = temp_dir("gpu_feed");
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            coarse_radius_m: 96.0,
+            ..config(0)
+        },
+    );
+    let eye = eye_at(&world, 0, 0);
+    let shape = Shape::of(&world.render_snapshot());
+    let layout = PoolLayout {
+        node_count: 1 << 22,
+        segments: vec![64 << 20, 64 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 20,
+        upload_budget: 24 << 20,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let mut cache = Residency::new(shape, &layout).unwrap();
+    let config = BrickCacheConfig::default();
+    // 1440 rows at a 70 degree field of view.
+    let view = ViewPoint {
+        eye: [eye.x as f32, eye.y as f32, eye.z as f32],
+        pixel_angle: 2.0 / (1.43 * 1440.0),
+    };
+    let mut batch = UploadBatch::default();
+    for frame in 1..=120 {
+        world.update(eye);
+        let snapshot = world.render_snapshot();
+        let dirty = world_core::DirtyBricks::from_unsorted(world.take_changes().render_bricks);
+        let input = FrameInput {
+            source: &snapshot,
+            frame,
+            refresh: frame == 1,
+            dirty: dirty.as_slice(),
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(&mut cache, &input, &mut batch);
+    }
+    let stats = cache.stats();
+    assert!(stats.bricks > 1000, "{stats:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
