@@ -941,3 +941,68 @@ fn many_edits_spread_over_frames_on_a_small_budget() {
     assert!(frame - 10 >= dirty.len() as u32, "one a frame");
     verify(&mut res, &snap, &pools);
 }
+
+/// A change that waits below an expanded node changes that node's mask in
+/// the source; when a change elsewhere rewrites the group above it, the
+/// node keeps its record and everything resident below it, instead of
+/// dropping its whole subtree for stage 1 to rebuild (which, walking, threw
+/// away up to 600,000 records in one frame).
+#[test]
+fn a_waiting_change_below_keeps_its_ancestors_resident() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    // c0 holds part of the slab; c1, in the same level-5 node, is air until
+    // replaced and then waits; c3, in another level-5 node of the same
+    // level-6 node, is air until replaced and is applied first.
+    let c0 = VoxelPos::new(0, -1024, 0);
+    let c1 = VoxelPos::new(1024, -1024, 0);
+    let c3 = VoxelPos::new(4096, -1024, 0);
+    assert_eq!(key(c0).parent(), key(c1).parent());
+    assert_ne!(key(c0).parent(), key(c3).parent());
+    assert_eq!(key(c0).ancestor(6), key(c3).ancestor(6));
+    assert!(res.is_expanded(key(c0)));
+    let expanded_before = res.stats().expanded;
+    tree.insert_chunk(c1, rough_slab(1024, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c3, replacement_at(c3)).unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [c3.x as f32 + 40.0, -10.0, c3.z as f32 + 40.0],
+        pixel_angle: 1e-6,
+    };
+    let both = [c1, c3];
+    let mut frame = 10;
+    while !res.has_record(key(c3)) {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        assert_eq!(r.collapsed, 0);
+        frame += 1;
+        assert!(frame < 30, "c3 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    assert!(res.is_expanded(key(c0)), "c0 kept its detail");
+    assert!(
+        res.stats().expanded >= expanded_before,
+        "{} expanded, {expanded_before} before",
+        res.stats().expanded
+    );
+    verify(&mut res, &snap, &pools);
+}

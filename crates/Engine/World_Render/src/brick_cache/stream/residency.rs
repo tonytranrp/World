@@ -601,27 +601,19 @@ impl Residency {
         }
     }
 
-    /// Before the record of `key` is written again for content whose mask
-    /// is `mask`: drops what the entry holds below it (children, group,
-    /// brick) when that was laid out for another mask, or when it lies in a
-    /// replaced chunk that waits (it describes the old content, and applying
-    /// the chunk would drop it anyway). The record then points at nothing
-    /// it cannot read; stage 1 refines the node again.
-    fn unlink_stale(&mut self, key: NodeKey, mask: u64, batch: &mut UploadBatch) {
-        let Some(&e) = self.entries.get(&key) else {
-            return;
-        };
-        if e.group.is_none() && e.brick.is_none() {
-            return;
-        }
-        if e.layout == mask && !self.in_waiting_chunk(key) {
-            return;
-        }
-        self.release(key, e, batch);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.group = None;
-        }
-        self.set_brick(key, None);
+    /// The record to keep for `key` when its parent's group is written
+    /// again and its content's mask is now `mask`: its current one, when it
+    /// points at a group or brick block laid out for another mask, or lies
+    /// in a replaced chunk that waits. Such a node's content changed under a
+    /// change not applied yet; until that change rewrites its path, it keeps
+    /// describing the old content (decision 0012), and its record keeps the
+    /// mask its group or block was laid out for. Rewriting it would make the
+    /// GPU read children by rank in the wrong mask; dropping what it holds
+    /// instead would throw away whole subtrees for stage 1 to rebuild.
+    fn kept_record(&self, key: NodeKey, mask: u64) -> Option<GpuNode> {
+        let e = self.entries.get(&key)?;
+        let linked = e.group.is_some() || e.brick.is_some();
+        (linked && (e.layout != mask || self.in_waiting_chunk(key))).then_some(e.record)
     }
 
     /// Forgets everything below and including `key` without writing records:
@@ -721,8 +713,10 @@ impl Residency {
         for (k, (slot, child)) in view.children().enumerate() {
             let ck = key.child(slot);
             let index = group.first + k as u32;
-            self.unlink_stale(ck, child.mask(), batch);
-            let Some(record) = self.child_record(ck, child) else {
+            let Some(record) = self
+                .kept_record(ck, child.mask())
+                .or_else(|| self.child_record(ck, child))
+            else {
                 continue;
             };
             if content(&child) == Content::Branch {
@@ -766,8 +760,10 @@ impl Residency {
                 self.drop_subtree(ck, batch);
             }
             let index = group.first + (mask & ((1u64 << slot) - 1)).count_ones();
-            self.unlink_stale(ck, child.mask(), batch);
-            if let Some(record) = self.child_record(ck, child) {
+            let record = self
+                .kept_record(ck, child.mask())
+                .or_else(|| self.child_record(ck, child));
+            if let Some(record) = record {
                 if branch {
                     self.put_entry(ck, index, record);
                 }
@@ -1338,10 +1334,23 @@ impl Residency {
                 stats.expanded, stats.bricks
             ));
         }
+        // Records on the path of a change not applied yet, and everything in
+        // a waiting chunk, describe the content before it: only their
+        // structure is checked.
+        let mut pending_paths: HashSet<NodeKey> = HashSet::default();
+        for change in &self.pending {
+            let k = change.key();
+            for level in k.level()..=self.shape.root_level() {
+                pending_paths.insert(k.ancestor(level));
+            }
+        }
+        let affected =
+            |res: &Self, key: NodeKey| pending_paths.contains(&key) || res.in_waiting_chunk(key);
         let mut keys = self.keys();
         keys.sort_unstable();
         for key in keys {
             let e = self.entries[&key];
+            let stale = affected(self, key);
             let pool = nodes.get(e.index as usize).copied();
             if pool != Some(e.record) {
                 return Err(format!(
@@ -1355,7 +1364,7 @@ impl Residency {
             } else {
                 self.child_record(key, view)
             };
-            if expected != Some(e.record) {
+            if !stale && expected != Some(e.record) {
                 return Err(format!(
                     "{key:?}: record {:?} but the source gives {expected:?}",
                     e.record
@@ -1385,8 +1394,27 @@ impl Residency {
                     e.kids, e.bricks
                 ));
             }
+            // Every child entry sits in the group at its rank in the layout.
             if let Some(g) = e.group {
+                let mut todo = e.kids;
+                while todo != 0 {
+                    let slot = todo.trailing_zeros();
+                    todo &= todo - 1;
+                    let at = g.first + (e.layout & ((1u64 << slot) - 1)).count_ones();
+                    let c = self.entries[&key.child(slot)];
+                    if e.layout & (1u64 << slot) == 0 || c.index != at {
+                        return Err(format!(
+                            "{key:?} child {slot}: at {} outside layout {:#x} from {}",
+                            c.index, e.layout, g.first
+                        ));
+                    }
+                }
+            }
+            if let Some(g) = e.group.filter(|_| !stale) {
                 for (k, (slot, child)) in view.children().enumerate() {
+                    if affected(self, key.child(slot)) {
+                        continue;
+                    }
                     let want = self.child_record(key.child(slot), child);
                     let have = nodes.get((g.first + k as u32) as usize).copied();
                     if want != have {
@@ -1396,7 +1424,7 @@ impl Residency {
                     }
                 }
             }
-            if let Some(b) = e.brick {
+            if let Some(b) = e.brick.filter(|_| !stale) {
                 let mut want = Vec::new();
                 encode_brick(
                     view,
