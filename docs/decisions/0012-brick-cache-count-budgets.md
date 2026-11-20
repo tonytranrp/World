@@ -165,7 +165,15 @@ and tests stay deterministic.
   while chunks arrived at 2 to 3 a frame, about 1,500 to 2,500 summaries
   a frame, and pending reached 2,400 to 4,000 by frame 4,000. At 8192 on
   8 threads it stays at 0 to 6 through 6,000 frames, and the frame mean
-  went down (17.3 to 15.3 ms), since the same work takes less wall time.
+  went down (17.3 to 15.3-15.5 ms on the long walks, about 1 ms lower in
+  1,500-frame walks at 4 and 8 m/s), since the same work takes less wall
+  time; p95 and p99 rose by up to 1 to 2 ms. The threads compete with the
+  residency's generation workers while the world fills: holes in the
+  first 15 s run 5 to 30% higher (185 to 190 and 42 to 49 in the first
+  two 5-second intervals at 8 m/s, against 157 to 175 and 30 to 39) and
+  the full-detail sphere settles about 2 s later, then holes stay at 0.
+  Warming on half the threads cost more frame time (p95 and p99 2 to 5 ms
+  higher) without fewer holes.
 - `run_frame` now averages 11 to 13 ms while walking: about 6 ms of stage 1
   visits (cache-missing table lookups), 4 ms of changes, 1.5 ms of
   expansions. Fewer visits trade refinement latency for time, as in 0010;
