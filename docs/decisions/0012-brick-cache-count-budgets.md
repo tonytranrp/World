@@ -47,14 +47,26 @@ and tests stay deterministic.
   summarizes it afresh; stage 1 refines it again.
 - **Changes are queued and applied nearest first under
   `max_summaries_per_frame`** (2048 node summaries, each over up to 64
-  children). A replaced chunk is summarized a grandchild at a time, across
+  children). A changed brick is charged the cached summaries on its path
+  it forgets (at least one), since the path is summarized again when it is
+  rewritten. A replaced chunk is summarized a grandchild at a time, across
   frames if needed, and applied once that is done; a chunk replaced again
-  meanwhile starts over. Until a change is applied, the records above it
-  describe the old content: a swapped chunk shows its old detail a little
-  longer, a far edit appears a few frames late (near ones come first).
-  Nothing in a waiting chunk is expanded or loaded, and a waiting chunk
-  with no cached summary gets a cheap deterministic stand-in, so work on
-  shared ancestors never walks it.
+  meanwhile starts over, and an edit inside it only marks its path edited,
+  since applying the chunk rebuilds everything below it. Until a change is
+  applied, the records above it describe the old content: a swapped chunk
+  shows its old detail a little longer, a far edit appears a few frames
+  late (near ones come first). Nothing in a waiting chunk is expanded or
+  loaded, and a waiting chunk with no cached summary gets a cheap
+  deterministic stand-in, so work on shared ancestors never walks it.
+- **A record only points at a group or brick block laid out for its
+  mask.** The GPU finds children and leaves by their rank in the record's
+  mask, and a change elsewhere can rewrite the record of a node whose own
+  change has not been applied (a waiting chunk, or a node above a deferred
+  edit). Each entry keeps the mask its group or block was laid out for;
+  before its record is written again, what it holds below is dropped if
+  that mask differs or the node lies in a waiting chunk, and stage 1
+  refines it again. Releasing a subtree walks the entries below, not the
+  record's mask.
 - **Summaries below the chunk level are kept per chunk**, so a replaced
   chunk forgets its own at once, and air and uniform children are answered
   without a cache lookup.
@@ -124,3 +136,12 @@ and tests stay deterministic.
   expansions. Fewer visits trade refinement latency for time, as in 0010;
   a CPU mirror of the pool walked by index remains the option for the
   per-visit cost.
+- Reserving the residency table costs its full size at startup: 2^21
+  buckets of 113 bytes (a 16-byte key, a 96-byte entry, a control byte),
+  about 237 MB, on the floor tier and 2^22, about 474 MB, on the PC tier.
+  macOS only maps pages as they are touched, but Windows counts the whole
+  allocation as committed memory. 2^21 is the smallest power of two that
+  held the floor walks (up to 1.45 million entries; 2^20 buckets hold
+  917,000), so the floor reserve is what the table grew to anyway; the PC
+  reserve follows its larger node pool and is untested by a walk. A
+  smaller entry would shrink both.
