@@ -216,3 +216,39 @@ mostly table lookups in stage 1; a CPU mirror of the node pool walked by
 index (decision 0010) is the next step there. With the pool near 90%,
 pressure shrink will act on long walks; it is bounded but not yet measured
 in one.
+
+## Long walks under node pool pressure
+
+6000-frame walks at 8 m/s showed two things the 1500-frame walks did not.
+One frame of about 300 ms (296 and 310 ms, frames 3145 and 3201) right
+after node pool pressure first acted: the residency table resized all at
+once, 1.38 to 3.67 million slots in one insert (282 ms), because the
+pressure collapses had left about 450,000 deleted markers. And the change
+queue never caught up: 800 pending at frame 1000, 2,600 to 4,000 by frame
+5000, because replaced chunks arrived faster (2 to 3 a frame) than 2048
+summaries a frame could absorb.
+
+The table is now many small maps of at most 4,160 entries, each dropped
+when empty, and reserves nothing up front (the 237 MiB floor reservation
+is gone). Collapsed and replaced subtrees are detached and freed at most
+`max_frees_per_frame` (16,384) records a frame, oldest first. Replaced
+chunks are summarized on the brick cache's own task pool (up to 8 threads,
+`summary_threads`; Bevy's compute pool made frames wait on Bevy's own
+tasks, 2 to 3 ms worse mean) under 8192 summaries a frame, with results
+identical for any thread count. A review found a replaced chunk never
+refining again under a still camera once its old subtree was freed, and
+wrong summaries for trees whose chunk level is 3; both are fixed with
+tests, and a stress test keeps burials alive across random operations.
+
+| 6000 frames, 8 m/s | mean / p95 / p99 / max | pending at frames 1000 to 5000 |
+|---|---|---|
+| Before | 17.3 to 17.4 / 25.2 to 25.5 / 28.4 to 29.8 / 296 to 310 ms | 791 to 3956, growing |
+| After | 15.1 / 23.2 / 27.2 / 37.5 ms | 0 |
+
+1500-frame walks against the previous merge: mean 1.6 to 1.9 ms lower at 4
+and 8 m/s, p95 and max equal, p99 within 2.5 ms. The cost is start-up: the
+summary threads compete with the generation workers while the world fills,
+so early holes are about 20% higher (182 to 185 and 28 to 44 in the first
+two 5-second intervals, against 152 to 175 and 21 to 38) and the
+full-detail sphere settles about 2 s later at 8 m/s (14.8 against 12.8 s).
+Fewer summary tasks did not help holes and made frames worse.
