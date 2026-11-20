@@ -42,7 +42,7 @@ pub fn init_trace_pipeline(
         shader: assets.load(TRACE_SHADER_PATH),
         shader_defs: Vec::new(),
         entry_point: Some("trace".into()),
-        zero_initialize_workgroup_memory: true,
+        zero_initialize_workgroup_memory: trace::ZERO_INIT_WORKGROUP_MEMORY,
         constants: Vec::new(),
     });
     commands.insert_resource(TracePipeline { layout, id });

@@ -238,6 +238,7 @@ fn compute(
     source: &str,
     layout: &BindGroupLayout,
     entry: &str,
+    zero_init_workgroup_memory: bool,
 ) -> ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -253,7 +254,10 @@ fn compute(
         layout: Some(&pipeline_layout),
         module: &module,
         entry_point: Some(entry),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: zero_init_workgroup_memory,
+            ..Default::default()
+        },
         cache: None,
     })
 }
@@ -273,12 +277,19 @@ impl Pipelines {
         let apply_src = compile_wesl("shaders/brick_cache/apply.wesl");
         let evict_src = compile_wesl("shaders/brick_cache/evict.wesl");
         Self {
-            trace: compute(device, "trace", &trace_src, &trace_layout, "trace"),
+            trace: compute(
+                device,
+                "trace",
+                &trace_src,
+                &trace_layout,
+                "trace",
+                trace::ZERO_INIT_WORKGROUP_MEMORY,
+            ),
             apply: upload::APPLY_ENTRY_POINTS
                 .iter()
-                .map(|e| compute(device, e, &apply_src, &apply_layout, e))
+                .map(|e| compute(device, e, &apply_src, &apply_layout, e, true))
                 .collect(),
-            evict: compute(device, "evict", &evict_src, &evict_layout, "evict"),
+            evict: compute(device, "evict", &evict_src, &evict_layout, "evict", true),
             trace_layout,
             apply_layout,
             evict_layout,
