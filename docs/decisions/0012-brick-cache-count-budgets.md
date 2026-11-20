@@ -159,8 +159,9 @@ and tests stay deterministic.
   likely because faster frames take more CPU time from the generation
   workers.
 - **A replaced chunk's grandchildren are summarized in up to 8 tasks**
-  on Bevy's compute task pool (`summary_threads`, 0 for one per pool
-  thread; no threads are spawned, and a panic in a task is raised again),
+  on the brick cache's own task pool (`summary_threads`, 0 for one per
+  pool thread; threads are made once, and a panic in a task is raised
+  again),
   only for level-4 chunks, whose grandchildren are level-2 nodes,
   as many as the budget allows, counted exactly before any is computed
   (one summary for each grandchild and one for each of its mixed
@@ -179,7 +180,13 @@ and tests stay deterministic.
   two 5-second intervals at 8 m/s, against 157 to 175 and 30 to 39) and
   the full-detail sphere settles about 2 s later, then holes stay at 0.
   Warming on half the threads cost more frame time (p95 and p99 2 to 5 ms
-  higher) without fewer holes.
+  higher) without fewer holes, both with threads spawned per call and
+  with 4 tasks on the persistent pool (mean +1, p95 +2 ms, holes 184 and
+  31 to 38 against 183 to 185 and 34 to 41). Running the tasks on Bevy's
+  compute task pool did lower the early holes (second interval 20 to 24
+  against 20 to 25 for mac-floor-perf) but made frames wait on Bevy's own
+  tasks (p95 5 to 7 ms higher), so the brick cache keeps its own pool of
+  up to 8 threads, made once.
 - `run_frame` now averages 11 to 13 ms while walking: about 6 ms of stage 1
   visits (cache-missing table lookups), 4 ms of changes, 1.5 ms of
   expansions. Fewer visits trade refinement latency for time, as in 0010;
