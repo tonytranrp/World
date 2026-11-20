@@ -537,6 +537,58 @@ fn a_split_growth_pass_finds_the_most_important_work_first() {
     assert_eq!((expand, load), (want_expand, want_load));
 }
 
+/// A growth pass whose camera moved on starts over: its next frame finds
+/// exactly what a fresh pass from the new view finds.
+#[test]
+fn a_moving_camera_restarts_the_growth_pass() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, _pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let mut batch = UploadBatch::default();
+    for frame in 1..=8 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 256 << 10,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+    }
+    let lod = config.lod;
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, 5);
+    assert!(growth.is_active());
+
+    let moved = ViewPoint {
+        eye: [0.0, 0.0, 2.0 * lod.regrow_voxels],
+        ..view
+    };
+    let resumed = select_budgeted(&res, &mut walk, &mut growth, &moved, &lod, 1.0, 5);
+    let fresh = select_budgeted(
+        &res,
+        &mut Vec::new(),
+        &mut GrowthState::default(),
+        &moved,
+        &lod,
+        1.0,
+        5,
+    );
+    assert_eq!((resumed.expand, resumed.load), (fresh.expand, fresh.load));
+}
+
 /// Candidates a tiny upload budget turns away are carried from frame to
 /// frame: the cache reaches the same state as with a roomy budget, and with
 /// the camera still, no frame after that finds anything left to do.

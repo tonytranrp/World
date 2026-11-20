@@ -30,7 +30,10 @@
 //! angle changed, or the table changed since (see [`GrowthState`]). A still
 //! camera over a settled cache walks nothing.
 //! Nodes expanded while a pass runs rejoin it, so their children are judged
-//! by the same pass.
+//! by the same pass. A growth pass whose camera moved more than
+//! `regrow_voxels` starts over from the root, so a moving camera always
+//! works on its current view, nearest and coarsest first. Every node taken
+//! off a queue counts against the budget, whether or not it still exists.
 //!
 //! A growth pass or a shrink pass run to completion under one view gives
 //! exactly [`select`]'s answer.
@@ -333,7 +336,11 @@ pub fn select_budgeted(
         }
     };
     let root = shape.root();
-    if !growth.active && growth.due(view, lod.regrow_voxels) {
+    // A pass whose camera moved on restarts: its queue was ordered for a
+    // view that is gone. Table changes wait for the pass to finish (nodes
+    // expanded meanwhile rejoin it).
+    let moved = growth.active && pass_due(growth.last, false, view, lod.regrow_voxels);
+    if moved || (!growth.active && growth.due(view, lod.regrow_voxels)) {
         growth.ran(*view);
         let d2 = distance2(origin, root, eye);
         if wanted(root, d2) {
@@ -349,6 +356,9 @@ pub fn select_budgeted(
             growth.active = false;
             break;
         };
+        // Every pop counts, so a queue gone stale still costs a bounded
+        // amount per frame.
+        visits += 1;
         // The eye may have moved since the node was queued.
         if !wanted(key, distance2(origin, key, eye)) {
             continue;
@@ -356,7 +366,6 @@ pub fn select_budgeted(
         let Some(node) = res.node_state(key) else {
             continue;
         };
-        visits += 1;
         if key.level >= 2 {
             if node.expanded {
                 // Per-axis squared distances to the four child slabs.
@@ -438,10 +447,10 @@ pub fn select_budgeted(
         let Some(key) = walk.pop() else {
             break;
         };
+        visits += 1;
         let Some(node) = res.node_state(key) else {
             continue;
         };
-        visits += 1;
         let px = projected_pixels(shape.origin, key, view);
         let scale = if key.level >= 2 { pressure } else { 1.0 };
         let keep = px >= lod.detail_pixels * scale * lod.hysteresis;
