@@ -884,3 +884,60 @@ fn an_edit_inside_a_waiting_chunk_waits_for_the_chunk() {
     }
     verify(&mut res, &snap, &pools);
 }
+
+/// Changed bricks count against the summary budget too: many edits on a
+/// budget of one apply about one a frame, nearest first, and converge.
+#[test]
+fn many_edits_spread_over_frames_on_a_small_budget() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let edits: Vec<world_core::Edit> = (0..12)
+        .map(|i| world_core::Edit::new(VoxelPos::new(-60 + 10 * i, -5, 3), MaterialId(2)))
+        .collect();
+    let dirty = tree.apply(&edits).unwrap();
+    assert!(dirty.len() >= 8, "{} bricks", dirty.len());
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    // At the far end of the row: the nearest brick goes first.
+    let view = ViewPoint {
+        eye: [60.0, -5.0, 3.0],
+        pixel_angle: 1e-6,
+    };
+    let nearest = shape
+        .brick_key(world_core::BrickPos::containing(VoxelPos::new(50, -5, 3)))
+        .unwrap();
+    let edited_material =
+        |res: &Residency| res.record(nearest).map(|r| r.edited()).unwrap_or_default();
+    let mut frame = 10;
+    loop {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: if frame == 10 { dirty.as_slice() } else { &[] },
+                chunks: &[],
+                view: Some(view),
+                config: &config,
+            },
+        );
+        if frame == 10 {
+            assert_eq!(r.changes_applied, 1, "{r:?}");
+            assert!(edited_material(&res), "the nearest brick went first");
+        }
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < 100, "never drained");
+    }
+    assert!(frame - 10 >= dirty.len() as u32, "one a frame");
+    verify(&mut res, &snap, &pools);
+}

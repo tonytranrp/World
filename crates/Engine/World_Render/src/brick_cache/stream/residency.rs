@@ -1074,11 +1074,16 @@ impl Residency {
     }
 
     /// Applies queued changes, nearest to `eye` first (in key order without
-    /// one), until they have computed `max_summaries` node summaries. A
-    /// replaced chunk is summarized first, a grandchild at a time and across
-    /// calls if the budget runs out (at least one grandchild per call), and
-    /// applied once that is done. The rest wait for the next call, and until
-    /// then the records above them describe the content they had before.
+    /// one), until they have computed `max_summaries` node summaries; a
+    /// changed brick is charged the cached summaries on its path that it
+    /// forgets (at least one), since rewriting the path computes them again
+    /// after the others are chosen. A replaced chunk is summarized first, a
+    /// grandchild at a time and across calls if the budget runs out (at
+    /// least one grandchild per call), and applied once that is done; an
+    /// edit inside it meanwhile only marks its path edited, since applying
+    /// the chunk rebuilds everything below it. At least one change makes
+    /// progress per call. The rest wait for the next call, and until then
+    /// the records above them describe the content they had before.
     ///
     /// A changed brick: `reupload` decides, in that order, which resident
     /// changed bricks are uploaded again (it gets the block bytes the brick
@@ -1114,8 +1119,12 @@ impl Residency {
         let mut applied = 0usize;
         let mut worked = false;
         let mut rest = Vec::new();
+        // Summaries a changed brick's path will need again: they are
+        // computed after the loop, when the paths are rewritten, so they are
+        // charged here.
+        let mut charged = 0u64;
         for change in order {
-            let spent = self.summarized - start;
+            let spent = self.summarized - start + charged;
             if worked && spent >= max_summaries {
                 rest.push(change);
                 continue;
@@ -1130,7 +1139,7 @@ impl Residency {
                     continue;
                 }
                 Change::Brick(k) => {
-                    self.apply_brick(source, k, &mut reupload, batch);
+                    charged += self.apply_brick(source, k, &mut reupload, batch).max(1);
                     true
                 }
                 Change::Chunk(c) => {
