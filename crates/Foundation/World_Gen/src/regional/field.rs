@@ -49,7 +49,7 @@ impl ColumnRect {
 }
 
 /// What the surface rules need to know about one column.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ColumnInputs {
     /// Terrain height in voxels: voxels below `floor(height)` are solid.
     pub height: f32,
@@ -232,6 +232,123 @@ pub fn column_inputs(macros: &MacroGrid, detail: &DetailGrid, x: i32, z: i32) ->
     }
 }
 
+/// The inputs of a row of columns `x0..x0 + n` at a time, from grids that
+/// cover them, each equal to [`column_inputs`] bit for bit.
+///
+/// A bilinear interpolation lerps along `x` on the cell's low and high `z`
+/// edges, then along `z` between the two. The `x` lerps depend only on the
+/// column's `x` and the row of cells, so they are computed once per row of
+/// cells (every 4 rows of columns for the detail lattice, every 64 for the
+/// macro lattice) and each row of columns pays one lerp per value. Every
+/// value goes through the same operations in the same order as
+/// [`column_inputs`].
+pub struct RowInputs<'a> {
+    macros: &'a MacroGrid,
+    detail: &'a DetailGrid,
+    x0: i32,
+    /// The detail cell row the detail edges below belong to.
+    detail_row: Option<i32>,
+    /// Per column: height and slope lerped along `x` on the low and high
+    /// edge of its detail cell.
+    height_edges: Vec<[f32; 2]>,
+    slope_edges: Vec<[f32; 2]>,
+    /// The macro cell row the macro edges below belong to.
+    macro_row: Option<i32>,
+    moisture_edges: Vec<[f32; 2]>,
+    soil_edges: Vec<[f32; 2]>,
+}
+
+impl<'a> RowInputs<'a> {
+    /// Rows of the `n` columns from `x0`; the grids must cover every row
+    /// asked for.
+    pub fn new(macros: &'a MacroGrid, detail: &'a DetailGrid, x0: i32, n: u32) -> Self {
+        let n = n as usize;
+        Self {
+            macros,
+            detail,
+            x0,
+            detail_row: None,
+            height_edges: vec![[0.0; 2]; n],
+            slope_edges: vec![[0.0; 2]; n],
+            macro_row: None,
+            moisture_edges: vec![[0.0; 2]; n],
+            soil_edges: vec![[0.0; 2]; n],
+        }
+    }
+
+    /// The inputs of the row of columns at `z`, into `out` (one per column).
+    pub fn row(&mut self, z: i32, out: &mut [ColumnInputs]) {
+        let k = z.div_euclid(DETAIL_SPACING);
+        if self.detail_row != Some(k) {
+            self.detail_edges(k);
+        }
+        let m = z.div_euclid(MACRO_SPACING);
+        if self.macro_row != Some(m) {
+            self.macro_edges(m);
+        }
+        let dz = z.rem_euclid(DETAIL_SPACING) as f32 * (1.0 / DETAIL_SPACING as f32);
+        let mz = z.rem_euclid(MACRO_SPACING) as f32 * (1.0 / MACRO_SPACING as f32);
+        let along_z = |[low, high]: [f32; 2], fz: f32| low + (high - low) * fz;
+        let edges = self
+            .height_edges
+            .iter()
+            .zip(&self.slope_edges)
+            .zip(self.moisture_edges.iter().zip(&self.soil_edges));
+        for (out, ((&h, &s), (&w, &d))) in out.iter_mut().zip(edges) {
+            *out = ColumnInputs {
+                height: along_z(h, dz),
+                slope: along_z(s, dz),
+                moisture: along_z(w, mz),
+                soil_depth: along_z(d, mz),
+            };
+        }
+    }
+
+    /// The `x` lerps of every column in detail cell row `k`.
+    fn detail_edges(&mut self, k: i32) {
+        let detail = self.detail;
+        let n = detail.ni;
+        let (h, s) = (&detail.heights, &detail.slopes);
+        let row = (k - detail.k0) as usize * n;
+        let x = (self.x0..).zip(self.height_edges.iter_mut().zip(&mut self.slope_edges));
+        for (x, (height, slope)) in x {
+            let i = x.div_euclid(DETAIL_SPACING);
+            let fx = x.rem_euclid(DETAIL_SPACING) as f32 * (1.0 / DETAIL_SPACING as f32);
+            let at = row + (i - detail.i0) as usize;
+            *height = [
+                h[at] + (h[at + 1] - h[at]) * fx,
+                h[at + n] + (h[at + n + 1] - h[at + n]) * fx,
+            ];
+            *slope = [
+                s[at] + (s[at + 1] - s[at]) * fx,
+                s[at + n] + (s[at + n + 1] - s[at + n]) * fx,
+            ];
+        }
+        self.detail_row = Some(k);
+    }
+
+    /// The `x` lerps of every column in macro cell row `m`.
+    fn macro_edges(&mut self, m: i32) {
+        let macros = self.macros;
+        let x = (self.x0..).zip(self.moisture_edges.iter_mut().zip(&mut self.soil_edges));
+        for (x, (moisture, soil)) in x {
+            let j = x.div_euclid(MACRO_SPACING);
+            let fx = x.rem_euclid(MACRO_SPACING) as f32 * (1.0 / MACRO_SPACING as f32);
+            let (a, b) = (macros.at(j, m), macros.at(j + 1, m));
+            let (c, d) = (macros.at(j, m + 1), macros.at(j + 1, m + 1));
+            *moisture = [
+                a.moisture + (b.moisture - a.moisture) * fx,
+                c.moisture + (d.moisture - c.moisture) * fx,
+            ];
+            *soil = [
+                a.soil_depth + (b.soil_depth - a.soil_depth) * fx,
+                c.soil_depth + (d.soil_depth - c.soil_depth) * fx,
+            ];
+        }
+        self.macro_row = Some(m);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +384,37 @@ mod tests {
             assert_eq!(a.slope.to_bits(), b.slope.to_bits());
             assert_eq!(a.moisture.to_bits(), b.moisture.to_bits());
             assert_eq!(a.soil_depth.to_bits(), b.soil_depth.to_bits());
+        }
+    }
+
+    #[test]
+    fn rows_equal_column_inputs_bit_for_bit() {
+        let (c, r) = fields();
+        // Unaligned, crossing macro and detail cells, negative coordinates.
+        let rect = ColumnRect {
+            x0: -131,
+            z0: -70,
+            nx: 203,
+            nz: 150,
+        };
+        let macros = MacroGrid::covering(&c, &rect);
+        let detail = DetailGrid::covering(&r, &macros, &rect);
+        let mut rows = RowInputs::new(&macros, &detail, rect.x0, rect.nx);
+        let zero = ColumnInputs {
+            height: 0.0,
+            slope: 0.0,
+            moisture: 0.0,
+            soil_depth: 0.0,
+        };
+        let mut out = vec![zero; rect.nx as usize];
+        let bits =
+            |i: &ColumnInputs| [i.height, i.slope, i.moisture, i.soil_depth].map(f32::to_bits);
+        for z in rect.z0..rect.z0 + rect.nz as i32 {
+            rows.row(z, &mut out);
+            for (x, got) in (rect.x0..).zip(&out) {
+                let want = column_inputs(&macros, &detail, x, z);
+                assert_eq!(bits(got), bits(&want), "({x}, {z})");
+            }
         }
     }
 

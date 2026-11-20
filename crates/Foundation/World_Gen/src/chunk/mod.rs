@@ -21,7 +21,7 @@ pub use source::ChunkSource;
 
 use crate::GeneratorId;
 use crate::continental::Continental;
-use crate::regional::field::column_inputs;
+use crate::regional::field::{ColumnInputs, RowInputs, column_inputs};
 use crate::regional::{ColumnRect, DetailGrid, MacroGrid, Regional};
 use crate::surface::{Column, Surface};
 
@@ -68,11 +68,13 @@ impl Stages {
         let n = CHUNK_SIZE as i32;
         let mut columns = Vec::with_capacity((CHUNK_SIZE * CHUNK_SIZE) as usize);
         let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        // A row of columns at a time: equal to `column_inputs` per column.
+        let mut rows = RowInputs::new(&macros, &detail, rect.x0, CHUNK_SIZE);
+        let mut inputs = vec![ColumnInputs::default(); CHUNK_SIZE as usize];
         for z in rect.z0..rect.z0 + n {
-            for x in rect.x0..rect.x0 + n {
-                let column = self
-                    .surface
-                    .column(x, z, &column_inputs(&macros, &detail, x, z));
+            rows.row(z, &mut inputs);
+            for (x, inputs) in (rect.x0..).zip(&inputs) {
+                let column = self.surface.column(x, z, inputs);
                 lo = lo.min(column.height);
                 hi = hi.max(column.height);
                 columns.push(column);
