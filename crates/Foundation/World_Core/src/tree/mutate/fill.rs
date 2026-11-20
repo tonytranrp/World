@@ -34,6 +34,11 @@ impl LocalBox {
         }))
     }
 
+    /// The lowest and highest voxel of the box.
+    pub fn corners(&self) -> ([u32; 3], [u32; 3]) {
+        (self.lo, self.hi.map(|v| v - 1))
+    }
+
     /// The lowest voxel of the box at or above `origin` on every axis: a
     /// voxel of the box inside a cube at `origin` that the box overlaps.
     pub fn lowest_in(&self, origin: [u32; 3]) -> [u32; 3] {

@@ -198,6 +198,13 @@ impl Forest {
         &self.keys
     }
 
+    /// The live chunk at chunk key `key`, when the index knows it.
+    #[inline]
+    pub fn indexed_chunk(&self, key: u32) -> Option<u32> {
+        let id = self.keys.get(key)?;
+        matches!(self.chunks.get(id as usize), Some(Some(_))).then_some(id)
+    }
+
     /// A live chunk. Panics on a free id, which no stored word holds.
     #[inline(always)]
     pub fn chunk(&self, id: u32) -> &Chunk {

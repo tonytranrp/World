@@ -55,6 +55,26 @@ pub(crate) fn set_voxels(
         }),
         "voxel edits must be in tree order, one per voxel"
     );
+    // Edits that all fall in one chunk the index knows go straight into it:
+    // the levels above keep their words unless the chunk collapses.
+    if let (Some(first), Some(last)) = (edits.first(), edits.last()) {
+        let key = chunk_key(first.local);
+        if key == chunk_key(last.local)
+            && let Some(id) = forest.indexed_chunk(key)
+        {
+            let mut writer = Writer::new(forest);
+            let result = writer.in_known_chunk(id, first.local, |w, local| {
+                w.set_voxels(local, CHUNK_LEVEL, edits, changed)
+            });
+            if let Some(filled) = result {
+                // Now air or one material: the chunk word above becomes it.
+                graft(forest, root, ROOT_LEVEL, CHUNK_LEVEL, first.local, |_| {
+                    filled
+                });
+            }
+            return false;
+        }
+    }
     let mut writer = Writer::new(forest);
     let new = writer.set_voxels(*root, ROOT_LEVEL, edits, changed);
     let refused = writer.refused;
@@ -71,6 +91,26 @@ pub(crate) fn fill_box(
     region: &LocalBox,
     material: MaterialId,
 ) -> bool {
+    // A box inside one chunk the index knows is filled inside that chunk.
+    let (lo, hi) = region.corners();
+    let key = chunk_key(lo);
+    if key == chunk_key(hi)
+        && let Some(id) = forest.indexed_chunk(key)
+    {
+        let mask = !((1u32 << (2 * (CHUNK_LEVEL + 1))) - 1);
+        let origin = lo.map(|v| v & mask);
+        let mut changed = false;
+        let mut writer = Writer::new(forest);
+        let result = writer.in_known_chunk(id, lo, |w, local| {
+            let new = w.fill(local, CHUNK_LEVEL, origin, region, material);
+            changed = new.is_some();
+            new
+        });
+        if let Some(filled) = result {
+            graft(forest, root, ROOT_LEVEL, CHUNK_LEVEL, lo, |_| filled);
+        }
+        return changed;
+    }
     let new = Writer::new(forest).fill(*root, ROOT_LEVEL, [0; 3], region, material);
     new.map(|child| *root = child).is_some()
 }
@@ -187,6 +227,48 @@ impl Writer<'_> {
                 }
                 self.forest.free_chunk(id);
                 Some(other)
+            }
+        }
+    }
+
+    /// Runs `write` inside chunk `id`, which the index places at world-local
+    /// `at`, as [`in_chunk`](Self::in_chunk) does for a chunk-level child that
+    /// is a chunk. Returns the content when the chunk is no longer mixed (air
+    /// or one material) and leaves the chunk for the caller to replace, since
+    /// the word above it still names it; `None` otherwise.
+    fn in_known_chunk(
+        &mut self,
+        id: u32,
+        at: [u32; 3],
+        write: impl FnOnce(&mut Self, Child) -> Option<Child>,
+    ) -> Option<Child> {
+        let local = Child::Node(self.forest.chunk(id).root);
+        self.chunk = Some(id);
+        let result = write(self, local);
+        self.chunk = None;
+        let held = self.held.take();
+        match result {
+            None => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                None
+            }
+            Some(Child::Node(root)) => {
+                let mut chunk = held.unwrap_or_else(|| self.forest.check_out(id));
+                let generation = self.forest.next_generation();
+                let c = Arc::get_mut(&mut chunk).expect("a checked-out chunk is unique");
+                c.root = root;
+                c.generation = generation;
+                self.forest.check_in(id, chunk);
+                self.forest.link(id, chunk_key(at));
+                None
+            }
+            Some(filled) => {
+                if let Some(chunk) = held {
+                    self.forest.check_in(id, chunk);
+                }
+                Some(filled)
             }
         }
     }

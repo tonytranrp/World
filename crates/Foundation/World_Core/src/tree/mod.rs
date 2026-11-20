@@ -134,7 +134,11 @@ impl VoxelTree {
         let Some(region) = LocalBox::of(region)? else {
             return Ok(false);
         };
-        if let Some(local) = self.view().unloaded_in(&region) {
+        // A box inside a chunk the index knows is resident.
+        let (lo, hi) = region.corners();
+        let in_known_chunk = forest::chunk_key(lo) == forest::chunk_key(hi)
+            && self.forest.indexed_chunk(forest::chunk_key(lo)).is_some();
+        if !in_known_chunk && let Some(local) = self.view().unloaded_in(&region) {
             let pos = path::from_world_local(local);
             return Err(EditError::NotResident { pos });
         }

@@ -290,6 +290,30 @@ fn reads_through_the_chunk_index_stay_exact_as_chunks_move_and_go() {
     probe(&after, "unloaded");
     assert_eq!(after.lookup(VoxelPos::new(-C + 1, 2, 3)), None);
 
+    // A single voxel write that collapses an indexed chunk to one material,
+    // then one that splits it again.
+    let corner = VoxelPos::new(0, 0, -C);
+    tree.fill_box(
+        world_core::VoxelBox::from_min_size(corner, [1024; 3]),
+        MaterialId(4),
+    )
+    .unwrap();
+    tree.set(VoxelPos::new(3, 3, -C + 3), MaterialId(5))
+        .unwrap();
+    probe(&tree.snapshot(), "one odd voxel");
+    tree.set(VoxelPos::new(3, 3, -C + 3), MaterialId(4))
+        .unwrap();
+    let collapsed = tree.snapshot();
+    probe(&collapsed, "collapsed by a write");
+    assert!(matches!(
+        world_core::tree::TreeRead::root(&collapsed),
+        world_core::tree::NodeRef::Branch(_)
+    ));
+    tree.set(VoxelPos::new(700, 9, -C + 1), MaterialId::AIR)
+        .unwrap();
+    probe(&tree.snapshot(), "split again");
+    check_canonical(&tree).unwrap();
+
     // The snapshot taken first still reads what it saw.
     probe(&before, "old snapshot");
     assert_eq!(before.get(VoxelPos::new(5, 5, 5)), MaterialId::AIR);
