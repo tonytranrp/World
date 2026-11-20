@@ -26,6 +26,9 @@ pub enum EditError {
     /// A whole-node operation was given a position that is not the lowest
     /// voxel of a node at `level`.
     Misaligned { pos: VoxelPos, level: u32 },
+    /// The voxel lies in a region whose content is not loaded (decision
+    /// 0006); the edit has to wait until it is.
+    NotResident { pos: VoxelPos },
 }
 
 impl fmt::Display for EditError {
@@ -39,6 +42,11 @@ impl fmt::Display for EditError {
             Self::Misaligned { pos, level } => write!(
                 f,
                 "voxel ({}, {}, {}) is not the lowest corner of a level-{level} node",
+                pos.x, pos.y, pos.z
+            ),
+            Self::NotResident { pos } => write!(
+                f,
+                "voxel ({}, {}, {}) is in a region that is not loaded",
                 pos.x, pos.y, pos.z
             ),
         }

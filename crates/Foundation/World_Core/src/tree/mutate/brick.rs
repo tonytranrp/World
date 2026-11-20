@@ -20,9 +20,11 @@ impl Writer<'_> {
             Child::Air => return [Record::AIR; TREE_FANOUT as usize],
             Child::Uniform(m) => return [Record::filled(m); TREE_FANOUT as usize],
             Child::Node(index) => index,
+            // Only children at the chunk level and above can be unloaded.
+            Child::NotResident => unreachable!("level-1 children are always resident"),
         };
-        let node = self.store.node(index);
-        let block = self.store.block(node.base, node.block_len(1));
+        let node = self.store().node(index);
+        let block = self.store().block(node.base, node.block_len(1));
         let mut records = [Record::AIR; TREE_FANOUT as usize];
         for (slot, words) in slots(node.mask).zip(block.chunks_exact(RECORD_WORDS)) {
             records[slot as usize] = Record::read(words);
@@ -36,7 +38,7 @@ impl Writer<'_> {
             (_, Some(node)) if node.mask & bit(slot) == 0 => Record::AIR,
             (_, Some(node)) => {
                 let at = node.base + (RECORD_WORDS * rank(node.mask, slot)) as u32;
-                Record::read(self.store.block(at, RECORD_WORDS))
+                Record::read(self.store().block(at, RECORD_WORDS))
             }
             (Child::Uniform(m), None) => Record::filled(m),
             _ => Record::AIR,
@@ -53,7 +55,7 @@ impl Writer<'_> {
             return false;
         }
         let at = node.base + (RECORD_WORDS * rank(node.mask, slot)) as u32;
-        self.store.write_block(at, &new.words());
+        self.store_mut().write_block(at, &new.words());
         true
     }
 
@@ -80,16 +82,16 @@ impl Writer<'_> {
                     Some(base) => {
                         let old_len = self.palette_block(old, base).len();
                         if old_len == words.len() {
-                            if self.store.block(base, old_len) != words {
-                                self.store.write_block(base, words);
+                            if self.store().block(base, old_len) != words {
+                                self.store_mut().write_block(base, words);
                             }
                             base
                         } else {
-                            self.store.free_block(base, old_len);
-                            self.store.alloc_block(words)
+                            self.store_mut().free_block(base, old_len);
+                            self.store_mut().alloc_block(words)
                         }
                     }
-                    None => self.store.alloc_block(words),
+                    None => self.store_mut().alloc_block(words),
                 };
                 Record {
                     mask,
@@ -97,27 +99,27 @@ impl Writer<'_> {
                 }
             }
         };
-        self.store.count_leaf(old.is_leaf(), record.is_leaf());
+        self.store_mut().count_leaf(old.is_leaf(), record.is_leaf());
         record
     }
 
     /// Frees what a leaf owns, when its whole level-1 node goes.
     pub(super) fn free_leaf(&mut self, record: Record) {
         self.free_palette(record);
-        self.store.count_leaf(record.is_leaf(), false);
+        self.store_mut().count_leaf(record.is_leaf(), false);
     }
 
     fn free_palette(&mut self, record: Record) {
         if let Some(base) = record.palette_base() {
             let len = self.palette_block(record, base).len();
-            self.store.free_block(base, len);
+            self.store_mut().free_block(base, len);
         }
     }
 
     /// The palette block of `record`, stored at `base`.
     fn palette_block(&self, record: Record, base: u32) -> &[u32] {
-        let len = leaf::block_len(record.mask, self.store.word(base));
-        self.store.block(base, len)
+        let len = leaf::block_len(record.mask, self.store().word(base));
+        self.store().block(base, len)
     }
 }
 

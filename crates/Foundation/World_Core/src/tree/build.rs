@@ -43,6 +43,21 @@ pub(crate) fn child(
     if let Some(material) = source.uniform(path::from_world_local(origin), size) {
         return Child::filled(material);
     }
+    if builder.enters_chunk(level) {
+        builder.begin_chunk();
+        let root = mixed(builder, source, level, origin);
+        return builder.end_chunk(root);
+    }
+    mixed(builder, source, level, origin)
+}
+
+/// Builds the node at `level` and `origin` whose content is mixed or unknown.
+fn mixed(
+    builder: &mut Builder<'_>,
+    source: &impl RegionSource,
+    level: u32,
+    origin: [u32; 3],
+) -> Child {
     let span = path::child_span(level);
     let child_origin = |slot: u32| {
         let offset = path::slot_offset(slot);

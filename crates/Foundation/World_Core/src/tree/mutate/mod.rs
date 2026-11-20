@@ -30,7 +30,8 @@ pub(crate) use voxel::LocalEdit;
 
 use super::ROOT_LEVEL;
 use super::alloc::Store;
-use super::node::{Child, Node, Packed};
+use super::forest::Forest;
+use super::node::{CHUNK_LEVEL, Child, Node, Packed};
 use crate::consts::TREE_DEPTH;
 use crate::material::MaterialId;
 
@@ -38,7 +39,7 @@ use crate::material::MaterialId;
 /// edit per voxel. Calls `changed` with every edit that changed its voxel and
 /// the material the voxel held before.
 pub(crate) fn set_voxels(
-    store: &mut Store,
+    forest: &mut Forest,
     root: &mut Child,
     edits: &[LocalEdit],
     changed: &mut impl FnMut(LocalEdit, MaterialId),
@@ -50,7 +51,7 @@ pub(crate) fn set_voxels(
         }),
         "voxel edits must be in tree order, one per voxel"
     );
-    let new = Writer { store }.set_voxels(*root, ROOT_LEVEL, edits, changed);
+    let new = Writer::new(forest).set_voxels(*root, ROOT_LEVEL, edits, changed);
     if let Some(child) = new {
         *root = child;
     }
@@ -58,28 +59,106 @@ pub(crate) fn set_voxels(
 
 /// Sets every voxel of `region`. Returns whether anything changed.
 pub(crate) fn fill_box(
-    store: &mut Store,
+    forest: &mut Forest,
     root: &mut Child,
     region: &LocalBox,
     material: MaterialId,
 ) -> bool {
-    let new = Writer { store }.fill(*root, ROOT_LEVEL, [0; 3], region, material);
+    let new = Writer::new(forest).fill(*root, ROOT_LEVEL, [0; 3], region, material);
     new.map(|child| *root = child).is_some()
 }
 
-/// Rewrites children through the store. Every method takes a child and the
+/// Rewrites children through the forest. Every method takes a child and the
 /// level its node has (or would have, once split): 1 for a node whose
 /// children are leaf records.
+///
+/// Above [`CHUNK_LEVEL`] the writer works on the top store; a method that
+/// reaches a chunk-level child enters that child's chunk (see
+/// [`in_chunk`](Self::in_chunk)) and works on its store until it returns.
 struct Writer<'a> {
-    store: &'a mut Store,
+    forest: &'a mut Forest,
+    /// The chunk being written, or `None` above the chunk level.
+    chunk: Option<u32>,
+}
+
+impl<'a> Writer<'a> {
+    fn new(forest: &'a mut Forest) -> Self {
+        Self {
+            forest,
+            chunk: None,
+        }
+    }
 }
 
 impl Writer<'_> {
+    /// The store the writer is working on.
+    fn store(&self) -> &Store {
+        match self.chunk {
+            None => &self.forest.top,
+            Some(id) => &self.forest.chunk(id).store,
+        }
+    }
+
+    fn store_mut(&mut self) -> &mut Store {
+        match self.chunk {
+            None => &mut self.forest.top,
+            Some(id) => &mut self.forest.chunk_mut(id).store,
+        }
+    }
+
+    /// Whether `level` is the chunk level, reached from the top: the child
+    /// there is a chunk id, air, uniform or not resident, and must be entered
+    /// with [`in_chunk`](Self::in_chunk) before it is read or written.
+    fn at_chunk_boundary(&self, level: u32) -> bool {
+        level == CHUNK_LEVEL && self.chunk.is_none()
+    }
+
+    /// Runs `write` on the chunk-level child `child` inside its chunk, with
+    /// the child as the chunk's store sees it. An air or uniform child gets a
+    /// new chunk, which is dropped again unless the write leaves mixed
+    /// content. A result of air, one material or not resident drops the
+    /// chunk. Returns the child the parent should hold, as `write` does.
+    fn in_chunk(
+        &mut self,
+        child: Child,
+        write: impl FnOnce(&mut Self, Child) -> Option<Child>,
+    ) -> Option<Child> {
+        debug_assert!(self.at_chunk_boundary(CHUNK_LEVEL));
+        debug_assert!(
+            child != Child::NotResident,
+            "writes never reach unloaded chunks"
+        );
+        let (id, fresh, local) = match child {
+            Child::Node(id) => (id, false, Child::Node(self.forest.chunk(id).root)),
+            filled => (self.forest.alloc_chunk(), true, filled),
+        };
+        self.chunk = Some(id);
+        let result = write(self, local);
+        self.chunk = None;
+        match result {
+            None => {
+                if fresh {
+                    self.forest.free_chunk(id);
+                }
+                None
+            }
+            Some(Child::Node(root)) => {
+                self.forest.chunk_mut(id).root = root;
+                self.forest.touch(id);
+                Some(Child::Node(id))
+            }
+            Some(other) => {
+                self.forest.free_chunk(id);
+                Some(other)
+            }
+        }
+    }
+
     /// The index and contents of the node behind `child`, if it is one.
     fn existing(&self, child: Child) -> Option<(u32, Node)> {
         match child {
-            Child::Node(index) => Some((index, self.store.node(index))),
-            Child::Air | Child::Uniform(_) => None,
+            Child::Node(index) => Some((index, self.store().node(index))),
+            Child::Air | Child::Uniform(_) | Child::NotResident => None,
         }
     }
 
@@ -100,18 +179,24 @@ impl Writer<'_> {
                 }
                 Child::filled(material)
             }
+            (Packed::NotResident, existing) => {
+                if let Some((index, node)) = existing {
+                    self.release(index, node, level);
+                }
+                Child::NotResident
+            }
             (Packed::Node(p), Some((index, old))) => {
                 self.rewrite(index, old, level, p.mask, p.words());
                 Child::Node(index)
             }
             (Packed::Node(p), None) => {
-                let base = self.store.alloc_block(p.words());
+                let base = self.store_mut().alloc_block(p.words());
                 let node = Node {
                     mask: p.mask,
                     base,
                     info: 0,
                 };
-                Child::Node(self.store.alloc_node(node))
+                Child::Node(self.store_mut().alloc_node(node))
             }
         }
     }
@@ -122,13 +207,13 @@ impl Writer<'_> {
     fn rewrite(&mut self, index: u32, old: Node, level: u32, mask: u64, words: &[u32]) {
         let old_len = old.block_len(level);
         let base = if old_len == words.len() {
-            if self.store.block(old.base, old_len) != words {
-                self.store.write_block(old.base, words);
+            if self.store().block(old.base, old_len) != words {
+                self.store_mut().write_block(old.base, words);
             }
             old.base
         } else {
-            let base = self.store.alloc_block(words);
-            self.store.free_block(old.base, old_len);
+            let base = self.store_mut().alloc_block(words);
+            self.store_mut().free_block(old.base, old_len);
             base
         };
         let node = Node {
@@ -137,18 +222,26 @@ impl Writer<'_> {
             info: 0,
         };
         if node != old {
-            self.store.set_node(index, node);
+            self.store_mut().set_node(index, node);
         }
     }
 
     /// Frees one node and its block, not its children.
     fn release(&mut self, index: u32, node: Node, level: u32) {
-        self.store.free_block(node.base, node.block_len(level));
-        self.store.free_node(index);
+        self.store_mut()
+            .free_block(node.base, node.block_len(level));
+        self.store_mut().free_node(index);
     }
 
-    /// Frees every node and palette block under and including `child`.
+    /// Frees every node and palette block under and including `child`. A
+    /// whole chunk is dropped at once.
     fn free_subtree(&mut self, child: Child, level: u32) {
+        if self.at_chunk_boundary(level) {
+            if let Child::Node(id) = child {
+                self.forest.free_chunk(id);
+            }
+            return;
+        }
         let Some((index, node)) = self.existing(child) else {
             return;
         };

@@ -15,8 +15,12 @@
 use std::fmt;
 
 use super::alloc::{Storage, StorageReader};
+use super::forest::ChunkLookup;
+use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
-use super::node::{Child, RECORD_WORDS, UNIFORM_BIT, bit, rank, slot_at, slots};
+use super::node::{
+    CHUNK_LEVEL, Child, NOT_RESIDENT, RECORD_WORDS, UNIFORM_BIT, bit, rank, slot_at, slots,
+};
 use super::{ROOT_LEVEL, WORLD_ORIGIN};
 use crate::consts::{TREE_DEPTH, TREE_FANOUT};
 use crate::coords::{VoxelPos, path};
@@ -63,6 +67,9 @@ pub enum NodeKind {
     Branch,
     /// A level-0 node: 4x4x4 voxels, not all the same.
     Leaf,
+    /// The content is not loaded (decision 0006). Only children at the chunk
+    /// level and above of the world tree are ever not resident.
+    NotResident,
 }
 
 /// One child of a [`VoxelSource`], at a level its caller tracks.
@@ -70,7 +77,8 @@ pub enum NodeKind {
 /// Views are canonical: a child whose voxels are all air is
 /// [`NodeKind::Air`] and one whose voxels are all one solid material is
 /// [`NodeKind::Uniform`], whatever the storage holds, so equal content gives
-/// equal views.
+/// equal views. A [`NodeKind::NotResident`] child has mask 0, reads as air
+/// and is its own child, like air, but its content is unknown.
 pub trait NodeView: Copy {
     fn kind(&self) -> NodeKind;
 
@@ -174,7 +182,7 @@ pub(crate) fn descend<N: NodeView>(
     let mut level = levels - 1;
     loop {
         match node.kind() {
-            NodeKind::Air => return MaterialId::AIR,
+            NodeKind::Air | NodeKind::NotResident => return MaterialId::AIR,
             NodeKind::Uniform(m) => return m,
             NodeKind::Leaf => return node.voxel(slot_at(local, 0)),
             NodeKind::Branch => {
@@ -195,7 +203,7 @@ pub fn same_content(a: &impl VoxelSource, b: &impl VoxelSource) -> bool {
 /// Whether two views of children at the same level hold the same voxels.
 pub(crate) fn same_node(a: impl NodeView, b: impl NodeView) -> bool {
     match (a.kind(), b.kind()) {
-        (NodeKind::Air, NodeKind::Air) => true,
+        (NodeKind::Air, NodeKind::Air) | (NodeKind::NotResident, NodeKind::NotResident) => true,
         (NodeKind::Uniform(x), NodeKind::Uniform(y)) => x == y,
         (NodeKind::Branch, NodeKind::Branch) => {
             a.mask() == b.mask()
@@ -263,19 +271,28 @@ pub enum NodeRef<'a> {
     Branch(BranchRef<'a>),
     /// A leaf of 4x4x4 voxels, not all the same.
     Leaf(LeafRef<'a>),
+    /// The child's content is not loaded.
+    NotResident,
 }
 
 impl<'a> NodeRef<'a> {
     /// The reader's view of a stored child whose node, if it is one, has
-    /// `level` (1 or higher).
-    pub(crate) fn new(storage: &'a Storage, child: Child, level: u32) -> Self {
+    /// `level` (1 or higher) and lives in `storage`.
+    pub(crate) fn new(
+        storage: &'a Storage,
+        chunks: &'a dyn ChunkLookup,
+        child: Child,
+        level: u32,
+    ) -> Self {
         match child {
             Child::Air => Self::Air,
             Child::Uniform(m) => Self::Uniform(m),
+            Child::NotResident => Self::NotResident,
             Child::Node(index) => {
                 let node = storage.node(index);
                 Self::Branch(BranchRef {
                     storage,
+                    chunks,
                     level,
                     mask: node.mask,
                     block: storage.block(node.base, node.block_len(level)),
@@ -314,12 +331,13 @@ impl NodeView for NodeRef<'_> {
             Self::Uniform(m) => NodeKind::Uniform(*m),
             Self::Branch(_) => NodeKind::Branch,
             Self::Leaf(_) => NodeKind::Leaf,
+            Self::NotResident => NodeKind::NotResident,
         }
     }
 
     fn mask(&self) -> u64 {
         match self {
-            Self::Air => 0,
+            Self::Air | Self::NotResident => 0,
             Self::Uniform(_) => u64::MAX,
             Self::Branch(b) => b.mask(),
             Self::Leaf(l) => l.mask(),
@@ -328,7 +346,7 @@ impl NodeView for NodeRef<'_> {
 
     fn child(&self, slot: u32) -> Self {
         match self {
-            Self::Air | Self::Uniform(_) => *self,
+            Self::Air | Self::Uniform(_) | Self::NotResident => *self,
             Self::Branch(b) => b.child(slot),
             Self::Leaf(_) => panic!("a leaf has voxels, not children"),
         }
@@ -336,7 +354,7 @@ impl NodeView for NodeRef<'_> {
 
     fn voxel(&self, slot: u32) -> MaterialId {
         match self {
-            Self::Air => MaterialId::AIR,
+            Self::Air | Self::NotResident => MaterialId::AIR,
             Self::Uniform(m) => *m,
             Self::Leaf(l) => l.voxel(slot),
             Self::Branch(_) => panic!("a branch has children, not voxels"),
@@ -347,7 +365,7 @@ impl NodeView for NodeRef<'_> {
     fn palette(&self) -> Palette {
         match self {
             Self::Leaf(l) => Palette::stored(l.palette()),
-            Self::Air => Palette::stored([]),
+            Self::Air | Self::NotResident => Palette::stored([]),
             Self::Uniform(m) => Palette::stored([*m]),
             Self::Branch(_) => panic!("a branch has children, not a palette"),
         }
@@ -358,6 +376,7 @@ impl NodeView for NodeRef<'_> {
 #[derive(Clone, Copy)]
 pub struct BranchRef<'a> {
     storage: &'a Storage,
+    chunks: &'a dyn ChunkLookup,
     level: u32,
     mask: u64,
     /// One child word (level 2 and up) or leaf record (level 1) per non-air
@@ -402,11 +421,15 @@ impl<'a> BranchRef<'a> {
                 Record::read(&self.block[at..at + RECORD_WORDS]),
             )
         } else {
-            NodeRef::new(
-                self.storage,
-                Child::from_word(self.block[k]),
-                self.level - 1,
-            )
+            let child = Child::from_word(self.block[k]);
+            if self.level == CHUNK_LEVEL + 1
+                && let Child::Node(id) = child
+            {
+                // The children of a level-5 node root chunks.
+                let (storage, root) = self.chunks.chunk_root(id);
+                return NodeRef::new(storage, self.chunks, Child::Node(root), CHUNK_LEVEL);
+            }
+            NodeRef::new(self.storage, self.chunks, child, self.level - 1)
         }
     }
 }
@@ -501,39 +524,128 @@ impl fmt::Debug for LeafRef<'_> {
 /// The storage and root of a tree or snapshot: what point lookups read.
 #[derive(Clone, Copy)]
 pub(crate) struct TreeView<'a> {
-    pub storage: &'a Storage,
+    pub top: &'a Storage,
+    pub chunks: &'a dyn ChunkLookup,
     pub root: Child,
 }
 
 impl<'a> TreeView<'a> {
     pub fn root(self) -> NodeRef<'a> {
-        NodeRef::new(self.storage, self.root, ROOT_LEVEL)
+        NodeRef::new(self.top, self.chunks, self.root, ROOT_LEVEL)
+    }
+
+    /// The material of one voxel; air outside the world and where the region
+    /// is not resident.
+    pub fn get(self, pos: VoxelPos) -> MaterialId {
+        self.lookup(pos).unwrap_or(MaterialId::AIR)
     }
 
     /// The material of one voxel, read straight from storage: one node and
-    /// one word per level, no views. The reader remembers the last node and
-    /// word page, which the nodes of one path often share.
-    pub fn get(self, pos: VoxelPos) -> MaterialId {
+    /// one word per level, no views; `None` where the region is not
+    /// resident. The readers remember the last node and word page, which the
+    /// nodes of one path often share.
+    pub fn lookup(self, pos: VoxelPos) -> Option<MaterialId> {
         let Some(local) = path::world_local(pos) else {
-            return MaterialId::AIR;
+            return Some(MaterialId::AIR);
         };
         let mut index = match self.root {
-            Child::Air => return MaterialId::AIR,
-            Child::Uniform(m) => return m,
+            Child::Air => return Some(MaterialId::AIR),
+            Child::Uniform(m) => return Some(m),
+            Child::NotResident => return None,
             Child::Node(index) => index,
         };
-        let mut storage = self.storage.reader();
+        let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         loop {
             match step(&mut storage, index, level, local) {
-                Step::Filled(m) => return m,
+                Step::Filled(m) => return Some(m),
+                Step::NotResident => return None,
+                Step::Node(child) => {
+                    level -= 1;
+                    index = child;
+                    if level == CHUNK_LEVEL {
+                        let (chunk, root) = self.chunks.chunk_root(child);
+                        storage = chunk.reader();
+                        index = root;
+                    }
+                }
+                Step::Record(at) => {
+                    return Some(record_voxel(&mut storage, at, slot_at(local, 0)));
+                }
+            }
+        }
+    }
+
+    /// The chunk id stored at the chunk-level position holding world-local
+    /// `local`, if that region is a chunk (mixed and resident).
+    pub fn chunk_id(self, local: [u32; 3]) -> Option<u32> {
+        let mut index = match self.root {
+            Child::Node(index) => index,
+            Child::Air | Child::Uniform(_) | Child::NotResident => return None,
+        };
+        let mut storage = self.top.reader();
+        let mut level = ROOT_LEVEL;
+        loop {
+            match step(&mut storage, index, level, local) {
+                Step::Node(child) if level == CHUNK_LEVEL + 1 => return Some(child),
                 Step::Node(child) => {
                     index = child;
                     level -= 1;
                 }
-                Step::Record(at) => return record_voxel(&mut storage, at, slot_at(local, 0)),
+                Step::Filled(_) | Step::NotResident | Step::Record(_) => return None,
             }
         }
+    }
+
+    /// Whether the region holding world-local `local` is loaded. Walks the
+    /// top levels only.
+    pub fn resident(self, local: [u32; 3]) -> bool {
+        let mut index = match self.root {
+            Child::Node(index) => index,
+            Child::NotResident => return false,
+            Child::Air | Child::Uniform(_) => return true,
+        };
+        let mut storage = self.top.reader();
+        let mut level = ROOT_LEVEL;
+        while level > CHUNK_LEVEL {
+            match step(&mut storage, index, level, local) {
+                Step::NotResident => return false,
+                Step::Node(child) => {
+                    index = child;
+                    level -= 1;
+                }
+                Step::Filled(_) | Step::Record(_) => return true,
+            }
+        }
+        true
+    }
+
+    /// A world-local voxel of `region` whose region is not resident, if
+    /// there is one.
+    pub fn unloaded_in(self, region: &LocalBox) -> Option<[u32; 3]> {
+        unloaded_in(self.root(), ROOT_LEVEL, [0; 3], region)
+    }
+}
+
+/// A voxel of `region` inside `node`, a child at `level` whose lowest voxel
+/// is `origin`, that is not resident.
+fn unloaded_in(
+    node: NodeRef<'_>,
+    level: u32,
+    origin: [u32; 3],
+    region: &LocalBox,
+) -> Option<[u32; 3]> {
+    match node {
+        NodeRef::NotResident => Some(region.lowest_in(origin)),
+        NodeRef::Branch(b) if level > CHUNK_LEVEL => {
+            let span = path::child_span(level);
+            region.slots(origin, span).find_map(|slot| {
+                let offset = path::slot_offset(slot);
+                let child_origin = [0, 1, 2].map(|a| origin[a] + offset[a] * span);
+                unloaded_in(b.child(slot), level - 1, child_origin, region)
+            })
+        }
+        _ => None,
     }
 }
 
@@ -541,7 +653,10 @@ impl<'a> TreeView<'a> {
 pub(crate) enum Step {
     /// An air or uniform child: the voxel's material.
     Filled(MaterialId),
-    /// The index of the child node, one level down.
+    /// A child whose content is not loaded.
+    NotResident,
+    /// The child word one level down: a node index, or a chunk id when the
+    /// step was taken at level `CHUNK_LEVEL + 1`.
     Node(u32),
     /// The word offset of the leaf record that holds the voxel.
     Record(u32),
@@ -565,7 +680,9 @@ pub(crate) fn step(
         return Step::Record(node.base + RECORD_WORDS as u32 * k);
     }
     let word = storage.word(node.base + k);
-    if word & UNIFORM_BIT != 0 {
+    if word == NOT_RESIDENT {
+        Step::NotResident
+    } else if word & UNIFORM_BIT != 0 {
         Step::Filled(MaterialId(word as u16))
     } else {
         Step::Node(word)

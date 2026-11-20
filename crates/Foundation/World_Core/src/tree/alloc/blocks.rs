@@ -10,6 +10,7 @@ use super::pages::Pages;
 /// shorter than the block, so under 192 words) becomes a free block of its own
 /// size and the new block starts the next page. Freed blocks go on a LIFO
 /// list per size and are reused only by a request of exactly that size.
+#[derive(Clone)]
 pub(super) struct WordBlocks {
     /// One past the highest word ever handed out.
     end: u32,

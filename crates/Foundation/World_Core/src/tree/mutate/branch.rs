@@ -16,8 +16,10 @@ impl Writer<'_> {
         let Child::Node(index) = child else {
             return [child; TREE_FANOUT as usize];
         };
-        let node = self.store.node(index);
-        let block = self.store.block(node.base, node.mask.count_ones() as usize);
+        let node = self.store().node(index);
+        let block = self
+            .store()
+            .block(node.base, node.mask.count_ones() as usize);
         let mut children = [Child::Air; TREE_FANOUT as usize];
         for (slot, &word) in slots(node.mask).zip(block) {
             children[slot as usize] = Child::from_word(word);
@@ -30,7 +32,7 @@ impl Writer<'_> {
         if node.mask & bit(slot) == 0 {
             return Child::Air;
         }
-        Child::from_word(self.store.word(node.base + rank(node.mask, slot) as u32))
+        Child::from_word(self.store().word(node.base + rank(node.mask, slot) as u32))
     }
 
     /// Overwrites child `slot` of a stored node at level 2 or higher with
@@ -47,7 +49,7 @@ impl Writer<'_> {
             return false;
         }
         let at = node.base + rank(node.mask, slot) as u32;
-        self.store.write_block(at, &[word]);
+        self.store_mut().write_block(at, &[word]);
         true
     }
 }
@@ -69,10 +71,12 @@ pub(super) fn pack(children: &Children) -> Packed<{ TREE_FANOUT as usize }> {
     if mask == 0 {
         return Packed::Filled(MaterialId::AIR);
     }
-    if let Child::Uniform(material) = children[0]
-        && children.iter().all(|&c| c == children[0])
-    {
-        return Packed::Filled(material);
+    if children.iter().all(|&c| c == children[0]) {
+        match children[0] {
+            Child::Uniform(material) => return Packed::Filled(material),
+            Child::NotResident => return Packed::NotResident,
+            Child::Air | Child::Node(_) => {}
+        }
     }
     Packed::Node(PackedNode::new(mask, &words[..len]))
 }
@@ -108,5 +112,17 @@ mod tests {
         assert!(matches!(pack(&children), Packed::Node(p) if p.mask == u64::MAX));
         children[63] = Child::Air;
         assert!(matches!(pack(&children), Packed::Node(p) if p.mask == !bit(63)));
+    }
+
+    #[test]
+    fn all_not_resident_collapses_and_mixed_stays() {
+        assert_eq!(pack(&[Child::NotResident; 64]), Packed::NotResident);
+        let mut children = [Child::NotResident; 64];
+        children[0] = Child::Uniform(MaterialId(2));
+        let Packed::Node(p) = pack(&children) else {
+            panic!("mixed residency needs a node");
+        };
+        assert_eq!(p.mask, u64::MAX);
+        assert_eq!(p.words()[1], crate::tree::node::NOT_RESIDENT);
     }
 }

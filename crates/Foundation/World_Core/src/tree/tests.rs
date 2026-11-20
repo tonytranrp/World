@@ -32,7 +32,7 @@ fn live(tree: &VoxelTree) -> (usize, usize, usize) {
 fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
     fn walk(node: NodeRef<'_>, level: u32, found: &mut (usize, usize, usize)) {
         match node {
-            NodeRef::Air => {}
+            NodeRef::Air | NodeRef::NotResident => {}
             NodeRef::Uniform(m) => assert!(!m.is_air(), "a uniform child is never air"),
             NodeRef::Branch(b) => {
                 assert_eq!(b.level(), level);
@@ -172,7 +172,7 @@ fn refused_edits_change_nothing_and_copy_nothing() {
 
     assert_eq!(tree.get(pos(1, 1, 1)), STONE, "the batch applied nothing");
     assert_eq!(tree.stats(), stats);
-    assert!(tree.store.storage().shares_everything_with(&before.storage));
+    assert!(tree.shares_everything_with(&before));
 }
 
 #[test]
@@ -199,7 +199,7 @@ fn writes_that_change_nothing_copy_and_report_nothing() {
     assert!(tree.apply(&no_ops).unwrap().is_empty());
 
     assert_eq!(tree.stats(), stats);
-    assert!(tree.store.storage().shares_everything_with(&before.storage));
+    assert!(tree.shares_everything_with(&before));
 }
 
 #[test]
@@ -258,10 +258,15 @@ fn clearing_a_region_returns_every_node_and_word() {
     assert!(matches!(tree.root(), NodeRef::Air));
     assert_eq!(live(&tree), (0, 0, 0));
     let cleared = tree.stats();
-    // Leaves live in their parents' blocks, so only branches were nodes.
-    assert_eq!(cleared.free_nodes, grown.branches + grown.free_nodes);
-    assert_eq!(cleared.free_words, grown.words + grown.free_words);
-    assert_eq!(cleared.bytes, grown.bytes, "freeing keeps the pages");
+    // Every chunk went with its region, pages and all; only the top store's
+    // pages remain, its nodes back on the free list.
+    assert!(grown.chunks > 0);
+    assert_eq!(cleared.chunks, 0);
+    assert!(
+        cleared.bytes < grown.bytes,
+        "dropping chunks returns their pages"
+    );
+    assert!(cleared.free_nodes <= grown.branches + grown.free_nodes);
 }
 
 #[test]
@@ -910,37 +915,4 @@ proptest! {
         prop_assert!(!same_content(&grid, &tree));
         prop_assert!(same_content(&grid, &grid.clone()));
     }
-}
-
-#[test]
-fn snapshot_pages_expose_the_raw_layout_without_copying() {
-    let mut tree = VoxelTree::new();
-    assert_eq!(tree.snapshot().root_word(), None);
-    tree.set(pos(1, 2, 3), STONE).unwrap();
-    tree.set(pos(-100, 50, 7), DIRT).unwrap();
-    let snap = tree.snapshot();
-
-    let nodes: Vec<(usize, &[Node])> = snap.node_pages().collect();
-    let words: Vec<(usize, &[u32])> = snap.word_pages().collect();
-    assert_eq!((nodes.len(), words.len()), (1, 1));
-    assert_eq!((nodes[0].0, words[0].0), (0, 0));
-    assert_eq!(nodes[0].1.len(), NODE_PAGE_LEN);
-    assert_eq!(words[0].1.len(), WORD_PAGE_LEN);
-    let bytes: &[u8] = bytemuck::cast_slice(nodes[0].1);
-    assert_eq!(bytes.len(), NODE_PAGE_LEN * 16);
-
-    // The root word leads to the node a reader sees.
-    let root = snap.root_word().unwrap();
-    assert_eq!(root & UNIFORM_BIT, 0);
-    let node = nodes[0].1[root as usize];
-    let NodeRef::Branch(b) = snap.root() else {
-        panic!("two voxels need a root branch");
-    };
-    assert_eq!(node.mask, b.mask());
-    assert_eq!(node.info, 0);
-    let first = words[0].1[node.base as usize];
-    assert_eq!(first & UNIFORM_BIT, 0, "the root's children are nodes");
-
-    tree.fill_box(VoxelBox::WORLD, STONE).unwrap();
-    assert_eq!(tree.snapshot().root_word(), Some(UNIFORM_BIT | 1));
 }

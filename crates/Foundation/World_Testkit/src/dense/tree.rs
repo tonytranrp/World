@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use world_core::tree::{NodeKind, NodeView, TreeRead, TreeStats, VoxelSource};
+use world_core::tree::{CHUNK_LEVEL, NodeKind, NodeView, TreeRead, TreeStats, VoxelSource};
 use world_core::{DenseGrid, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 
 use super::diverge::{Divergence, first_difference};
@@ -114,6 +114,10 @@ impl Walk {
             NodeKind::Branch => self.branch(node, level),
             NodeKind::Leaf if level != 0 => Err(self.fail("a leaf above level 0")),
             NodeKind::Leaf => self.leaf(node),
+            NodeKind::NotResident if level < CHUNK_LEVEL => {
+                Err(self.fail("a not-resident child below the chunk level"))
+            }
+            NodeKind::NotResident => Ok(()),
         }
     }
 
@@ -139,8 +143,10 @@ impl Walk {
         }
         if mask == u64::MAX {
             let first = summary(listed[0].1);
-            if matches!(listed[0].1.kind(), NodeKind::Uniform(_))
-                && listed.iter().all(|&(_, n)| summary(n) == first)
+            if matches!(
+                listed[0].1.kind(),
+                NodeKind::Uniform(_) | NodeKind::NotResident
+            ) && listed.iter().all(|&(_, n)| summary(n) == first)
             {
                 return Err(self.fail("a branch whose children are all one material"));
             }
@@ -219,6 +225,7 @@ fn summary(node: impl NodeView) -> (u8, u64) {
         NodeKind::Uniform(m) => (1, m.0.into()),
         NodeKind::Branch => (2, node.mask()),
         NodeKind::Leaf => (3, node.mask()),
+        NodeKind::NotResident => (4, 0),
     }
 }
 
@@ -282,6 +289,7 @@ mod tests {
             free_nodes: 4,
             free_words: 5,
             bytes: 6,
+            chunks: 1,
         };
         assert_eq!(
             NodeCounts::from(stats),

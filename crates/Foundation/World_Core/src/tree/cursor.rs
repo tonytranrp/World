@@ -4,7 +4,8 @@ use std::fmt;
 
 use super::ROOT_LEVEL;
 use super::alloc::StorageReader;
-use super::node::{Child, slot_at};
+use super::forest::ChunkLookup;
+use super::node::{CHUNK_LEVEL, Child, slot_at};
 use super::read::{Step, TreeView, record_voxel, step};
 use crate::consts::TREE_DEPTH;
 use crate::coords::{VoxelPos, path};
@@ -20,14 +21,18 @@ use crate::material::MaterialId;
 /// its tree, so the tree cannot change while the cursor lives.
 #[derive(Clone)]
 pub struct TreeCursor<'a> {
-    /// Remembers the last node and word page across lookups too.
-    storage: StorageReader<'a>,
+    /// Reads the top levels; remembers the last node and word page.
+    top: StorageReader<'a>,
+    /// Reads the chunk on the cached path, when the path reaches one.
+    chunk: Option<StorageReader<'a>>,
+    chunks: &'a dyn ChunkLookup,
     root: Child,
     /// World-local coordinate of the last lookup.
     last: [u32; 3],
     /// `path[level]` is the node at that level on the path to `last`, for
     /// levels `bottom` up to the root; when `bottom` is 0, `path[0]` is the
-    /// word offset of the last leaf's record.
+    /// word offset of the last leaf's record. Levels up to the chunk level
+    /// index the chunk's arenas.
     path: [u32; TREE_DEPTH as usize],
     /// The lowest level whose `path` entry is valid.
     bottom: u32,
@@ -40,7 +45,9 @@ impl<'a> TreeCursor<'a> {
             path[ROOT_LEVEL as usize] = index;
         }
         Self {
-            storage: view.storage.reader(),
+            top: view.top.reader(),
+            chunk: None,
+            chunks: view.chunks,
             root: view.root,
             last: [0; 3],
             path,
@@ -48,14 +55,22 @@ impl<'a> TreeCursor<'a> {
         }
     }
 
-    /// The material of one voxel; air outside the world.
+    /// The material of one voxel; air outside the world and where the region
+    /// is not resident.
     pub fn get(&mut self, pos: VoxelPos) -> MaterialId {
+        self.lookup(pos).unwrap_or(MaterialId::AIR)
+    }
+
+    /// The material of one voxel, or `None` where its region is not
+    /// resident. Air outside the world.
+    pub fn lookup(&mut self, pos: VoxelPos) -> Option<MaterialId> {
         let Some(local) = path::world_local(pos) else {
-            return MaterialId::AIR;
+            return Some(MaterialId::AIR);
         };
         match self.root {
-            Child::Air => return MaterialId::AIR,
-            Child::Uniform(m) => return m,
+            Child::Air => return Some(MaterialId::AIR),
+            Child::Uniform(m) => return Some(m),
+            Child::NotResident => return None,
             Child::Node(_) => {}
         }
         // A level-L node covers 4^(L+1) voxels per axis, so the old and new
@@ -66,23 +81,40 @@ impl<'a> TreeCursor<'a> {
         let shared = (u32::BITS - diff.leading_zeros()).saturating_sub(1) / 2;
         self.last = local;
         let mut level = shared.max(self.bottom);
-        if level == 0 {
-            return record_voxel(&mut self.storage, self.path[0], slot_at(local, 0));
-        }
         loop {
-            match step(&mut self.storage, self.path[level as usize], level, local) {
+            let reader = if level > CHUNK_LEVEL {
+                &mut self.top
+            } else {
+                // The cached path reaches this level, so it entered a chunk.
+                self.chunk
+                    .as_mut()
+                    .expect("a cached path below the chunk level has a chunk")
+            };
+            if level == 0 {
+                return Some(record_voxel(reader, self.path[0], slot_at(local, 0)));
+            }
+            match step(reader, self.path[level as usize], level, local) {
                 Step::Filled(m) => {
                     self.bottom = level;
-                    return m;
+                    return Some(m);
                 }
-                Step::Node(index) => {
+                Step::NotResident => {
+                    self.bottom = level;
+                    return None;
+                }
+                Step::Node(child) => {
                     level -= 1;
-                    self.path[level as usize] = index;
+                    self.path[level as usize] = child;
+                    if level == CHUNK_LEVEL {
+                        let (storage, root) = self.chunks.chunk_root(child);
+                        self.chunk = Some(storage.reader());
+                        self.path[level as usize] = root;
+                    }
                 }
                 Step::Record(at) => {
                     self.path[0] = at;
                     self.bottom = 0;
-                    return record_voxel(&mut self.storage, at, slot_at(local, 0));
+                    level = 0;
                 }
             }
         }

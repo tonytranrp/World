@@ -4,12 +4,15 @@
 //! packed once at its final size (decision 0006), from a body that has
 //! already passed.
 
-use super::{DecodeError, HEADER_LEN, TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_UNIFORM, index_bits};
+use super::{
+    DecodeError, HEADER_LEN, TAG_AIR, TAG_BRANCH, TAG_LEAF, TAG_NOT_RESIDENT, TAG_UNIFORM,
+    index_bits,
+};
 use crate::consts::{TREE_DEPTH, TREE_FANOUT};
 use crate::material::MaterialId;
 use crate::tree::Builder;
-use crate::tree::node::Child;
 use crate::tree::node::leaf::{Record, Voxels};
+use crate::tree::node::{CHUNK_LEVEL, Child};
 
 /// The children of one branch, in slot order.
 type Slots<T> = [T; TREE_FANOUT as usize];
@@ -28,6 +31,11 @@ pub(super) trait Build {
     fn mixed_leaf(&mut self, voxels: &Voxels) -> Self::Leaf;
     /// A child whose every voxel is `material`, never air.
     fn uniform(&mut self, material: MaterialId) -> Self::Child;
+    /// A child at the chunk level or above whose content is not loaded.
+    fn not_resident(&mut self) -> Self::Child;
+    /// Called before the children of a branch at the chunk level are read:
+    /// they belong to a new chunk.
+    fn begin_chunk(&mut self);
     /// A level-1 branch made of these leaves (air where the mask is clear).
     fn brick(&mut self, leaves: &Slots<Self::Leaf>) -> Self::Child;
     /// A branch at `level` (2 and up) made of these children.
@@ -45,6 +53,8 @@ impl Build for Validate {
     fn uniform_leaf(&mut self, _: MaterialId) {}
     fn mixed_leaf(&mut self, _: &Voxels) {}
     fn uniform(&mut self, _: MaterialId) {}
+    fn not_resident(&mut self) {}
+    fn begin_chunk(&mut self) {}
     fn brick(&mut self, _: &Slots<()>) {}
     fn branch(&mut self, _: u32, _: &Slots<()>) {}
 }
@@ -73,12 +83,25 @@ impl Build for TreeBuild<'_, '_> {
         Child::filled(material)
     }
 
+    fn not_resident(&mut self) -> Child {
+        Child::NotResident
+    }
+
+    fn begin_chunk(&mut self) {
+        self.builder.begin_chunk();
+    }
+
     fn brick(&mut self, leaves: &Slots<Record>) -> Child {
         self.builder.brick(leaves)
     }
 
     fn branch(&mut self, level: u32, children: &Slots<Child>) -> Child {
-        self.builder.branch(level, children)
+        let child = self.builder.branch(level, children);
+        if level == CHUNK_LEVEL {
+            self.builder.end_chunk(child)
+        } else {
+            child
+        }
     }
 }
 
@@ -96,9 +119,10 @@ pub(super) fn body<B: Build>(bytes: &[u8], build: &mut B) -> Result<B::Child, De
 }
 
 /// What a child turned out to be, for its parent's canonical check.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Uniform(u16),
+    NotResident,
     Node,
 }
 
@@ -165,7 +189,16 @@ impl<'a> Reader<'a> {
                 let id = self.uniform_id(at)?;
                 Ok((Kind::Uniform(id), build.uniform(MaterialId(id))))
             }
-            TAG_BRANCH => self.branch(at, level, build),
+            TAG_BRANCH => {
+                if level == CHUNK_LEVEL {
+                    build.begin_chunk();
+                }
+                self.branch(at, level, build)
+            }
+            TAG_NOT_RESIDENT if level < CHUNK_LEVEL => {
+                Err(malformed(at, "a not-resident child below the chunk level"))
+            }
+            TAG_NOT_RESIDENT => Ok((Kind::NotResident, build.not_resident())),
             TAG_LEAF => Err(malformed(at, "a leaf above level 0")),
             TAG_AIR => Err(malformed(at, "an air child inside a branch")),
             _ => Err(malformed(at, "an unknown child tag")),
@@ -186,6 +219,7 @@ impl<'a> Reader<'a> {
                 Ok((Kind::Uniform(id), build.uniform_leaf(MaterialId(id))))
             }
             TAG_BRANCH => Err(malformed(at, "a branch at level 0")),
+            TAG_NOT_RESIDENT => Err(malformed(at, "a not-resident child below the chunk level")),
             TAG_LEAF => self.leaf(at, build),
             TAG_AIR => Err(malformed(at, "an air child inside a branch")),
             _ => Err(malformed(at, "an unknown child tag")),
@@ -204,7 +238,7 @@ impl<'a> Reader<'a> {
         }
         let mut leaves = [B::AIR_LEAF; TREE_FANOUT as usize];
         let mut children = [B::AIR_CHILD; TREE_FANOUT as usize];
-        let mut material = None;
+        let mut same = None;
         let mut mixed = false;
         for slot in set_slots(mask) {
             let child_at = self.pos;
@@ -219,12 +253,18 @@ impl<'a> Reader<'a> {
                 kind
             };
             match kind {
-                Kind::Uniform(id) if material.is_none_or(|m| m == id) => material = Some(id),
+                Kind::Node => mixed = true,
+                filled if same.is_none_or(|s| s == filled) => same = Some(filled),
                 _ => mixed = true,
             }
         }
         if mask == u64::MAX && !mixed {
-            return Err(malformed(at, "a branch whose voxels are all one material"));
+            return Err(match same {
+                Some(Kind::NotResident) => {
+                    malformed(at, "a branch whose children are all not resident")
+                }
+                _ => malformed(at, "a branch whose voxels are all one material"),
+            });
         }
         let built = if level == 1 {
             build.brick(&leaves)

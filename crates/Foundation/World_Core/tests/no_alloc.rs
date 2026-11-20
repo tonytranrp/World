@@ -54,6 +54,7 @@ fn scene() -> VoxelTree {
 fn walk(node: NodeRef<'_>) -> u64 {
     match node {
         NodeRef::Air => 1,
+        NodeRef::NotResident => 3,
         NodeRef::Uniform(m) => 2 + u64::from(m.0),
         NodeRef::Branch(b) => {
             let mut sum = u64::from(b.level()) ^ b.mask();

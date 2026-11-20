@@ -42,9 +42,21 @@
 //!
 //! - bit 31 ([`UNIFORM_BIT`]) set: every voxel of the child is the material
 //!   in the low 16 bits (never air); bits 16 to 30 are zero.
-//! - bit 31 clear: the index of the child node, one level lower.
+//! - exactly [`NOT_RESIDENT`] (bits 31 and 30): the child's content is not
+//!   loaded (decision 0006). Only children at [`CHUNK_LEVEL`] and above can
+//!   be not resident.
+//! - bit 31 clear: the index of the child node, one level lower. The children
+//!   of a level-5 node are the roots of chunks: their words are chunk ids.
 //!
 //! The root is a child word too, or air when the world is empty.
+//!
+//! # Chunks
+//!
+//! The subtree under a node at [`CHUNK_LEVEL`] (1024 voxels, 16 m, per axis)
+//! is a *chunk* and lives in its own arenas, so it can be loaded, saved,
+//! compacted and freed on its own (decision 0006). Levels above form a small
+//! shared top. Node indices and word offsets inside a chunk refer to that
+//! chunk's arenas.
 //!
 //! # Leaf records, level 1: block of `3n` words
 //!
@@ -116,6 +128,14 @@ const _: () = assert!(TREE_FANOUT == u64::BITS);
 /// Set in a child word or leaf payload that holds a material, not an index.
 pub const UNIFORM_BIT: u32 = 1 << 31;
 
+/// The child word of a child whose content is not loaded. It is not a valid
+/// uniform word: a uniform word keeps bits 16 to 30 clear.
+pub const NOT_RESIDENT: u32 = UNIFORM_BIT | 1 << 30;
+
+/// The level of the nodes that root chunks. A chunk is 4^(CHUNK_LEVEL + 1)
+/// = 1024 voxels per axis.
+pub const CHUNK_LEVEL: u32 = 4;
+
 /// Words in one leaf record of a level-1 node's block.
 pub const RECORD_WORDS: usize = 3;
 
@@ -152,8 +172,11 @@ pub(crate) enum Child {
     Air,
     /// Every voxel is this solid material (never air).
     Uniform(MaterialId),
-    /// A node index; the node's level is one below its parent's.
+    /// A node index; the node's level is one below its parent's. Below a
+    /// level-5 node it is a chunk id.
     Node(u32),
+    /// The content is not loaded (only at [`CHUNK_LEVEL`] and above).
+    NotResident,
 }
 
 impl Child {
@@ -168,7 +191,9 @@ impl Child {
 
     /// Decodes a stored child word. Stored words are never air.
     pub const fn from_word(word: u32) -> Self {
-        if word & UNIFORM_BIT != 0 {
+        if word == NOT_RESIDENT {
+            Self::NotResident
+        } else if word & UNIFORM_BIT != 0 {
             Self::Uniform(MaterialId(word as u16))
         } else {
             Self::Node(word)
@@ -190,6 +215,7 @@ impl Child {
                 );
                 Some(index)
             }
+            Self::NotResident => Some(NOT_RESIDENT),
         }
     }
 }
@@ -276,6 +302,8 @@ pub(crate) enum Packed<const N: usize> {
     Filled(MaterialId),
     /// Mixed content that needs a node.
     Node(PackedNode<N>),
+    /// Every child is not resident: the node is not needed either.
+    NotResident,
 }
 
 #[cfg(test)]
@@ -290,6 +318,7 @@ mod tests {
             Child::Uniform(MaterialId(u16::MAX)),
             Child::Node(0),
             Child::Node(MAX_NODES - 1),
+            Child::NotResident,
         ] {
             assert_eq!(Child::from_word(child.word().unwrap()), child);
         }

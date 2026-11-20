@@ -78,16 +78,6 @@ impl Storage {
         }
     }
 
-    /// Every node page in order; page `i` holds nodes from `i * NODE_PAGE_LEN`.
-    pub fn node_pages(&self) -> impl Iterator<Item = &[Node]> {
-        self.nodes.pages()
-    }
-
-    /// Every word page in order; page `i` holds words from `i * WORD_PAGE_LEN`.
-    pub fn word_pages(&self) -> impl Iterator<Item = &[u32]> {
-        self.words.pages()
-    }
-
     /// Whether both hold the very same page directories: nothing was written
     /// or added between them.
     #[cfg(test)]
@@ -130,7 +120,7 @@ impl<'a> StorageReader<'a> {
 }
 
 /// The writer's arenas: storage plus free lists and live counts.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Store {
     storage: Storage,
     nodes: NodeSlots,
@@ -208,6 +198,7 @@ impl Store {
             words: self.blocks.live_words(),
             free_nodes: self.nodes.free_count(),
             free_words: self.blocks.free_words(),
+            chunks: 0,
             bytes: self.storage.nodes.page_count() * NODE_PAGE_LEN * size_of::<Node>()
                 + self.storage.words.page_count() * WORD_PAGE_LEN * size_of::<u32>(),
         }

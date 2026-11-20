@@ -62,12 +62,14 @@ fn report(name: &str, tree: &VoxelTree, unit: u64) {
         free_nodes,
         free_words,
         bytes,
+        chunks,
     } = tree.stats();
     let nodes = branches + leaves;
     let per = |n: usize| n as f64 / unit as f64;
     let live_bytes = nodes * 16 + words * 4;
     let ratio = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     println!("memory: {name}");
+    println!("  chunks          {chunks}");
     println!(
         "  bytes held {bytes} ({:.2} MiB), live {live_bytes} ({:.2} MiB, nodes x16 + words x4)",
         bytes as f64 / (1 << 20) as f64,
