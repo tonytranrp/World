@@ -3,9 +3,10 @@
 //! coarse tier and the threaded pool (decision 0006).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use world_core::consts::VOXELS_PER_METER;
-use world_core::serialize::wal::read_log;
+use world_core::serialize::wal::{WalRecord, WalWriter, read_log};
 use world_core::{Edit, MaterialId, VoxelBox, VoxelPos};
 use world_gen::TerrainConfig;
 
@@ -176,6 +177,10 @@ fn edits_survive_a_crash_through_the_log() {
     let above = VoxelPos::new(eye.x + 3, eye.y + 67, eye.z + 3);
     assert_eq!(world.snapshot().get(above), MaterialId(1));
     assert_eq!(world.stats().pending_chunks, 0);
+    assert!(
+        world.stats().edited >= 1,
+        "edits applied from the log are not on disk, so their chunks must be saved"
+    );
     let _ = cube;
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -284,8 +289,9 @@ fn an_overlay_from_another_generator_version_is_refused() {
         generator: 99,
         bytes: vec![1, 2, 3],
     }];
-    let loaded = jobs::load(world.generator(), 1, coord, None, &saved);
-    assert!(!loaded.edited, "the generated chunk stands in");
+    let generators = jobs::Generators::new(Arc::new(world.generator().clone()));
+    let loaded = jobs::load(&generators, coord, None, &saved);
+    assert!(loaded.refused, "the generated chunk stands in");
     assert!(loaded.error.unwrap().contains("version 99"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -394,5 +400,368 @@ fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
     }
     let stats = cache.stats();
     assert!(stats.bricks > 1000, "{stats:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The lowest voxel of the chunk holding `eye`, which every plan loads.
+fn eye_chunk_min(eye: VoxelPos) -> VoxelPos {
+    world_gen::ChunkCoord::containing(eye).unwrap().min_voxel()
+}
+
+#[test]
+fn destruction_shows_from_afar_once_its_chunk_is_written() {
+    let dir = temp_dir("coarse_edit");
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            full_radius_m: 24.0,
+            evict_radius_m: 32.0,
+            coarse_radius_m: 64.0,
+            coarse_cell_level: 2,
+            ..config(0)
+        },
+    );
+    let eye = eye_at(&world, 6000, -6000);
+    settle(&mut world, eye);
+    for _ in 0..30 {
+        world.update(eye);
+    }
+    // A 1 m cube 2.5 m under the ground, aligned to coarse cells.
+    let ground = world.generator().column(eye.x, eye.z).unwrap().height;
+    let min = VoxelPos::new(eye.x & !63, (ground - 160) & !63, eye.z & !63);
+    let centre = VoxelPos::new(min.x + 32, min.y + 32, min.z + 32);
+    assert!(
+        !world.coarse_snapshot().get(centre).is_air(),
+        "the generated coarse terrain is solid there"
+    );
+    assert!(world.snapshot().lookup(centre).is_some(), "loaded");
+    world
+        .fill_box(VoxelBox::from_min_size(min, [64; 3]), MaterialId::AIR)
+        .unwrap();
+    assert!(world.render_snapshot().get(centre).is_air());
+
+    // 56 m away the chunk is evicted and written, and the coarse ring
+    // shows its new summary instead of the generated one.
+    let away = eye_at(&world, eye.x + 56 * 64, eye.z);
+    settle(&mut world, away);
+    for _ in 0..10 {
+        world.update(away);
+    }
+    assert_eq!(world.snapshot().lookup(centre), None, "evicted");
+    assert!(world.stats().saved_chunks >= 1);
+    assert!(
+        world.coarse_snapshot().get(centre).is_air(),
+        "the coarse chunk is the saved summary"
+    );
+    assert!(
+        world.render_snapshot().get(centre).is_air(),
+        "the render tree draws the hole from afar"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_overlay_from_an_older_generator_keeps_its_edits() {
+    use super::jobs::{self, Generators};
+    use super::store::RegionStore;
+    use world_core::VoxelTree;
+    use world_core::serialize::content_hash;
+    use world_core::serialize::region::RecordKind;
+    use world_core::tree::ChunkData;
+    use world_gen::{ChunkCoord, Generator, GeneratorVersion};
+
+    let terrain = TerrainConfig::default();
+    let seed = ResidencyConfig::default().seed;
+    let v1 = Arc::new(Generator::new(seed, GeneratorVersion::V1, terrain.clone()).unwrap());
+    let v2 = Arc::new(Generator::new(seed, GeneratorVersion::V2, terrain).unwrap());
+    let old = Generators::new(Arc::clone(&v1));
+    let now = Generators::new(Arc::clone(&v2));
+    let tree_of = |coord: ChunkCoord, data: ChunkData| {
+        let mut tree = VoxelTree::unloaded();
+        tree.insert_chunk(coord.min_voxel(), data).unwrap();
+        tree
+    };
+    // A chunk as version 1 made it, then edited.
+    let edited_v1 = |coord: ChunkCoord, edits: &[Edit]| {
+        let mut tree = tree_of(coord, jobs::generate(&v1, coord));
+        tree.apply(edits).unwrap();
+        tree
+    };
+
+    // Deep down, where caves make the versions differ, the overlay is merged
+    // onto the version 1 base.
+    let (x, z) = (-4000, 9000);
+    let ground = v2.column(x, z).unwrap().height;
+    let mut checked = false;
+    for depth_m in [24, 40, 56, 72, 88, 104, 120] {
+        let p = VoxelPos::new(x, ground - depth_m * VOXELS_PER_METER as i32, z);
+        let coord = ChunkCoord::containing(p).unwrap();
+        let a = content_hash(&tree_of(coord, jobs::generate(&v1, coord)));
+        let b = content_hash(&tree_of(coord, jobs::generate(&v2, coord)));
+        if a == b {
+            continue;
+        }
+        let expected = edited_v1(coord, &[Edit::new(p, MaterialId(3))]);
+        let data = expected.chunk_data(coord.min_voxel()).unwrap();
+        let records = jobs::encode_chunk(&old, coord, data, 2).records;
+        assert_eq!(
+            (records[0].kind, records[0].generator),
+            (RecordKind::Overlay, 1)
+        );
+        let loaded = jobs::load(&now, coord, None, &records[..1]);
+        assert!(!loaded.refused, "{:?}", loaded.error);
+        assert_eq!(
+            content_hash(&tree_of(coord, loaded.data)),
+            content_hash(&expected)
+        );
+        checked = true;
+        break;
+    }
+    assert!(checked, "no chunk where the versions differ");
+
+    // In the world: the old overlay's edit loads, and editing the chunk again
+    // keeps it.
+    let dir = temp_dir("old_version");
+    let world = open(&dir, config(0));
+    let eye = eye_at(&world, x, z);
+    drop(world);
+    let coord = ChunkCoord::containing(eye).unwrap();
+    let cmin = coord.min_voxel();
+    let first = VoxelPos::new(cmin.x + 5, cmin.y + 5, cmin.z + 5);
+    assert_ne!(v1.material(first).unwrap(), MaterialId(3));
+    let expected = edited_v1(coord, &[Edit::new(first, MaterialId(3))]);
+    let records = jobs::encode_chunk(&old, coord, expected.chunk_data(cmin).unwrap(), 2).records;
+    RegionStore::open(&dir)
+        .unwrap()
+        .write(coord, records)
+        .unwrap();
+
+    let mut world = open(&dir, config(0));
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(first), MaterialId(3), "the old edit");
+    assert!(world.take_errors().is_empty());
+    assert_eq!(world.stats().edited, 0, "loaded as saved");
+    let second = VoxelPos::new(cmin.x + 9, cmin.y + 9, cmin.z + 9);
+    world.apply(&[Edit::new(second, MaterialId(4))]).unwrap();
+    world.save_all().unwrap();
+    drop(world);
+
+    let mut world = open(&dir, config(0));
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(first), MaterialId(3), "kept");
+    assert_eq!(world.snapshot().get(second), MaterialId(4));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_refused_record_is_set_aside_before_its_chunk_is_written() {
+    use super::store::{RegionStore, SavedChunk};
+    use world_core::serialize::region::RecordKind;
+    let dir = temp_dir("set_aside");
+    let world = open(&dir, config(0));
+    let eye = eye_at(&world, 7000, 7000);
+    drop(world);
+    let coord = world_gen::ChunkCoord::containing(eye).unwrap();
+    let record = SavedChunk {
+        kind: RecordKind::Overlay,
+        generator: 99,
+        bytes: vec![7; 64],
+    };
+    let store = RegionStore::open(&dir).unwrap();
+    store.write(coord, vec![record.clone()]).unwrap();
+
+    let mut world = open(&dir, config(0));
+    settle(&mut world, eye);
+    let errors = world.take_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("version 99")),
+        "{errors:?}"
+    );
+    let target = VoxelPos::new(eye.x, eye.y + 30, eye.z);
+    world.apply(&[Edit::new(target, MaterialId(3))]).unwrap();
+    world.save_all().unwrap();
+
+    let aside: Vec<PathBuf> = std::fs::read_dir(store.set_aside_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    let name = aside[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.contains("overlay.v99"), "{name}");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), record.bytes);
+    drop(world);
+
+    let mut world = open(&dir, config(0));
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(target), MaterialId(3));
+    assert!(world.take_errors().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn chunks_are_written_only_when_they_change() {
+    let dir = temp_dir("amplification");
+    let mut world = open(&dir, config(0));
+    let eye = eye_at(&world, -1500, 4500);
+    settle(&mut world, eye);
+    let target = VoxelPos::new(eye.x, eye.y + 30, eye.z);
+    world.apply(&[Edit::new(target, MaterialId(3))]).unwrap();
+    let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    settle(&mut world, away);
+    let writes = world.stats().writes;
+    assert!(writes >= 1);
+
+    // Back from the warm cache and away again: nothing changed, nothing is
+    // written.
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(target), MaterialId(3));
+    assert_eq!(world.stats().edited, 0);
+    settle(&mut world, away);
+    assert_eq!(world.stats().writes, writes);
+
+    // The same from the region file in a new session.
+    drop(world);
+    let mut world = open(&dir, config(0));
+    settle(&mut world, eye);
+    assert_eq!(world.snapshot().get(target), MaterialId(3));
+    assert_eq!(world.stats().edited, 0);
+    // Rewriting a voxel with its own material changes nothing either.
+    world.apply(&[Edit::new(target, MaterialId(3))]).unwrap();
+    assert_eq!(world.stats().edited, 0);
+    settle(&mut world, away);
+    assert_eq!(world.stats().writes, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_large_log_is_folded_into_region_files_at_a_checkpoint() {
+    let dir = temp_dir("checkpoint");
+    let cfg = ResidencyConfig {
+        log_checkpoint_kib: 64,
+        ..config(0)
+    };
+    let far = VoxelPos::new(100_000, 0, -100_000);
+    let (eye, block, late, far_edit);
+    {
+        let mut world = open(&dir, cfg.clone());
+        eye = eye_at(&world, 2500, 2500);
+        settle(&mut world, eye);
+        let ground = world.generator().column(far.x, far.z).unwrap().height;
+        far_edit = Edit::new(VoxelPos::new(far.x, ground - 1, far.z), MaterialId(3));
+        world.apply(&[far_edit]).unwrap();
+        // 5200 edits, about 73 KiB of log, in the player's own chunk.
+        let cmin = eye_chunk_min(eye);
+        block = VoxelBox::from_min_size(cmin, [20, 13, 20]);
+        let mut edits = Vec::new();
+        for z in 0..20 {
+            for y in 0..13 {
+                for x in 0..20 {
+                    let p = VoxelPos::new(cmin.x + x, cmin.y + y, cmin.z + z);
+                    edits.push(Edit::new(p, MaterialId(5)));
+                }
+            }
+        }
+        world.apply(&edits).unwrap();
+        world.update(eye);
+        assert!(world.stats().saving >= 1, "the checkpoint writes the chunk");
+        // An edit while the checkpoint runs stays in the log.
+        late = Edit::new(
+            VoxelPos::new(cmin.x + 30, cmin.y + 30, cmin.z + 30),
+            MaterialId(6),
+        );
+        world.apply(&[late]).unwrap();
+        world.update(eye);
+        let s = world.stats();
+        assert_eq!(s.checkpoints, 1, "{s:?}");
+        assert!(s.log_bytes < 1024, "{s:?}");
+        // Then the process "crashes" (no save).
+    }
+    let log = std::fs::read(dir.join("edits.wvl")).unwrap();
+    assert_eq!(
+        read_log(&log).unwrap().0,
+        vec![
+            WalRecord::Checkpoint(1),
+            WalRecord::Edits(vec![far_edit]),
+            WalRecord::Edits(vec![late]),
+        ],
+        "the checkpoint, the edit waiting for its chunk, and the late edit"
+    );
+
+    let mut world = open(&dir, cfg);
+    assert_eq!(world.stats().pending_chunks, 2);
+    settle(&mut world, eye);
+    let snapshot = world.snapshot();
+    assert_eq!(
+        snapshot.get(block.min()),
+        MaterialId(5),
+        "from the region file"
+    );
+    assert_eq!(snapshot.get(late.pos), MaterialId(6), "from the log");
+    assert_eq!(world.stats().pending_chunks, 1, "the far edit still waits");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn replay_starts_at_the_last_checkpoint() {
+    let dir = temp_dir("replay_checkpoint");
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let (mut wal, _) = WalWriter::open(&dir.join("edits.wvl")).unwrap();
+        let a = Edit::new(VoxelPos::new(100_000, 0, -100_000), MaterialId(3));
+        let b = Edit::new(VoxelPos::new(-100_000, 0, 100_000), MaterialId(3));
+        wal.append(&WalRecord::Edits(vec![a])).unwrap();
+        wal.append(&WalRecord::Checkpoint(7)).unwrap();
+        wal.append(&WalRecord::Edits(vec![b])).unwrap();
+        wal.sync().unwrap();
+    }
+    let world = open(&dir, config(0));
+    assert_eq!(
+        world.stats().pending_chunks,
+        1,
+        "the edit before the checkpoint is in region files already"
+    );
+    drop(world);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_hot_total_is_kept_without_walking_the_tree() {
+    let dir = temp_dir("hot_bytes");
+    let mut world = open(&dir, config(0));
+    let eye = eye_at(&world, 4000, -2000);
+    settle(&mut world, eye);
+    let s = world.stats();
+    assert!(s.hot_bytes > 0);
+    assert_eq!(s.hot_bytes, world.hot_bytes_walked());
+
+    // Edits change it.
+    let cmin = eye_chunk_min(eye);
+    world
+        .fill_box(VoxelBox::from_min_size(cmin, [100, 3, 100]), MaterialId(4))
+        .unwrap();
+    let target = ground_below(&world, eye);
+    dig(&mut world, target);
+    assert_eq!(world.stats().hot_bytes, world.hot_bytes_walked());
+
+    // An evicted chunk waiting for its write still counts toward the cap.
+    let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    world.update(away);
+    let s = world.stats();
+    assert!(s.saving >= 1 && s.saving_bytes > 0, "{s:?}");
+    assert_eq!(s.hot_bytes, world.hot_bytes_walked());
+    assert_eq!(world.hot_bytes_counted(), s.hot_bytes + s.saving_bytes);
+    settle(&mut world, away);
+    assert_eq!(world.stats().saving_bytes, 0);
+
+    // A step aside leaves chunks between the full and the evict radius;
+    // over the cap they go.
+    let aside = eye_at(&world, away.x + 6 * 64, away.z);
+    settle(&mut world, aside);
+    let sphere = super::plan::sphere(aside, 16.0).len();
+    assert!(world.stats().loaded > sphere, "{:?}", world.stats());
+    world.config_mut().hot_cap_mib = 0;
+    world.update(aside);
+    assert_eq!(world.stats().loaded, sphere);
+    assert_eq!(world.stats().hot_bytes, world.hot_bytes_walked());
     std::fs::remove_dir_all(&dir).unwrap();
 }
