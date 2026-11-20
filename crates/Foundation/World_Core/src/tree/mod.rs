@@ -47,7 +47,7 @@ pub use read::{
 };
 
 use alloc::Storage;
-use forest::{ChunkTable, Forest};
+use forest::{ChunkKeys, ChunkTable, Forest};
 pub(crate) use mutate::Builder;
 use mutate::{LocalBox, LocalEdit};
 use node::{Child, path_key};
@@ -280,6 +280,7 @@ impl VoxelTree {
         TreeSnapshot {
             top: self.forest.top.storage().clone(),
             chunks: self.forest.snapshot_chunks(),
+            keys: self.forest.chunk_keys().clone(),
             root: self.root,
         }
     }
@@ -331,6 +332,7 @@ impl VoxelTree {
         TreeView {
             top: self.forest.top.storage(),
             chunks: self.forest.chunk_slice(),
+            keys: self.forest.chunk_keys(),
             root: self.root,
         }
     }
@@ -381,6 +383,7 @@ impl fmt::Debug for VoxelTree {
 pub struct TreeSnapshot {
     top: Storage,
     chunks: ChunkTable,
+    keys: ChunkKeys,
     root: Child,
 }
 
@@ -416,6 +419,7 @@ impl TreeSnapshot {
         TreeView {
             top: &self.top,
             chunks: self.chunks.as_slice(),
+            keys: &self.keys,
             root: self.root,
         }
     }

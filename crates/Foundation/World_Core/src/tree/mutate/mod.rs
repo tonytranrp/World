@@ -32,7 +32,7 @@ use super::ROOT_LEVEL;
 use super::alloc::Store;
 use std::sync::Arc;
 
-use super::forest::{Chunk, Forest};
+use super::forest::{Chunk, Forest, chunk_key};
 use super::node::{CHUNK_LEVEL, Child, Node, Packed};
 use crate::consts::TREE_DEPTH;
 use crate::material::MaterialId;
@@ -136,7 +136,8 @@ impl Writer<'_> {
         level == CHUNK_LEVEL && self.chunk.is_none()
     }
 
-    /// Runs `write` on the chunk-level child `child` inside its chunk, with
+    /// Runs `write` on the chunk-level child `child`, holding world-local
+    /// `at`, inside its chunk, with
     /// the child as the chunk's store sees it. An air or uniform child gets a
     /// new chunk, which is dropped again unless the write leaves mixed
     /// content. A result of air, one material or not resident drops the
@@ -144,6 +145,7 @@ impl Writer<'_> {
     fn in_chunk(
         &mut self,
         child: Child,
+        at: [u32; 3],
         write: impl FnOnce(&mut Self, Child) -> Option<Child>,
     ) -> Option<Child> {
         debug_assert!(self.at_chunk_boundary(CHUNK_LEVEL));
@@ -176,6 +178,7 @@ impl Writer<'_> {
                 c.root = root;
                 c.generation = generation;
                 self.forest.check_in(id, chunk);
+                self.forest.link(id, chunk_key(at));
                 Some(Child::Node(id))
             }
             Some(other) => {

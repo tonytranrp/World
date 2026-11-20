@@ -10,7 +10,8 @@
 use super::Writer;
 use super::branch::{self, Children};
 use super::brick::{self, Records};
-use crate::tree::forest::Forest;
+use crate::tree::forest::{Forest, chunk_key};
+use crate::tree::node::CHUNK_LEVEL;
 use crate::tree::node::leaf::{self, Record, Voxels};
 use crate::tree::node::{Child, slot_at};
 
@@ -71,6 +72,16 @@ impl<'a> Builder<'a> {
     /// Closes the open chunk, whose content is `root`, and returns the child
     /// its parent holds: the chunk id, or `root` itself when it is air, one
     /// material or not resident, in which case the chunk is dropped.
+    /// [`end_chunk`](Self::end_chunk) for a chunk at world-local `origin`,
+    /// which the chunk index learns.
+    pub fn end_chunk_at(&mut self, root: Child, origin: [u32; 3]) -> Child {
+        let child = self.end_chunk(root);
+        if let Child::Node(id) = child {
+            self.writer.forest.link(id, chunk_key(origin));
+        }
+        child
+    }
+
     pub fn end_chunk(&mut self, root: Child) -> Child {
         debug_assert!(self.writer.chunk.is_some(), "end_chunk without begin_chunk");
         let Some(id) = self.writer.chunk.take() else {
@@ -147,13 +158,20 @@ impl Writer<'_> {
             };
             let new = make(&mut builder);
             self.held = builder.writer.held.take();
+            // A chunk placed at the chunk level from the top sits at `target`.
+            if level == CHUNK_LEVEL
+                && self.chunk.is_none()
+                && let Child::Node(id) = new
+            {
+                self.forest.link(id, chunk_key(target));
+            }
             // A freed node may come back with the same index, so only a
             // filled child that stays the same is "no change".
             let same = new == child && !matches!(child, Child::Node(_));
             return (!same).then_some(new);
         }
         if self.at_chunk_boundary(level) {
-            return self.in_chunk(child, |w, local| {
+            return self.in_chunk(child, target, |w, local| {
                 w.graft(local, level, target_level, target, make)
             });
         }

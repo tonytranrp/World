@@ -230,3 +230,67 @@ fn chunks_move_between_trees_without_copying() {
     assert_eq!(target.get(VoxelPos::new(500, 500, 500)), MaterialId(5));
     assert_eq!(target.stats().chunks, 0);
 }
+
+/// Point reads go straight to a chunk through the chunk index; whatever
+/// happens to chunks (moved to another tree and position, unloaded, made
+/// uniform, recreated, kept by a snapshot), every read still agrees with a
+/// cursor walk from the root, which never uses the index.
+#[test]
+fn reads_through_the_chunk_index_stay_exact_as_chunks_move_and_go() {
+    const C: i32 = 1024;
+    let probe = |tree: &world_core::TreeSnapshot, label: &str| {
+        let mut cursor = tree.cursor();
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                for (dx, dy, dz) in [(1, 2, 3), (500, 7, 900), (1023, 0, 1023), (10, 63, 20)] {
+                    let p = VoxelPos::new(cx * C + dx, dy, cz * C + dz);
+                    assert_eq!(tree.lookup(p), cursor.lookup(p), "{label} at {p:?}");
+                }
+            }
+        }
+    };
+    let mut tree = VoxelTree::new();
+    for cx in -1..=1 {
+        for cz in -1..=1 {
+            for (dx, dz) in [(1, 3), (500, 900), (10, 20)] {
+                let m = MaterialId((cx + 2 + 3 * (cz + 1)) as u16);
+                tree.set(VoxelPos::new(cx * C + dx, 2, cz * C + dz), m)
+                    .unwrap();
+                tree.set(VoxelPos::new(cx * C + dx, 63, cz * C + dz), m)
+                    .unwrap();
+            }
+        }
+    }
+    let before = tree.snapshot();
+    probe(&before, "built");
+
+    // Move a chunk to another tree at another position.
+    let data = tree.take_chunk(VoxelPos::new(C, 0, 0)).unwrap();
+    probe(&tree.snapshot(), "after take");
+    let mut other = VoxelTree::new();
+    other.insert_chunk(VoxelPos::new(-C, 0, -C), data).unwrap();
+    probe(&other.snapshot(), "moved");
+    assert_eq!(
+        other.get(VoxelPos::new(-C + 1, 2, -C + 3)),
+        before.get(VoxelPos::new(C + 1, 2, 3))
+    );
+
+    // Make a chunk uniform, then mixed again; unload one.
+    let c = VoxelPos::new(0, 0, 0);
+    tree.fill_box(
+        world_core::VoxelBox::from_min_size(c, [1024; 3]),
+        MaterialId(9),
+    )
+    .unwrap();
+    probe(&tree.snapshot(), "made uniform");
+    tree.set(VoxelPos::new(5, 5, 5), MaterialId(1)).unwrap();
+    probe(&tree.snapshot(), "mixed again");
+    tree.unload(CHUNK_LEVEL, VoxelPos::new(-C, 0, 0)).unwrap();
+    let after = tree.snapshot();
+    probe(&after, "unloaded");
+    assert_eq!(after.lookup(VoxelPos::new(-C + 1, 2, 3)), None);
+
+    // The snapshot taken first still reads what it saw.
+    probe(&before, "old snapshot");
+    assert_eq!(before.get(VoxelPos::new(5, 5, 5)), MaterialId::AIR);
+}

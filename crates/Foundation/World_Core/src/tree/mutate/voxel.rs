@@ -34,7 +34,9 @@ impl Writer<'_> {
             return None;
         }
         if self.at_chunk_boundary(level) {
-            return self.in_chunk(child, |w, local| w.set_voxels(local, level, edits, changed));
+            return self.in_chunk(child, edits[0].local, |w, local| {
+                w.set_voxels(local, level, edits, changed)
+            });
         }
         if level == 1 {
             return self.set_leaves(child, edits, changed);

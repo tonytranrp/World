@@ -18,10 +18,13 @@
 //! Chunk ids are recycled last-in, first-out, so the same operations always
 //! give the same ids.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use super::TreeStats;
 use super::alloc::{Storage, Store};
+use super::node::CHUNK_LEVEL;
 
 /// One chunk's arenas and the index of its root node in them.
 #[derive(Clone)]
@@ -36,6 +39,91 @@ pub(crate) struct Chunk {
 /// The live chunks by id, as the tree and its snapshots share them.
 pub(crate) type ChunkTable = Arc<Vec<Option<Arc<Chunk>>>>;
 
+/// Hashes a chunk key (30 bits) with one multiplication.
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.0 = u64::from(v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Chunk ids by chunk key, for lookups that go straight to a chunk.
+pub(crate) type ChunkIndex = HashMap<u32, u32, BuildHasherDefault<KeyHasher>>;
+
+/// A chunk id's key when it has none (not known, or the id is free).
+pub(crate) const NO_KEY: u32 = u32::MAX;
+
+/// The key of the chunk holding world-local `local`: its chunk coordinate,
+/// ten bits per axis.
+#[inline]
+pub(crate) const fn chunk_key(local: [u32; 3]) -> u32 {
+    let shift = 2 * (CHUNK_LEVEL + 1);
+    (local[0] >> shift) | (local[1] >> shift) << 10 | (local[2] >> shift) << 20
+}
+
+const _: () = assert!(
+    crate::consts::WORLD_SIZE_VOXELS >> (2 * (CHUNK_LEVEL + 1)) <= 1 << 10,
+    "a chunk coordinate fits ten bits per axis"
+);
+
+/// Where each live chunk sits, for readers: chunk key to id, and id to key.
+/// A hit counts only when the id is live and its key matches, so a stale or
+/// missing entry costs a walk from the root and never a wrong answer. Every
+/// live chunk is linked at exactly one place, and a chunk is only freed, never
+/// moved, so a matching key names that place.
+#[derive(Clone, Default)]
+pub(crate) struct ChunkKeys {
+    pub index: Arc<ChunkIndex>,
+    pub keys: Arc<Vec<u32>>,
+}
+
+impl ChunkKeys {
+    /// The chunk id at `key`, if the index knows it.
+    #[inline]
+    pub fn get(&self, key: u32) -> Option<u32> {
+        let id = *self.index.get(&key)?;
+        (self.keys.get(id as usize) == Some(&key)).then_some(id)
+    }
+
+    fn link(&mut self, id: u32, key: u32) {
+        let keys = Arc::make_mut(&mut self.keys);
+        if keys.len() <= id as usize {
+            keys.resize(id as usize + 1, NO_KEY);
+        }
+        if keys[id as usize] == key {
+            return;
+        }
+        keys[id as usize] = key;
+        Arc::make_mut(&mut self.index).insert(key, id);
+    }
+
+    fn unlink(&mut self, id: u32) {
+        let Some(&key) = self.keys.get(id as usize) else {
+            return;
+        };
+        if key == NO_KEY {
+            return;
+        }
+        Arc::make_mut(&mut self.keys)[id as usize] = NO_KEY;
+        let index = Arc::make_mut(&mut self.index);
+        if index.get(&key) == Some(&id) {
+            index.remove(&key);
+        }
+    }
+}
+
 /// The writer's storage: the top store and the live chunks.
 #[derive(Default)]
 pub(crate) struct Forest {
@@ -43,6 +131,7 @@ pub(crate) struct Forest {
     chunks: ChunkTable,
     free: Vec<u32>,
     generation: u64,
+    keys: ChunkKeys,
 }
 
 impl Forest {
@@ -95,7 +184,18 @@ impl Forest {
     /// Drops a chunk and everything in it.
     pub fn free_chunk(&mut self, id: u32) {
         Arc::make_mut(&mut self.chunks)[id as usize] = None;
+        self.keys.unlink(id);
         self.free.push(id);
+    }
+
+    /// Records that chunk `id` now sits at chunk key `key` in the tree.
+    pub fn link(&mut self, id: u32, key: u32) {
+        self.keys.link(id, key);
+    }
+
+    /// The chunk index, for readers and snapshots.
+    pub fn chunk_keys(&self) -> &ChunkKeys {
+        &self.keys
     }
 
     /// A live chunk. Panics on a free id, which no stored word holds.

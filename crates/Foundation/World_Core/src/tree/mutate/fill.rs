@@ -85,7 +85,7 @@ impl Writer<'_> {
             return Some(target);
         }
         if self.at_chunk_boundary(level) {
-            return self.in_chunk(child, |w, local| {
+            return self.in_chunk(child, origin, |w, local| {
                 w.fill(local, level, origin, region, material)
             });
         }

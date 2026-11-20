@@ -46,7 +46,7 @@ pub(crate) fn child(
     if builder.enters_chunk(level) {
         builder.begin_chunk();
         let root = mixed(builder, source, level, origin);
-        return builder.end_chunk(root);
+        return builder.end_chunk_at(root, origin);
     }
     mixed(builder, source, level, origin)
 }

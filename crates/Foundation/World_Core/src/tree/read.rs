@@ -15,7 +15,7 @@
 use std::fmt;
 
 use super::alloc::{Storage, StorageReader};
-use super::forest::{Chunks, chunk_root};
+use super::forest::{ChunkKeys, Chunks, chunk_key, chunk_root};
 use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
 use super::node::{
@@ -560,6 +560,7 @@ impl fmt::Debug for LeafRef<'_> {
 pub(crate) struct TreeView<'a> {
     pub top: &'a Storage,
     pub chunks: &'a Chunks,
+    pub keys: &'a ChunkKeys,
     pub root: Child,
 }
 
@@ -588,9 +589,14 @@ impl<'a> TreeView<'a> {
             Child::NotResident => return None,
             Child::Node(index) => index,
         };
+        // A chunk the index knows: straight in, skipping the top levels.
+        let mut level = ROOT_LEVEL;
+        if let Some(id) = self.indexed_chunk(local) {
+            level = CHUNK_LEVEL;
+            index = id;
+        }
         // Above the chunk level, where words may be not resident.
         let mut storage = self.top.reader();
-        let mut level = ROOT_LEVEL;
         while level > CHUNK_LEVEL {
             match step::<true, false>(&mut storage, index, level, local) {
                 Step::Filled(m) => return Some(m),
@@ -622,6 +628,14 @@ impl<'a> TreeView<'a> {
         }
     }
 
+    /// The live chunk holding world-local `local`, when the chunk index
+    /// knows it.
+    #[inline(always)]
+    fn indexed_chunk(self, local: [u32; 3]) -> Option<u32> {
+        let id = self.keys.get(chunk_key(local))?;
+        matches!(self.chunks.get(id as usize), Some(Some(_))).then_some(id)
+    }
+
     /// The chunk id stored at the chunk-level position holding world-local
     /// `local`, if that region is a chunk (mixed and resident).
     pub fn chunk_id(self, local: [u32; 3]) -> Option<u32> {
@@ -646,6 +660,9 @@ impl<'a> TreeView<'a> {
     /// Whether the region holding world-local `local` is loaded. Walks the
     /// top levels only.
     pub fn resident(self, local: [u32; 3]) -> bool {
+        if self.indexed_chunk(local).is_some() {
+            return true;
+        }
         let mut index = match self.root {
             Child::Node(index) => index,
             Child::NotResident => return false,
