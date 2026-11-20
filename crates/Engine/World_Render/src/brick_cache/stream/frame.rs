@@ -187,8 +187,15 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
-    // Summaries and brick encoding run on up to this many threads.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
+    // Brick encoding and a replaced chunk's summaries are split into up to
+    // this many tasks on Bevy's compute task pool.
+    let threads = bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default)
+        .thread_num()
+        .clamp(1, 8);
+    let summary_tasks = match input.config.summary_threads {
+        0 => threads,
+        n => n as usize,
+    };
 
     // Changes first: changed bricks and replaced chunks, nearest first,
     // while their summaries fit the budget; the rest wait.
@@ -216,7 +223,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
             source,
             input.view.map(|v| v.eye),
             u64::from(input.config.max_summaries_per_frame),
-            threads,
+            summary_tasks,
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {

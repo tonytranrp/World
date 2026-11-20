@@ -102,9 +102,12 @@ and tests stay deterministic.
 - **Collapsed and replaced subtrees are freed under
   `max_frees_per_frame`** (16,384 records). A collapse or an applied
   chunk only takes the node's children out of the table into a
-  graveyard; their groups, bricks and descendants are freed that many a
-  frame, and nothing below the node is refined, loaded or evicted until
-  they are. A collapse counted against `max_collapses_per_frame` could
+  graveyard; their groups, bricks and descendants are freed oldest first,
+  that many entries freed or taken out of the table a frame (at most 64
+  more), and nothing below the node is refined, loaded, collapsed or
+  evicted until they are; freeing the last of them starts a new growth
+  pass, since stage 1 skipped that subtree. A collapse counted against
+  `max_collapses_per_frame` could
   still free a whole refined region: on a long 8 m/s walk one frame
   applied five chunks that held 236,000 records (58 ms) during a pressure
   change. An edit below such a node waits until its old entries are
@@ -155,7 +158,10 @@ and tests stay deterministic.
   175 and 21 to 35 holes on average, against 151 to 167 and 11 to 30,
   likely because faster frames take more CPU time from the generation
   workers.
-- **A replaced chunk's grandchildren are summarized on up to 8 threads**,
+- **A replaced chunk's grandchildren are summarized in up to 8 tasks**
+  on Bevy's compute task pool (`summary_threads`, 0 for one per pool
+  thread; no threads are spawned, and a panic in a task is raised again),
+  only for level-4 chunks, whose grandchildren are level-2 nodes,
   as many as the budget allows, counted exactly before any is computed
   (one summary for each grandchild and one for each of its mixed
   children); the summaries are a pure function of the snapshot, so the

@@ -543,6 +543,11 @@ pub fn select_split(
         let Some(node) = res.node_state(key) else {
             continue;
         };
+        // The walk may have queued it before a burial took it out of the
+        // tree; the graveyard frees it.
+        if res.in_buried(key) {
+            continue;
+        }
         let px = projected_pixels(shape.origin, key, view);
         let scale = if key.level >= 2 { pressure } else { 1.0 };
         let keep = px >= lod.detail_pixels * scale * lod.hysteresis;

@@ -22,6 +22,7 @@
 //!   brick id, and each entry's child masks match its children's entries.
 
 use bevy::platform::collections::{HashMap, HashSet};
+use bevy::tasks::{ComputeTaskPool, TaskPool};
 use world_core::MaterialId;
 use world_core::tree::{NodeView, VoxelSource};
 
@@ -131,7 +132,7 @@ pub struct Residency {
     /// not freed yet, with the node they were taken from: freeing a large
     /// subtree is spread over frames (see [`free_buried`](Self::free_buried)).
     /// Their descendants stay in the table under their keys until freed.
-    graveyard: Vec<(NodeKey, NodeKey, Entry)>,
+    graveyard: std::collections::VecDeque<(NodeKey, NodeKey, Entry)>,
     /// The nodes with descendants still in the graveyard or below it, and
     /// how many graveyard entries each has left. Nothing below them is
     /// refined until they are freed.
@@ -220,7 +221,7 @@ impl Residency {
             pending_chunks: HashSet::default(),
             warming: HashMap::default(),
             summarized: 0,
-            graveyard: Vec::new(),
+            graveyard: std::collections::VecDeque::new(),
             burying: HashMap::default(),
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
             bricks: BrickSpace::new(&layout.segments, layout.allocs_per_segment),
@@ -883,6 +884,10 @@ impl Residency {
         if e.group.is_none() {
             return Err(Refused::AlreadyDone);
         }
+        // A leftover of a burial is freed by the graveyard, not here.
+        if self.in_buried(key) {
+            return Err(Refused::Waiting);
+        }
         self.bury_children(key);
         if let Some(g) = e.group {
             self.nodes.free(g);
@@ -908,21 +913,24 @@ impl Residency {
             kids &= kids - 1;
             let ck = key.child(slot);
             if let Some(ce) = self.remove_entry(ck) {
-                self.graveyard.push((key, ck, ce));
+                self.graveyard.push_back((key, ck, ce));
                 *self.burying.entry(key).or_default() += 1;
             }
         }
     }
 
-    /// Frees up to `max` buried entries (their groups and bricks), taking
-    /// their children out of the table into the graveyard in turn. Returns
-    /// how many were freed. A node is no longer burying once everything
-    /// below it is freed, and stage 1 then starts a new pass, since its
-    /// passes skipped what lies below it.
+    /// Frees buried entries (their groups and bricks), oldest first, taking
+    /// their children out of the table into the graveyard in turn, until
+    /// `max` entries were freed or taken out (at most 64 more). Returns how
+    /// many were freed. A node is no longer burying once everything below
+    /// it is freed, and stage 1 then starts a new pass, since its passes
+    /// skipped what lies below it.
     pub fn free_buried(&mut self, max: u32, batch: &mut UploadBatch) -> u32 {
         let mut freed = 0;
-        while freed < max {
-            let Some((tag, key, e)) = self.graveyard.pop() else {
+        let mut work = 0u32;
+        while work < max {
+            // Oldest first, so no burial waits behind newer ones.
+            let Some((tag, key, e)) = self.graveyard.pop_front() else {
                 break;
             };
             if let Some(g) = e.group {
@@ -933,8 +941,9 @@ impl Residency {
                     let ck = key.child(slot);
                     // Its parent left the table already: no masks to keep.
                     if let Some(ce) = self.entries.remove(&ck) {
-                        self.graveyard.push((tag, ck, ce));
+                        self.graveyard.push_back((tag, ck, ce));
                         *self.burying.entry(tag).or_default() += 1;
+                        work = work.saturating_add(1);
                     }
                 }
                 self.nodes.free(g);
@@ -951,6 +960,7 @@ impl Residency {
                 }
             }
             freed += 1;
+            work = work.saturating_add(1);
         }
         freed
     }
@@ -1113,6 +1123,9 @@ impl Residency {
         let Some(slot) = e.brick else {
             return Err(Refused::AlreadyDone);
         };
+        if self.in_buried(key) {
+            return Err(Refused::Waiting);
+        }
         let record = e.record.unlinked();
         self.set_brick(key, None);
         self.free_brick(slot, batch);
@@ -1189,6 +1202,13 @@ impl Residency {
     /// the chunk rebuilds everything below it. At least one change makes
     /// progress per call. The rest wait for the next call, and until then
     /// the records above them describe the content they had before.
+    ///
+    /// The budget can be exceeded by the last change it lets in: a chunk's
+    /// planned grandchildren stop once they reach it, so by at most one
+    /// grandchild (65 summaries), plus the children whose grandchildren
+    /// that completes (up to 64) and the chunk itself when it is applied;
+    /// a changed brick by its path (up to the tree's depth); and the path
+    /// rewrites that follow.
     ///
     /// A changed brick: `reupload` decides, in that order, which resident
     /// changed bricks are uploaded again (it gets the block bytes the brick
@@ -1488,12 +1508,32 @@ impl Residency {
         }
         let affected =
             |res: &Self, key: NodeKey| pending_paths.contains(&key) || res.in_waiting_chunk(key);
+        // The tree: what the root reaches through the entries' child masks.
+        // Everything else is a buried entry's descendant, out of the tree
+        // and freed under a budget.
+        let mut reachable: HashSet<NodeKey> = HashSet::default();
+        let mut stack = vec![self.shape.root()];
+        while let Some(key) = stack.pop() {
+            let Some(e) = self.entries.get(&key) else {
+                continue;
+            };
+            reachable.insert(key);
+            if e.group.is_some() {
+                let mut kids = e.kids;
+                while kids != 0 {
+                    let slot = kids.trailing_zeros();
+                    kids &= kids - 1;
+                    stack.push(key.child(slot));
+                }
+            }
+        }
         let mut keys = self.keys();
         keys.sort_unstable();
         for key in keys {
-            // Descendants of buried entries, freed under a budget: out of
-            // the tree already.
-            if self.in_buried(key) {
+            if !reachable.contains(&key) {
+                if !self.in_buried(key) {
+                    return Err(format!("{key:?}: out of the tree but not buried"));
+                }
                 continue;
             }
             let e = self.entries[&key];
@@ -1662,7 +1702,7 @@ fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
 
 /// The summaries of the level-2 nodes `keys` (only level 2: a uniform
 /// child weighs a level-1 node's volume) and of their mixed children,
-/// computed on up to `threads` scoped threads: for each node, its mixed
+/// computed in up to `threads` tasks: for each node, its mixed
 /// children's then its own, as [`Residency::summary`] computes them with
 /// nothing cached. Pure, so the result does not depend on the threads.
 fn summarize_level2<S: VoxelSource + Sync>(
@@ -1699,24 +1739,43 @@ fn summarize_level2<S: VoxelSource + Sync>(
         }
         out
     };
-    // A few nodes are not worth a thread.
-    if threads <= 1 || keys.len() < 8 {
-        return run(keys);
-    }
-    let per = keys.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = keys
-            .chunks(per)
-            .map(|chunk| scope.spawn(move || run(chunk)))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+    // A few nodes are not worth a task.
+    let tasks = if keys.len() < 8 { 1 } else { threads };
+    in_parallel(keys, tasks, run)
 }
 
-/// Encodes `jobs` (key, brick id, edited) on up to `threads` scoped threads,
+/// `run` over `items` split into up to `tasks` contiguous parts, on Bevy's
+/// compute task pool (no threads are spawned), the results concatenated in
+/// order. A panic in a part is raised again here.
+fn in_parallel<T: Sync, R: Send + 'static>(
+    items: &[T],
+    tasks: usize,
+    run: impl Fn(&[T]) -> Vec<R> + Sync,
+) -> Vec<R> {
+    if tasks <= 1 || items.len() <= 1 {
+        return run(items);
+    }
+    let per = items.len().div_ceil(tasks);
+    let pool = ComputeTaskPool::get_or_init(TaskPool::default);
+    let run = &run;
+    let parts = pool.scope(|scope| {
+        for part in items.chunks(per) {
+            scope.spawn(async move {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(part)))
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(items.len());
+    for part in parts {
+        match part {
+            Ok(results) => out.extend(results),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    out
+}
+
+/// Encodes `jobs` (key, brick id, edited) in up to `threads` tasks,
 /// each into its own buffer, and returns the blocks in job order.
 fn encode_parallel<S: VoxelSource + Sync>(
     source: &S,
@@ -1737,19 +1796,29 @@ fn encode_parallel<S: VoxelSource + Sync>(
             })
             .collect::<Vec<_>>()
     };
-    // Small batches are not worth a thread.
-    if threads <= 1 || jobs.len() < 32 {
-        return encode(jobs);
+    // Small batches are not worth a task.
+    let tasks = if jobs.len() < 32 { 1 } else { threads };
+    in_parallel(jobs, tasks, encode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_parallel;
+
+    #[test]
+    fn parallel_parts_keep_their_order() {
+        let items: Vec<u32> = (0..1000).collect();
+        let doubled = in_parallel(&items, 7, |part| part.iter().map(|x| x * 2).collect());
+        assert_eq!(doubled, items.iter().map(|x| x * 2).collect::<Vec<_>>());
     }
-    let per = jobs.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .chunks(per)
-            .map(|chunk| scope.spawn(move || encode(chunk)))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+
+    #[test]
+    #[should_panic(expected = "a part failed")]
+    fn a_panic_in_a_part_is_raised_again() {
+        let items: Vec<u32> = (0..1000).collect();
+        in_parallel(&items, 4, |part| {
+            assert!(!part.contains(&700), "a part failed");
+            part.to_vec()
+        });
+    }
 }

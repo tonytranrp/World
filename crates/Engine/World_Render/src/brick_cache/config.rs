@@ -121,6 +121,9 @@ pub struct BrickCacheConfig {
     /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
     /// needs 1,500 to 2,500 a frame. `1..=16777216`.
     pub max_summaries_per_frame: u32,
+    /// Tasks a replaced chunk's summaries are split into on Bevy's compute
+    /// task pool; 0 picks one per pool thread, at most 8. `0..=64`.
+    pub summary_threads: u32,
     /// Records whose groups and bricks are freed per frame after a collapse
     /// or a replaced chunk took them out of the tree; the rest wait, and
     /// nothing below them is refined until they are freed. A refined 16 m
@@ -166,6 +169,7 @@ impl Default for BrickCacheConfig {
                 max_collapses_per_frame: 256,
             },
             max_summaries_per_frame: 8192,
+            summary_threads: 0,
             max_frees_per_frame: 16384,
             debug_scene: true,
             debug_scene_edits: true,
@@ -266,6 +270,7 @@ impl ConfigAsset for BrickCacheConfig {
             1.0,
             16777216.0,
         );
+        range("summary_threads", self.summary_threads.into(), 0.0, 64.0);
         range(
             "max_frees_per_frame",
             self.max_frees_per_frame.into(),

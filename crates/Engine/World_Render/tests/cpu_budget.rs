@@ -1798,3 +1798,185 @@ fn a_replaced_chunk_refines_again_under_a_still_camera() {
     );
     verify(&mut res, &tree.snapshot(), &pools);
 }
+
+/// A deterministic random sequence for the burial stress test.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+}
+
+/// Entries the root reaches through the child masks.
+fn reachable(res: &Residency) -> usize {
+    let mut n = 0;
+    let mut stack = vec![res.shape().root()];
+    while let Some(k) = stack.pop() {
+        n += 1;
+        if let Some(s) = res.node_state(k)
+            && s.expanded
+        {
+            for slot in 0..64 {
+                if s.kids & (1 << slot) != 0 {
+                    stack.push(k.child(slot));
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Burials kept alive across random operations stay exact: collapses
+/// (also of leftovers, which are refused), re-expansions while burying,
+/// loads, evictions, partial frees, edits and chunk swaps applied on 1 to 8
+/// threads under random budgets. Every step verifies; after draining,
+/// every entry is reachable, the group and brick counts are exact, and the
+/// table regrows like a fresh one. (Ported from the third review's stress
+/// test; seeds scale with the test profile.)
+#[test]
+fn burials_stay_exact_under_random_operations() {
+    use world_render::internals::residency::Change;
+    let seeds = u64::from(world_testkit::profile::scale().cases).max(16);
+    for seed in 0..seeds {
+        let mut rng = Lcg(seed * 7919 + 1);
+        let mut tree = slab();
+        let originals: Vec<_> = CHUNKS
+            .iter()
+            .map(|&m| tree.chunk_data(m).unwrap())
+            .collect();
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let (mut res, mut pools) = roomy_cache(shape);
+        make_resident(&mut res, &snap, &mut pools);
+        let mut log = Vec::new();
+        for step in 0..100 {
+            let mut batch = UploadBatch::default();
+            let op = rng.next() % 10;
+            let keys = res.keys();
+            let pick = keys[rng.next() as usize % keys.len()];
+            let threads = 1 + (rng.next() % 8) as usize;
+            let budget = 1 + rng.next() % 3000;
+            log.push((op, pick));
+            let s = tree.snapshot();
+            match op {
+                0 | 1 => {
+                    let _ = res.collapse(pick, &mut batch);
+                }
+                2 => {
+                    let _ = res.expand(&s, pick, &mut batch);
+                }
+                3 => {
+                    let _ = res.load_brick(&s, pick, &mut batch);
+                }
+                4 => {
+                    let _ = res.evict_brick(pick, &mut batch);
+                }
+                5 => {
+                    res.free_buried((rng.next() % 40) as u32, &mut batch);
+                }
+                6 => {
+                    let x = (rng.next() % 128) as i32 - 64;
+                    let z = (rng.next() % 128) as i32 - 64;
+                    let y = -((rng.next() % 16) as i32) - 1;
+                    let p = VoxelPos::new(x, y, z);
+                    tree.set(p, MaterialId((rng.next() % 3) as u16)).unwrap();
+                    let k = NodeKey::containing(shape.local(p).unwrap(), 1);
+                    res.queue_changes([Change::Brick(k)]);
+                    let s = tree.snapshot();
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                7 => {
+                    let i = rng.next() as usize % CHUNKS.len();
+                    let data = if rng.next() % 2 == 0 {
+                        replacement(CHUNKS[i])
+                    } else {
+                        originals[i].clone()
+                    };
+                    tree.insert_chunk(CHUNKS[i], data).unwrap();
+                    let k = NodeKey::containing(shape.local(CHUNKS[i]).unwrap(), 4);
+                    res.queue_changes([Change::Chunk(k)]);
+                    let s = tree.snapshot();
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                8 => {
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                _ => {
+                    apply_cpu(&mut pools, &batch);
+                    batch.clear();
+                    grow_records(&mut res, &s, &mut pools);
+                }
+            }
+            apply_cpu(&mut pools, &batch);
+            let s = tree.snapshot();
+            let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+            if let Err(e) = res.verify(&s, &pools.nodes, &segs, &pools.table) {
+                panic!("seed {seed} step {step}: {e}\nlog {log:?}");
+            }
+        }
+        // Drain everything.
+        let s = tree.snapshot();
+        for _ in 0..1000 {
+            let mut batch = UploadBatch::default();
+            res.free_buried(u32::MAX, &mut batch);
+            res.apply_changes(&s, None, u64::MAX, 4, |_| true, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if res.pending_changes() == 0 && res.buried() == 0 {
+                break;
+            }
+        }
+        assert_eq!((res.pending_changes(), res.buried()), (0, 0), "seed {seed}");
+        verify(&mut res, &s, &pools);
+        assert_eq!(
+            reachable(&res),
+            res.stats().entries,
+            "seed {seed}: entries left out of the tree"
+        );
+        grow_records(&mut res, &s, &mut pools);
+        verify(&mut res, &s, &pools);
+        records_match_a_fresh_cache(&res, &s);
+    }
+}
+
+/// The graveyard frees the oldest burial first: a collapse made later does
+/// not hold back one made earlier.
+#[test]
+fn the_oldest_burial_is_freed_first() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &snap, &mut pools);
+    let key =
+        |x: i32, z: i32| NodeKey::containing(shape.local(VoxelPos::new(x, -8, z)).unwrap(), 4);
+    let (first, second) = (key(0, 0), key(1024, 1024));
+    let probe = |res: &Residency, k: NodeKey| res.is_blocked(k.child(0).child(0));
+    let mut batch = UploadBatch::default();
+    res.collapse(first, &mut batch).unwrap();
+    res.collapse(second, &mut batch).unwrap();
+    assert!(probe(&res, first) && probe(&res, second));
+    while probe(&res, first) {
+        res.free_buried(100, &mut batch);
+        // The later one waits until the earlier one is done.
+        assert!(probe(&res, second), "the newer burial was freed first");
+    }
+    while res.buried() > 0 {
+        res.free_buried(100, &mut batch);
+    }
+    apply_cpu(&mut pools, &batch);
+    verify(&mut res, &snap, &pools);
+}
