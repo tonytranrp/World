@@ -172,3 +172,47 @@ per-frame budget counts upload bytes but not CPU: a frame can expand 800 to
 2,500 nodes (25 to 90 ms), an edit costs about 7 ms per dirty brick, and a
 growth pass pushes about 230,000 children into its queue, which the visit
 budget does not count.
+
+## Brick cache frames bounded by counts
+
+Timing `run_frame` found three costs the brick cache's budgets did not
+cover: expansions (up to 2,500 a frame), chunks the residency swapped into
+the render tree, which were reported as one changed brick but rewrote by
+summarizing the whole new chunk (6 ms each in release), and growth pushes
+(about 230,000 a frame, uncounted, in a pass that restarted every slow
+frame and never finished). The swap path was also wrong: everything the
+cache held below a swapped chunk off that one path kept the old content,
+so coarse cells stayed "uniform" and never refined.
+
+Every per-frame cost now has a count budget (decision 0012): swapped
+chunks are their own kind of change, summarized across frames and applied
+nearest first; expansions, growth pushes, shrink visits and collapses are
+capped; a pass restarts only after the camera moved 128 voxels; the
+residency table no longer rehashes mid-walk. Two independent reviews found
+five more defects (records pointing at groups laid out for another mask,
+a leak when collapsing a waiting chunk, edits applied into a waiting
+chunk, edits outside the budget, the root rewritten over an old layout),
+all fixed with tests. The first fix for the mask problem dropped whole
+level-5 subtrees whenever a chunk waited below them and cost 4 ms a frame
+in walks; records over an old layout now stay as they are until the change
+below them applies.
+
+mac-floor, development build, 1500 frames, one warm-up launch each,
+alternating runs, steady frames (101 to 1500), three runs each:
+
+| | Before | After |
+|---|---|---|
+| 4 m/s mean / p99 / max | 21.5 to 23.0 / 55 to 56 / 135 to 153 ms | 16.1 to 16.8 / 28 to 31 / 34 to 64 ms |
+| 8 m/s mean / p99 / max | 25.5 to 25.8 / 55 to 56 / 241 to 248 ms | 16.9 to 17.0 / 26 to 27 / 30 to 35 ms |
+| Expanded nodes at frame 1000, 4 / 8 m/s | 31,000 to 33,000 / 23,000 | 77,000 to 79,000 / 72,000 |
+| Node pool, 4 / 8 m/s | 35 to 38% / 26% | 87 to 89% / 82% |
+
+Holes in the full-detail sphere still reach 0 within 15 s, but the first
+two intervals are slightly higher (165 to 170 and 17 to 32 against 151 to
+161 and 9 to 31), likely because faster frames take CPU from the
+generation workers. At 8 m/s 800 changes wait at any time, far coarse
+chunks longest. `run_frame` still averages 11 to 13 ms while walking,
+mostly table lookups in stage 1; a CPU mirror of the node pool walked by
+index (decision 0010) is the next step there. With the pool near 90%,
+pressure shrink will act on long walks; it is bounded but not yet measured
+in one.
