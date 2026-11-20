@@ -31,7 +31,7 @@ use std::fmt;
 
 pub use chunk::{
     CHUNK_SIZE, CHUNKS_PER_AXIS, ChunkColumns, ChunkCoord, ChunkOutOfWorld, ChunkSource,
-    CoarseColumns, MAX_COARSE_LEVEL,
+    CoarseColumns, CoarseSource, MAX_COARSE_LEVEL,
 };
 pub use config::{HeightBounds, TerrainConfig};
 pub use surface::{Column, Layers};

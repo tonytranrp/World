@@ -76,3 +76,36 @@ fn a_loaded_chunk_replaces_a_not_resident_region() {
     let s = tree.stats();
     assert_eq!((s.chunks, s.branches), (0, 0), "unloading frees everything");
 }
+
+#[test]
+fn a_coarse_chunk_is_uniform_cells_matching_its_samples() {
+    use world_gen::CoarseSource;
+    let g = generator();
+    let coord = surface_chunk(&g, 520, 505);
+    let level = 2; // 16-voxel cells, a quarter metre
+    let source = CoarseSource::new(g.coarse_columns(coord, level).unwrap());
+    let min = coord.min_voxel();
+    let mut tree = VoxelTree::new();
+    tree.build_region(CHUNK_LEVEL, min, &source).unwrap();
+    check_canonical(&tree).unwrap();
+    assert_eq!(tree.stats().leaves, 0, "cells are whole bricks or larger");
+    let cell = 16;
+    for (i, j) in [(0, 0), (13, 40), (63, 63), (31, 7)] {
+        let column = *source.columns().column(i, j).unwrap();
+        for k in 0..64 {
+            let y = min.y + k * cell;
+            let p = VoxelPos::new(min.x + i as i32 * cell, y, min.z + j as i32 * cell);
+            let want = column.material_at(y + cell / 2, &source.columns().layers());
+            // Every voxel of the cell has the cell's material.
+            for d in [0, 5, 15] {
+                let q = VoxelPos::new(p.x + d, p.y + 15 - d, p.z + d);
+                assert_eq!(tree.get(q), want, "cell {i},{j},{k} at {q:?}");
+            }
+        }
+    }
+    // Far less storage than the same chunk at full detail.
+    let mut full = VoxelTree::new();
+    full.build_region(CHUNK_LEVEL, min, &ChunkSource::new(g.columns(coord)))
+        .unwrap();
+    assert!(tree.stats().bytes * 8 < full.stats().bytes);
+}

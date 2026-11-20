@@ -9,10 +9,12 @@
 //! evaluate the same global lattices. The margins a footprint needs are
 //! computed from the lattice spacings (`regional::field`), not guessed.
 
+pub mod coarse_source;
 pub mod columns;
 pub mod coord;
 pub mod source;
 
+pub use coarse_source::CoarseSource;
 pub use columns::{ChunkColumns, CoarseColumns, MAX_COARSE_LEVEL};
 pub use coord::{CHUNK_SHIFT, CHUNK_SIZE, CHUNKS_PER_AXIS, ChunkCoord, ChunkOutOfWorld};
 pub use source::ChunkSource;
