@@ -10,21 +10,31 @@
 //!
 //! A whole walk visits every resident record, one table lookup each, which
 //! is too much for one frame once the table holds hundreds of thousands of
-//! records. [`select_budgeted`] splits it in two:
+//! records. [`select_budgeted`] splits it in two, and both halves visit at
+//! most `lod.max_visits_per_frame` records per frame and resume where they
+//! stopped:
 //!
-//! - **Growth** (expand and load) runs whole every frame but only descends
-//!   into nodes that want refining. A child's cells are a quarter of its
-//!   parent's and never closer, so it projects to less than a quarter of
-//!   its parent's pixels: below a node that does not want refining nothing
-//!   does. The walk is bounded by what is near the camera, not by the world.
-//! - **Shrink** (collapse and evict) must look at every record, so it visits
-//!   at most a set number per frame and resumes where it stopped.
+//! - **Growth** (expand and load) only descends into nodes that want
+//!   refining. A child's cells are a quarter of its parent's and never
+//!   closer, so it projects to less than a quarter of its parent's pixels:
+//!   below a node that does not want refining nothing does. A pass is
+//!   best-first: the nodes covering the most pixels are visited first, so a
+//!   pass the budget splits finds the nearest work in its first frame.
+//!   Candidates the upload budget turns away are carried to the next frame.
+//! - **Shrink** (collapse and evict) must look at every record, so it is a
+//!   plain resumable walk.
 //!
-//! Growth is a function of the view and the table alone, so the frame loop
-//! skips it while the camera stays within `regrow_voxels` of where it last
-//! ran and nothing in the table changed since (see [`GrowthState`]).
+//! Growth is a function of the view and the table alone, so a new pass
+//! starts only once the camera moved more than `regrow_voxels` from where
+//! the last one started, or the table changed since (see [`GrowthState`]).
+//! Nodes expanded while a pass runs rejoin it, so their children are judged
+//! by the same pass.
 //!
-//! A shrink pass that fits the budget gives exactly [`select`]'s answer.
+//! A growth pass or a shrink pass run to completion under one view gives
+//! exactly [`select`]'s answer.
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use world_core::VoxelPos;
 
@@ -78,8 +88,16 @@ pub fn distance(origin: VoxelPos, key: NodeKey, eye: [f32; 3]) -> f32 {
 
 /// Pixels covered by the cells refining `key` would reveal.
 pub fn projected_pixels(origin: VoxelPos, key: NodeKey, view: &ViewPoint) -> f32 {
+    let o = origin.to_array().map(f64::from);
+    pixels_from_d2(key, distance2(o, key, view.eye.map(f64::from)), view)
+}
+
+/// [`projected_pixels`] from the node's squared distance (as
+/// `distance2` computes it), so a walk that already has it gets the same
+/// value bit for bit.
+fn pixels_from_d2(key: NodeKey, d2: f64, view: &ViewPoint) -> f32 {
     let cell = (1u64 << (2 * (key.level() - 1))) as f32;
-    let d = distance(origin, key, view.eye).max(1.0);
+    let d = (d2.sqrt() as f32).max(1.0);
     cell / (d * view.pixel_angle.max(1e-6))
 }
 
@@ -135,18 +153,51 @@ fn distance2(origin: [f64; 3], key: NodeKey, eye: [f64; 3]) -> f64 {
         .sum()
 }
 
-/// When growth last ran, to skip it while its answer cannot have changed.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// A node waiting in a growth pass, ordered by projected pixels (ties to the
+/// lower key, so passes are deterministic).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pending {
+    pixels: f32,
+    key: NodeKey,
+}
+
+impl Eq for Pending {}
+
+impl Ord for Pending {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.pixels
+            .total_cmp(&other.pixels)
+            .then_with(|| other.key.cmp(&self.key))
+    }
+}
+
+impl PartialOrd for Pending {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Stage 1's growth across frames: the pass in progress, when it started,
+/// and the candidates the upload budget has not taken yet.
+#[derive(Clone, Debug, Default)]
 pub struct GrowthState {
-    /// The view growth last ran for.
+    /// The view the last pass started with.
     last: Option<ViewPoint>,
-    /// The table changed since.
+    /// The table changed since the last pass started.
     changed: bool,
+    /// Nodes the pass in progress still has to visit.
+    frontier: BinaryHeap<Pending>,
+    /// A pass is in progress.
+    active: bool,
+    /// Candidates found but not taken yet; checked again before use.
+    carry_expand: Vec<NodeKey>,
+    carry_load: Vec<NodeKey>,
 }
 
 impl GrowthState {
-    /// Whether growth must run for `view`: never ran, the table changed,
-    /// the pixel angle changed or the eye moved more than `regrow_voxels`.
+    /// Whether a new pass must start for `view`: none ran yet, the table
+    /// changed, the pixel angle changed or the eye moved more than
+    /// `regrow_voxels` since the last pass started.
     pub fn due(&self, view: &ViewPoint, regrow_voxels: f32) -> bool {
         let Some(last) = self.last else {
             return true;
@@ -157,39 +208,66 @@ impl GrowthState {
             || moved2 > regrow_voxels * regrow_voxels
     }
 
-    /// Growth ran for `view`.
+    /// Starts a pass for `view`, dropping the rest of any pass in progress.
     pub fn ran(&mut self, view: ViewPoint) {
         self.last = Some(view);
         self.changed = false;
+        self.frontier.clear();
+        self.active = true;
     }
 
-    /// The table changed: the next frame runs growth.
+    /// The table changed: a new pass starts once the current one is done.
     pub fn changed(&mut self) {
         self.changed = true;
+    }
+
+    /// A pass is in progress.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Node `key`, just expanded, rejoins the pass in progress so its
+    /// children are judged. Without a pass in progress the next pass will.
+    pub fn rejoin(&mut self, key: NodeKey, pixels: f32) {
+        if self.active {
+            self.frontier.push(Pending { pixels, key });
+        } else {
+            self.changed = true;
+        }
+    }
+
+    /// Candidates the frame did not get to, for the next frame.
+    pub fn carry(&mut self, expand: &[NodeKey], load: &[NodeKey]) {
+        self.carry_expand.clear();
+        self.carry_expand.extend_from_slice(expand);
+        self.carry_load.clear();
+        self.carry_load.extend_from_slice(load);
     }
 }
 
 /// Walks the whole resident tree and lists what to change.
 pub fn select(res: &Residency, view: &ViewPoint, lod: &LodTuning) -> Selection {
     let mut walk = Vec::new();
-    select_budgeted(res, &mut walk, view, lod, 1.0, u32::MAX, true)
+    let mut growth = GrowthState::default();
+    select_budgeted(res, &mut walk, &mut growth, view, lod, 1.0, u32::MAX)
 }
 
-/// Lists what to change: when `grow`, every node that wants growing (a walk
-/// bounded by the view), and what shrinking the walk in `walk` finds in at
-/// most `max_visits` records (a new walk from the root when it is empty).
+/// Lists what to change. Growth starts a pass when one is due and none is
+/// in progress, then visits at most `max_visits` nodes of the pass in
+/// progress; the candidates it finds join those carried from earlier
+/// frames that still apply. Shrink visits at most `max_visits` records of
+/// the walk in `walk` (a new walk from the root when it is empty).
 /// `pressure` (at least 1) raises the detail threshold of levels 2 and up,
-/// whose expansions take node pool records; bricks keep theirs.
-/// Records removed since they were queued are skipped; children of nodes
-/// expanded since are visited by the next pass.
+/// whose expansions take node pool records; bricks keep theirs. Records
+/// removed since they were queued are skipped.
 pub fn select_budgeted(
     res: &Residency,
     walk: &mut Vec<NodeKey>,
+    growth: &mut GrowthState,
     view: &ViewPoint,
     lod: &LodTuning,
     pressure: f32,
     max_visits: u32,
-    grow: bool,
 ) -> Selection {
     let shape = res.shape();
     let always = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
@@ -213,15 +291,42 @@ pub fn select_budgeted(
     let eye = view.eye.map(f64::from);
     let origin = shape.origin.to_array().map(f64::from);
     let forced = |level: u8| level >= 2 && u32::from(level) >= always;
-    let mut stack = Vec::new();
+    // Whether `key` wants refining from here, given its squared distance.
+    let wanted = |key: NodeKey, d2: f64| forced(key.level) || reach.wants(key.level, d2);
+    // Pixels a node's refined cells cover, from its squared distance: the
+    // order of the pass. Forced nodes come first.
+    let pixels = |key: NodeKey, d2: f64| {
+        if forced(key.level) {
+            f32::MAX
+        } else {
+            pixels_from_d2(key, d2, view)
+        }
+    };
     let root = shape.root();
-    if grow && (forced(root.level) || reach.wants(root.level, distance2(origin, root, eye))) {
-        stack.push(root);
+    if !growth.active && growth.due(view, lod.regrow_voxels) {
+        growth.ran(*view);
+        let d2 = distance2(origin, root, eye);
+        if wanted(root, d2) {
+            growth.frontier.push(Pending {
+                pixels: pixels(root, d2),
+                key: root,
+            });
+        }
     }
-    while let Some(key) = stack.pop() {
+    let mut visits = 0u32;
+    while visits < max_visits {
+        let Some(Pending { key, .. }) = growth.frontier.pop() else {
+            growth.active = false;
+            break;
+        };
+        // The eye may have moved since the node was queued.
+        if !wanted(key, distance2(origin, key, eye)) {
+            continue;
+        }
         let Some(node) = res.node_state(key) else {
             continue;
         };
+        visits += 1;
         if key.level >= 2 {
             if node.expanded {
                 // Per-axis squared distances to the four child slabs.
@@ -234,7 +339,6 @@ pub fn select_budgeted(
                         d * d
                     })
                 });
-                let child_level = key.level - 1;
                 let mut mask = node.mask;
                 while mask != 0 {
                     let slot = 63 - mask.leading_zeros();
@@ -246,8 +350,11 @@ pub fn select_budgeted(
                         (child.z - key.z * 4) as usize,
                     );
                     let d2 = slabs[0][ox] + slabs[1][oy] + slabs[2][oz];
-                    if forced(child_level) || reach.wants(child_level, d2) {
-                        stack.push(child);
+                    if wanted(child, d2) {
+                        growth.frontier.push(Pending {
+                            pixels: pixels(child, d2),
+                            key: child,
+                        });
                     }
                 }
             } else {
@@ -261,6 +368,34 @@ pub fn select_budgeted(
         } else if !node.brick_resident {
             load.push((projected_pixels(shape.origin, key, view), key));
         }
+    }
+    if growth.frontier.is_empty() {
+        growth.active = false;
+    }
+
+    // Candidates carried from earlier frames, if they still apply.
+    for key in std::mem::take(&mut growth.carry_expand) {
+        let still = res.node_state(key).is_some_and(|n| !n.expanded)
+            && wanted(key, distance2(origin, key, eye));
+        if still {
+            let priority = if forced(key.level) {
+                f32::MAX
+            } else {
+                projected_pixels(shape.origin, key, view)
+            };
+            expand.push((priority, key));
+        }
+    }
+    for key in std::mem::take(&mut growth.carry_load) {
+        let still = res.node_state(key).is_some_and(|n| !n.brick_resident)
+            && wanted(key, distance2(origin, key, eye));
+        if still {
+            load.push((projected_pixels(shape.origin, key, view), key));
+        }
+    }
+    for list in [&mut expand, &mut load] {
+        list.sort_unstable_by_key(|&(_, k)| k);
+        list.dedup_by_key(|&mut (_, k)| k);
     }
 
     // Shrink: everything, resumably.

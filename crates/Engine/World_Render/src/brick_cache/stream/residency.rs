@@ -101,7 +101,7 @@ pub struct Residency {
     /// Stage 1's walk in progress: nodes still to visit (see
     /// [`select_budgeted`](super::select::select_budgeted)).
     walk: Vec<NodeKey>,
-    /// When stage 1's growth last ran.
+    /// Stage 1's growth pass in progress and carried candidates.
     growth: GrowthState,
     /// Stage 1's detail threshold multiplier under node pool pressure (see
     /// `frame::adapt_pressure`); 1 when the pool has room.
@@ -207,9 +207,19 @@ impl Residency {
         self.walk = walk;
     }
 
-    /// When stage 1's growth last ran.
+    /// Stage 1's growth pass and carried candidates.
     pub fn growth(&mut self) -> &mut GrowthState {
         &mut self.growth
+    }
+
+    /// Takes stage 1's growth state, to run the next part of its pass.
+    pub fn take_growth(&mut self) -> GrowthState {
+        std::mem::take(&mut self.growth)
+    }
+
+    /// Puts back stage 1's growth state.
+    pub fn put_growth(&mut self, growth: GrowthState) {
+        self.growth = growth;
     }
 
     /// Stage 1's detail threshold multiplier under node pool pressure.

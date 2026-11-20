@@ -15,7 +15,8 @@ use world_render::internals::format::decode::Sample;
 use world_render::internals::frame::{FrameInput, run_frame};
 use world_render::internals::key::{NodeKey, Shape, view_at};
 use world_render::internals::select::{
-    Selection, ViewPoint, projected_pixels, select, select_budgeted,
+    ALWAYS_EXPANDED_LEVEL, GrowthState, Selection, ViewPoint, projected_pixels, select,
+    select_budgeted,
 };
 use world_render::internals::{BrickCacheConfig, LodTuning, Stage};
 use world_testkit::dense::{Bounds, EditOp, VoxelModel};
@@ -419,24 +420,25 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
     // A handful of records per frame: the passes add up to the whole walk.
     lod.max_visits_per_frame = 7;
     let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
     let mut union = Selection::default();
     let mut frames = 0;
     loop {
         let s = select_budgeted(
             &res,
             &mut walk,
+            &mut growth,
             &view,
             &lod,
             1.0,
             lod.max_visits_per_frame,
-            true,
         );
         union.collapse.extend(s.collapse);
         union.evict.extend(s.evict);
         union.expand.extend(s.expand);
         union.load.extend(s.load);
         frames += 1;
-        if walk.is_empty() {
+        if walk.is_empty() && !growth.is_active() {
             break;
         }
     }
@@ -447,7 +449,7 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         &mut union.expand,
         &mut union.load,
     ] {
-        // Growth runs whole every frame, so it repeats.
+        // A shrink pass that ends before growth's starts over.
         v.sort_unstable();
         v.dedup();
     }
@@ -461,6 +463,126 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         v.sort_unstable();
     }
     assert_eq!(union, want);
+}
+
+/// A growth pass the budget splits is best-first: candidates come out in
+/// order of the pixels they cover, so every frame's are worth at least as
+/// much as the next frame's, and together they are the whole walk's.
+#[test]
+fn a_split_growth_pass_finds_the_most_important_work_first() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, _pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    // A few frames on a small budget: partly refined, much left to do.
+    let mut batch = UploadBatch::default();
+    for frame in 1..=8 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 256 << 10,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+    }
+    let lod = config.lod;
+    let full = select(&res, &view, &lod);
+    assert!(full.expand.len() + full.load.len() > 10, "{full:?}");
+
+    // Levels that are always expanded come first, whatever their size.
+    let forced = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
+    let priority = |k: &NodeKey| {
+        if k.level() >= forced {
+            f32::MAX
+        } else {
+            projected_pixels(shape.origin, *k, &view)
+        }
+    };
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    let (mut expand, mut load) = (Vec::new(), Vec::new());
+    let mut floor = f32::INFINITY;
+    let mut frames = 0;
+    loop {
+        let s = select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, 5);
+        let found: Vec<f32> = s.expand.iter().chain(&s.load).map(priority).collect();
+        let best = found.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(best <= floor, "frame {frames} found {best} after {floor}");
+        floor = found.iter().copied().fold(floor, f32::min);
+        expand.extend(s.expand);
+        load.extend(s.load);
+        frames += 1;
+        if !growth.is_active() {
+            break;
+        }
+    }
+    assert!(frames > 2, "the budget split the pass");
+    for v in [&mut expand, &mut load] {
+        v.sort_unstable();
+    }
+    let (mut want_expand, mut want_load) = (full.expand, full.load);
+    want_expand.sort_unstable();
+    want_load.sort_unstable();
+    assert_eq!((expand, load), (want_expand, want_load));
+}
+
+/// Candidates a tiny upload budget turns away are carried from frame to
+/// frame: the cache reaches the same state as with a roomy budget, and with
+/// the camera still, no frame after that finds anything left to do.
+#[test]
+fn candidates_the_budget_turns_away_are_carried_until_done() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let run = |budget: u64, frames: u32| {
+        let (mut res, mut pools) = cpu_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut late_work = 0;
+        for frame in 1..=frames {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget,
+                victim_capacity: 64,
+            };
+            let report = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if frame > frames - 5 {
+                late_work += report.loaded + report.expanded;
+            }
+        }
+        let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+        let stats = res.stats();
+        (stats.bricks, stats.expanded, late_work)
+    };
+    let roomy = run(24 << 20, 40);
+    let tight = run(64 << 10, 600);
+    assert_eq!(roomy.2, 0, "the roomy run settled: {roomy:?}");
+    assert_eq!(tight.2, 0, "the tight run settled: {tight:?}");
+    assert_eq!((tight.0, tight.1), (roomy.0, roomy.1));
 }
 
 /// From the default camera, stage 1 refines the debug scene down to resident

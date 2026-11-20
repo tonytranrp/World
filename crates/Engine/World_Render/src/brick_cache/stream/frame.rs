@@ -14,7 +14,7 @@ use world_core::tree::VoxelSource;
 use super::batch::UploadBatch;
 use super::key::NodeKey;
 use super::residency::{Refused, Residency};
-use super::select::{ViewPoint, distance, select_budgeted};
+use super::select::{ViewPoint, distance, projected_pixels, select_budgeted};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -113,19 +113,17 @@ pub fn run_frame<S: VoxelSource + Sync>(
     let lod = &input.config.lod;
     let selection = match input.view {
         Some(view) => {
-            let grow = res.growth().due(&view, lod.regrow_voxels);
             let visits = if res.take_full_shrink() {
                 u32::MAX
             } else {
                 lod.max_visits_per_frame
             };
             let mut walk = res.take_walk();
+            let mut growth = res.take_growth();
             let pressure = res.pressure();
-            let s = select_budgeted(res, &mut walk, &view, lod, pressure, visits, grow);
+            let s = select_budgeted(res, &mut walk, &mut growth, &view, lod, pressure, visits);
             res.put_walk(walk);
-            if grow {
-                res.growth().ran(view);
-            }
+            res.put_growth(growth);
             s
         }
         None => Default::default(),
@@ -202,13 +200,21 @@ pub fn run_frame<S: VoxelSource + Sync>(
         }
     }
 
-    // Growth, by priority, while the budget lasts.
-    for k in expands {
+    // Growth, by priority, while the budget lasts. An expanded node rejoins
+    // the growth pass so its children are judged; candidates the budget did
+    // not reach are carried to the next frame.
+    for &k in &expands {
         if cost(batch) >= budget {
             break;
         }
         match res.expand(source, k, batch) {
-            Ok(_) => report.expanded += 1,
+            Ok(_) => {
+                report.expanded += 1;
+                if let Some(view) = input.view {
+                    let pixels = projected_pixels(shape.origin, k, &view);
+                    res.growth().rejoin(k, pixels);
+                }
+            }
             Err(Refused::PoolFull) => {
                 report.refused_full += 1;
                 report.refused_nodes += 1;
@@ -229,6 +235,12 @@ pub fn run_frame<S: VoxelSource + Sync>(
         }
     }
 
+    // Everything not done yet: the next frame checks each again and drops
+    // what has since been expanded or loaded (or is no longer wanted).
+    if input.config.stage == Stage::Distance {
+        res.growth().carry(&expands, &loads);
+    }
+
     report.upload_bytes = cost(batch);
     if input.config.stage == Stage::Distance {
         let before = res.pressure();
@@ -245,9 +257,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // Anything that changed the table can change what growth finds; edits
     // rewrite records even when no brick is uploaded.
     if !dirty.is_empty()
-        || report.loaded
-            + report.expanded
-            + report.collapsed
+        || report.collapsed
             + report.evicted
             + report.victims_applied
             + report.edited_uploaded
