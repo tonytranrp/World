@@ -96,6 +96,15 @@ jobs:
       - name: Tests (no GPU)
         run: cargo xtask test fast -- --profile ci
 
+      # Decision 0008: generated terrain must hash the same on Windows x86_64,
+      # macOS arm64 and macOS x86_64. The native run above covers arm64 and the
+      # Windows job covers Windows; this runs the generator's golden hashes as
+      # an Intel binary under Rosetta 2.
+      - name: World_Gen golden hashes on x86_64 (Rosetta)
+        run: |
+          /usr/bin/pgrep -q oahd || softwareupdate --install-rosetta --agree-to-license
+          cargo test --package world_gen --target x86_64-apple-darwin --test golden_hashes
+
       - name: Build the game for Apple Silicon and Intel
         run: |
           cargo build --release --no-default-features --package world --target aarch64-apple-darwin
