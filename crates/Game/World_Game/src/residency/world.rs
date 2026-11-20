@@ -1001,6 +1001,11 @@ impl StreamedWorld {
             None => {
                 self.saved.insert(coord);
                 self.refused.remove(&coord);
+                // The region file changed: compressions of older content
+                // and the warm copy are stale, even if another write of the
+                // chunk is queued behind this one.
+                self.compressing.remove(&coord);
+                self.warm.remove(coord);
             }
         }
         let Some(w) = self.writes.get_mut(&coord) else {
@@ -1029,8 +1034,6 @@ impl StreamedWorld {
         if let Some(checkpoint) = &mut self.checkpoint {
             checkpoint.waiting.remove(&coord);
         }
-        // The region file changed: compressions of older content are stale.
-        self.compressing.remove(&coord);
         let cap = self.warm_cap();
         self.warm
             .insert(coord, warm, true, cap, self.config.warm_edited_weight);
@@ -1177,10 +1180,13 @@ impl StreamedWorld {
         };
         let mut order = plan::ahead_first(eye, predicted, &sphere);
         if self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB {
+            // The predicted position is at most evict_radius_m away and
+            // only chunks within that of the eye are kept, so a larger
+            // radius would only add chunks to sort and drop.
             order.extend(plan::lookahead(
                 eye,
                 predicted,
-                c.prefetch_radius_m,
+                c.prefetch_radius_m.min(2.0 * c.evict_radius_m),
                 c.full_radius_m,
                 c.evict_radius_m,
             ));
@@ -1247,6 +1253,19 @@ impl StreamedWorld {
         for c in doomed {
             self.unload(c);
         }
+        // An unloaded chunk waiting to be compressed still holds its RAM,
+        // so unloading alone does not bring the total under the cap: drop
+        // the oldest waiting compressions until it fits. Otherwise every
+        // frame would evict another batch for the same bytes.
+        while self.hot_bytes_in_use() > cap {
+            let Some((c, _, ticket, chunk_bytes)) = self.to_compress.pop_front() else {
+                break;
+            };
+            self.to_compress_bytes -= chunk_bytes;
+            if self.compressing.get(&c) == Some(&ticket) {
+                self.compressing.remove(&c);
+            }
+        }
     }
 
     fn unload(&mut self, coord: ChunkCoord) {
@@ -1267,9 +1286,11 @@ impl StreamedWorld {
                 self.held_bytes -= old;
             }
             self.held_bytes += bytes;
-        } else {
+        } else if !self.refused.contains(&coord) {
             // What the region file or the generator gives: kept compressed,
-            // so a return does not generate it again.
+            // so a return does not generate it again. A refused chunk is
+            // not: it stands in for a record that did not load, which the
+            // next visit reads again.
             self.keep_warm(coord, data);
         }
         self.changes.unloaded.push(coord);

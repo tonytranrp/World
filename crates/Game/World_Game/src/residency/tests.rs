@@ -996,3 +996,85 @@ fn prefetch_loads_ahead_of_the_sphere_and_never_starves_it() {
     settle(&mut w.world, w.eye);
     assert!(w.world.is_settled(w.eye));
 }
+
+#[test]
+fn an_unreadable_region_file_is_refused_and_read_again() {
+    use super::store::{RegionStore, SavedChunk};
+    use world_core::serialize::region::RecordKind;
+    let dir = temp_dir("unreadable");
+    let world = open(&dir, config(0));
+    let eye = eye_at(&world, -2500, 6500);
+    drop(world);
+    let coord = world_gen::ChunkCoord::containing(eye).unwrap();
+    let store = RegionStore::open(&dir).unwrap();
+    store
+        .write(
+            coord,
+            vec![SavedChunk {
+                kind: RecordKind::Full,
+                generator: 2,
+                bytes: vec![1; 64],
+            }],
+        )
+        .unwrap();
+    // Opened while the file is readable, so the chunk is known to be saved;
+    // then the file goes bad.
+    let mut world = open(&dir, config(0));
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() && path.extension().is_some_and(|e| e != "log") {
+            std::fs::write(&path, b"not a region file").unwrap();
+        }
+    }
+    let read_failures = |world: &mut StreamedWorld| {
+        world
+            .take_errors()
+            .iter()
+            .filter(|e| e.contains("reading saved chunk"))
+            .count()
+    };
+    settle(&mut world, eye);
+    assert_eq!(read_failures(&mut world), 1);
+    // The generated stand-in is not kept warm: the next visit reads the
+    // file again instead of hiding its edits.
+    let away = eye_at(&world, eye.x + 200 * 64, eye.z);
+    settle(&mut world, away);
+    assert!(!world.is_warm(coord));
+    settle(&mut world, eye);
+    assert_eq!(read_failures(&mut world), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn chunks_waiting_to_be_compressed_do_not_push_the_hot_tier_over_its_cap() {
+    let dir = temp_dir("compress_cap");
+    // About the size of the sphere, so evicting beyond it matters.
+    let config = ResidencyConfig {
+        hot_cap_mib: 24,
+        ..config(0)
+    };
+    let cap = config.hot_cap_mib as usize * 1024 * 1024;
+    let mut world = open(&dir, config);
+    let (x, z) = (4500, -3500);
+    let start = eye_at(&world, x, z);
+    settle(&mut world, start);
+    let mut waited = 0;
+    // A chunk a step: new chunks keep every load slot busy, so the evicted
+    // ones wait to be compressed.
+    for step in 1..30 {
+        let eye = eye_at(&world, x + step * 1024, z);
+        world.update(eye, FRAME);
+        let s = world.stats();
+        let total = s.hot_bytes + s.saving_bytes + s.compressing_bytes;
+        assert!(
+            total <= cap || s.compressing_bytes == 0,
+            "step {step}: {total} > {cap} with {} bytes waiting: {s:?}",
+            s.compressing_bytes
+        );
+        if s.compressing_bytes > 0 {
+            waited += 1;
+        }
+    }
+    assert!(waited > 0, "no chunk ever waited to be compressed");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

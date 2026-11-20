@@ -104,7 +104,12 @@ enum IoJob {
 }
 
 enum WorkJob {
-    Load(ChunkCoord, Option<WarmChunk>, Vec<SavedChunk>),
+    /// The chunk's saved records, or why its region file could not be read.
+    Load(
+        ChunkCoord,
+        Option<WarmChunk>,
+        Result<Vec<SavedChunk>, String>,
+    ),
     Save(ChunkCoord, ChunkData, bool),
     Coarse(u32, u32, Vec<(ChunkCoord, SavedChunk)>),
     Compress(ChunkCoord, ChunkData, u64),
@@ -195,7 +200,7 @@ impl Pool {
                         let records = if saved && warm.is_none() {
                             read_saved(store, coord)
                         } else {
-                            Vec::new()
+                            Ok(Vec::new())
                         };
                         WorkJob::Load(coord, warm, records)
                     }
@@ -229,9 +234,9 @@ impl Pool {
                     Request::Load { coord, warm, saved } if saved && warm.is_none() => {
                         io.send(IoJob::ReadForLoad(coord)).is_ok()
                     }
-                    Request::Load { coord, warm, .. } => {
-                        work.send(WorkJob::Load(coord, warm, Vec::new())).is_ok()
-                    }
+                    Request::Load { coord, warm, .. } => work
+                        .send(WorkJob::Load(coord, warm, Ok(Vec::new())))
+                        .is_ok(),
                     Request::Save {
                         coord,
                         data,
@@ -308,10 +313,10 @@ impl Drop for Pool {
     }
 }
 
-fn read_saved(store: &RegionStore, coord: ChunkCoord) -> Vec<SavedChunk> {
+fn read_saved(store: &RegionStore, coord: ChunkCoord) -> Result<Vec<SavedChunk>, String> {
     store
         .read(coord, &[RecordKind::Full, RecordKind::Overlay])
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
 }
 
 fn read_coarse(
@@ -354,7 +359,10 @@ enum Ran {
 fn run(shared: &Shared, job: WorkJob) -> Ran {
     match job {
         WorkJob::Load(coord, warm, saved) => {
-            let loaded = jobs::load(&shared.generators, coord, warm.as_ref(), &saved);
+            let loaded = match &saved {
+                Ok(saved) => jobs::load(&shared.generators, coord, warm.as_ref(), saved),
+                Err(e) => jobs::unreadable(&shared.generators, coord, e),
+            };
             Ran::Done(Done::Loaded {
                 coord,
                 data: loaded.data,

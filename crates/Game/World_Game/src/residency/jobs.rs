@@ -125,6 +125,18 @@ fn empty() -> ChunkData {
         .expect("the chunk at the world centre exists and is resident")
 }
 
+/// A chunk whose region file could not be read: the generated chunk stands
+/// in, refused, so the file is set aside before anything replaces it and
+/// the saved edits it may hold are not overwritten.
+pub fn unreadable(generators: &Generators, coord: ChunkCoord, error: &str) -> Loaded {
+    Loaded {
+        data: generate(generators.current(), coord),
+        refused: true,
+        error: Some(format!("reading saved chunk {coord:?}: {error}")),
+        source: LoadSource::Generated,
+    }
+}
+
 /// Loads `coord` from a warm entry, saved records or the generator, in that
 /// order of preference. An overlay is merged onto the base of the generator
 /// version it was saved with; one from a version this build cannot generate
