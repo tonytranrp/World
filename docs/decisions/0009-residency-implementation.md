@@ -154,6 +154,15 @@ indexed chunk is recorded above it by a graft. Tests compare reads through
 the index with cursor walks across moves between trees, unloads, collapses
 and snapshots, and the one-million-edit suites pass.
 
+The first write to a chunk after a snapshot copied the chunk's free lists;
+they are now shared per size behind `Arc`s and copied only where a write
+allocates or frees, so such a write costs reference counts and the page it
+touches, as before chunks.
+
+The gate passes (dd8a860), against main: random reads -36%, writes into an
+empty tree -2% and into a dense block -4%, batched edits +1%, box fills
++5% (4.6), an edit after a snapshot +3%, encoding 0%, decoding -97%.
+
 Criterion on Windows against main: random reads 2.3 against 6.0 ms per
 100k, coherent reads 1.4 against 3.1 ms per 64k, coherent cursor reads
 0.45 against 0.45 ms, single-voxel writes 3.8 against 4.3 ms per 10k,
