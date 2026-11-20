@@ -363,7 +363,7 @@ fn a_waiting_chunk_is_not_refined() {
     assert!(res.in_waiting_chunk(key.child(0)));
     assert_eq!(res.expand(&snap, key, &mut batch), Err(Refused::Waiting));
     // Applied, it refines as usual.
-    res.apply_changes(&snap, None, u64::MAX, |_| true, &mut batch);
+    res.apply_changes(&snap, None, u64::MAX, 1, |_| true, &mut batch);
     assert!(!res.in_waiting_chunk(key));
     assert!(res.expand(&snap, key, &mut batch).is_ok());
 }
@@ -1386,4 +1386,127 @@ fn rough_slab_wide(size: i32) -> VoxelTree {
         }
     }
     tree
+}
+
+/// The shipped budget keeps up with a stream of replaced chunks about as
+/// costly as an 8 m/s walk's (1,500 to 2,500 summaries a frame measured;
+/// here a chunk of over 2,048 every frame): the queue stays short
+/// instead of growing frame after frame, and drains to an exact table.
+#[test]
+fn the_shipped_budget_keeps_up_with_a_walks_chunk_stream() {
+    let config = BrickCacheConfig::default();
+    // More chunks than the queue could hold if it fell behind, so repeats
+    // do not cap it.
+    let mins: Vec<VoxelPos> = (0..12)
+        .map(|i| VoxelPos::new(1024 * (i % 4), -1024, 1024 * (i / 4)))
+        .collect();
+    // Two contents per chunk, swapped in turn.
+    let content = |min: VoxelPos, step: i32| {
+        let mut t = VoxelTree::new();
+        t.fill_box(
+            VoxelBox::new(
+                VoxelPos::new(min.x, -16, min.z),
+                VoxelPos::new(min.x + 1024, -2, min.z + 1024),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+        for x in (min.x..min.x + 1024).step_by(step as usize) {
+            for z in (min.z..min.z + 1024).step_by(7) {
+                t.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+            }
+        }
+        t.chunk_data(min).unwrap()
+    };
+    let datas: Vec<[world_core::tree::ChunkData; 2]> = mins
+        .iter()
+        .map(|&m| [content(m, 5), content(m, 6)])
+        .collect();
+    let mut tree = VoxelTree::new();
+    for (m, d) in mins.iter().zip(&datas) {
+        tree.insert_chunk(*m, d[0].clone()).unwrap();
+    }
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    let key = |m: VoxelPos| NodeKey::containing(shape.local(m).unwrap(), 4);
+    let cost = count_mixed(view_at(&snap, key(mins[0])), 4);
+    assert!(cost > 2048, "each chunk costs {cost} summaries");
+    let view = ViewPoint {
+        eye: [512.0, 0.0, 512.0],
+        pixel_angle: 1e-9,
+    };
+    // A chunk replaced every frame, round the twelve.
+    let mut most = 0;
+    for frame in 10..70u32 {
+        let swap = Some(frame as usize);
+        let changed: Vec<VoxelPos> = swap
+            .map(|n| {
+                let i = n % mins.len();
+                tree.insert_chunk(mins[i], datas[i][(n / mins.len()) % 2].clone())
+                    .unwrap();
+                vec![mins[i]]
+            })
+            .unwrap_or_default();
+        let snap = tree.snapshot();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: &changed,
+                view: Some(view),
+                config: &config,
+            },
+        );
+        most = most.max(r.changes_pending);
+    }
+    assert!(most <= 2, "the queue grew to {most}");
+    let snap = tree.snapshot();
+    drain(&mut res, &mut pools, 200, &snap, (&[], &[]), view, &config);
+}
+
+/// Summaries computed on several threads are exactly those computed on
+/// one: the pools and the table come out identical.
+#[test]
+fn warming_on_threads_matches_warming_on_one() {
+    use world_render::internals::residency::Change;
+    let run = |threads: usize| {
+        let mut tree = slab();
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let (mut res, mut pools) = roomy_cache(shape);
+        make_resident(&mut res, &snap, &mut pools);
+        let c = VoxelPos::new(0, -1024, 0);
+        tree.insert_chunk(c, rough_slab(256, 0).chunk_data(c).unwrap())
+            .unwrap();
+        let snap = tree.snapshot();
+        let key = NodeKey::containing(shape.local(c).unwrap(), 4);
+        let mut batch = UploadBatch::default();
+        res.queue_changes([Change::Chunk(key)]);
+        // A budget that splits the chunk's summaries over several calls.
+        while res.pending_changes() > 0 {
+            res.apply_changes(&snap, None, 300, threads, |_| true, &mut batch);
+        }
+        apply_cpu(&mut pools, &batch);
+        verify(&mut res, &snap, &pools);
+        (
+            res.summaries_computed(),
+            res.keys(),
+            pools.nodes.clone(),
+            pools.segments.clone(),
+        )
+    };
+    assert!(run(1) == run(8), "threads changed the result");
 }

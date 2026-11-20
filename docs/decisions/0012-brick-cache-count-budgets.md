@@ -46,8 +46,8 @@ and tests stay deterministic.
   Applying one drops everything the cache held below the chunk and
   summarizes it afresh; stage 1 refines it again.
 - **Changes are queued and applied nearest first under
-  `max_summaries_per_frame`** (2048 node summaries, each over up to 64
-  children). A changed brick is charged the cached summaries on its path
+  `max_summaries_per_frame`** (8192 node summaries, each over up to 64
+  children; 2048 at first, see below). A changed brick is charged the cached summaries on its path
   it forgets (at least one), since the path is summarized again when it is
   rewritten. A replaced chunk is summarized a grandchild at a time, across
   frames if needed, and applied once that is done; a chunk replaced again
@@ -143,10 +143,17 @@ and tests stay deterministic.
   175 and 21 to 35 holes on average, against 151 to 167 and 11 to 30,
   likely because faster frames take more CPU time from the generation
   workers.
-- At 8 m/s the change queue holds 700 to 1,200 changes (far coarse
-  chunks wait longest); at 4 m/s 300 to 800. A larger
-  `max_summaries_per_frame` (4096) keeps it near empty for about 4 ms more
-  per frame.
+- **A replaced chunk's grandchildren are summarized on up to 8 threads**,
+  as many as the budget allows, counted exactly before any is computed
+  (one summary for each grandchild and one for each of its mixed
+  children); the summaries are a pure function of the snapshot, so the
+  threads change nothing but the time. With 2048 summaries a frame, one
+  thread, the queue never caught up on long 8 m/s walks: counted per 100
+  frames, the warming used the whole budget every frame (about 205,700)
+  while chunks arrived at 2 to 3 a frame, about 1,500 to 2,500 summaries
+  a frame, and pending reached 2,400 to 4,000 by frame 4,000. At 8192 on
+  8 threads it stays at 0 to 6 through 6,000 frames, and the frame mean
+  went down (17.3 to 15.3 ms), since the same work takes less wall time.
 - `run_frame` now averages 11 to 13 ms while walking: about 6 ms of stage 1
   visits (cache-missing table lookups), 4 ms of changes, 1.5 ms of
   expansions. Fewer visits trade refinement latency for time, as in 0010;

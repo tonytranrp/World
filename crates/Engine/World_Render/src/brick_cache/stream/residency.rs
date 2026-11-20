@@ -1040,7 +1040,7 @@ impl Residency {
 
     /// Applies an edit batch's changed bricks at once (see
     /// [`apply_changes`](Self::apply_changes)).
-    pub fn apply_edits<S: VoxelSource>(
+    pub fn apply_edits<S: VoxelSource + Sync>(
         &mut self,
         source: &S,
         dirty: &[NodeKey],
@@ -1048,7 +1048,7 @@ impl Residency {
         batch: &mut UploadBatch,
     ) {
         self.queue_changes(dirty.iter().map(|&k| Change::Brick(k)));
-        self.apply_changes(source, None, u64::MAX, reupload, batch);
+        self.apply_changes(source, None, u64::MAX, 1, reupload, batch);
     }
 
     /// Queues changes of the source; [`apply_changes`](Self::apply_changes)
@@ -1101,11 +1101,12 @@ impl Residency {
     /// resident. A replaced chunk drops everything resident below it (it
     /// described the old content) and is summarized afresh. Then every
     /// record on the applied changes' paths is rewritten from the source.
-    pub fn apply_changes<S: VoxelSource>(
+    pub fn apply_changes<S: VoxelSource + Sync>(
         &mut self,
         source: &S,
         eye: Option<[f32; 3]>,
         max_summaries: u64,
+        threads: usize,
         mut reupload: impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
     ) -> Applied {
@@ -1153,7 +1154,8 @@ impl Residency {
                     true
                 }
                 Change::Chunk(c) => {
-                    let ready = self.warm_chunk(source, c, max_summaries.saturating_sub(spent));
+                    let ready =
+                        self.warm_chunk(source, c, max_summaries.saturating_sub(spent), threads);
                     if ready {
                         self.apply_chunk(source, c, batch);
                     }
@@ -1255,10 +1257,17 @@ impl Residency {
 
     /// Summarizes the grandchildren of the replaced chunk `c` (and each
     /// child once its grandchildren are done) from where the last call
-    /// stopped, until `budget` summaries were computed (at least one
-    /// grandchild). The first call forgets what the chunk's old content
-    /// cached. Returns whether every grandchild is done.
-    fn warm_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey, budget: u64) -> bool {
+    /// stopped: as many as fit `budget` summaries, counted exactly before
+    /// any is computed (at least one grandchild), on up to `threads`
+    /// threads. The first call forgets what the chunk's old content cached.
+    /// Returns whether every grandchild is done.
+    fn warm_chunk<S: VoxelSource + Sync>(
+        &mut self,
+        source: &S,
+        c: NodeKey,
+        budget: u64,
+        threads: usize,
+    ) -> bool {
         const DONE: u32 = 64 * 64;
         let next = match self.warming.get(&c) {
             Some(&n) => n,
@@ -1272,34 +1281,47 @@ impl Residency {
             self.warming.insert(c, DONE);
             return true;
         }
-        let start = self.summarized;
-        let mut next = next;
-        let mut progressed = false;
-        while next < DONE {
-            if progressed && self.summarized - start >= budget {
+        // The grandchildren this call summarizes, and what each costs: one
+        // summary for it and one per mixed child.
+        let mut units: Vec<NodeKey> = Vec::new();
+        let mut planned = 0u64;
+        let mut end = next;
+        while end < DONE {
+            if !units.is_empty() && planned >= budget {
                 break;
             }
-            let (s1, s2) = (next / 64, next % 64);
+            let (s1, s2) = (end / 64, end % 64);
             let child = view.child(s1);
             if view.mask() & (1u64 << s1) == 0 || content(&child) != Content::Branch {
-                next = (s1 + 1) * 64;
+                end = (s1 + 1) * 64;
                 continue;
             }
             if child.mask() & (1u64 << s2) != 0 {
                 let grandchild = child.child(s2);
                 if content(&grandchild) == Content::Branch {
-                    self.summary(c.child(s1).child(s2), grandchild);
-                    progressed = true;
+                    let mixed = grandchild
+                        .children()
+                        .filter(|(_, b)| content(b) == Content::Branch)
+                        .count();
+                    planned += 1 + mixed as u64;
+                    units.push(c.child(s1).child(s2));
                 }
             }
-            next += 1;
-            if next % 64 == 0 {
-                // From the cached grandchildren.
+            end += 1;
+        }
+        for (key, summary) in summarize_level2(source, &units, threads) {
+            self.summarized += 1;
+            self.cache_summary(key, summary);
+        }
+        // Children whose grandchildren are all done, from the cache.
+        for s1 in next / 64..end / 64 {
+            let child = view.child(s1);
+            if view.mask() & (1u64 << s1) != 0 && content(&child) == Content::Branch {
                 self.summary(c.child(s1), child);
             }
         }
-        self.warming.insert(c, next);
-        next >= DONE
+        self.warming.insert(c, end);
+        end >= DONE
     }
 
     /// The first half of applying a replaced chunk, once its grandchildren
@@ -1526,6 +1548,60 @@ fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
         material,
         solid: u64::from(view.mask().count_ones()) * child / 2,
     }
+}
+
+/// The summaries of the level-2 nodes `keys` and of their mixed children,
+/// computed on up to `threads` scoped threads: for each node, its mixed
+/// children's then its own, as [`Residency::summary`] computes them with
+/// nothing cached. Pure, so the result does not depend on the threads.
+fn summarize_level2<S: VoxelSource + Sync>(
+    source: &S,
+    keys: &[NodeKey],
+    threads: usize,
+) -> Vec<(NodeKey, Summary)> {
+    let run = |chunk: &[NodeKey]| {
+        let mut out = Vec::new();
+        let mut tally = Tally::default();
+        for &key in chunk {
+            let view = view_at(source, key);
+            let mut node = Tally::default();
+            for (slot, child) in view.children() {
+                let s = match content(&child) {
+                    Content::Air | Content::Unloaded => Summary::default(),
+                    Content::Uniform(m) => Summary {
+                        material: m,
+                        solid: node_volume(1),
+                    },
+                    Content::Leaf => exact_summary(child, 0),
+                    Content::Branch => {
+                        tally.clear();
+                        count_voxels(child, 1, &mut tally);
+                        let s = tally.summary();
+                        out.push((key.child(slot), s));
+                        s
+                    }
+                };
+                node.add(s.material, s.solid);
+            }
+            out.push((key, node.summary()));
+        }
+        out
+    };
+    // A few nodes are not worth a thread.
+    if threads <= 1 || keys.len() < 8 {
+        return run(keys);
+    }
+    let per = keys.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = keys
+            .chunks(per)
+            .map(|chunk| scope.spawn(move || run(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 /// Encodes `jobs` (key, brick id, edited) on up to `threads` scoped threads,

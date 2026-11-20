@@ -114,7 +114,9 @@ pub struct BrickCacheConfig {
     /// Node summaries (each over up to 64 children) that applying changed
     /// bricks and replaced chunks may compute per frame, and again that
     /// expansions may; the rest waits for later frames, nearest first. A
-    /// replaced 16 m chunk costs one per mixed node in it. `1..=16777216`.
+    /// replaced 16 m chunk costs one per mixed node in it (up to about
+    /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
+    /// needs 1,500 to 2,500 a frame. `1..=16777216`.
     pub max_summaries_per_frame: u32,
     /// Show a small built-in scene while nothing feeds the renderer a world.
     pub debug_scene: bool,
@@ -154,7 +156,7 @@ impl Default for BrickCacheConfig {
                 max_shrink_visits_per_frame: 4096,
                 max_collapses_per_frame: 256,
             },
-            max_summaries_per_frame: 2048,
+            max_summaries_per_frame: 8192,
             debug_scene: true,
             debug_scene_edits: true,
         }

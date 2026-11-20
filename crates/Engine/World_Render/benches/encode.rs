@@ -303,7 +303,7 @@ fn changes(c: &mut Criterion) {
         let mut apply = |res: &mut Residency| {
             batch.clear();
             res.queue_changes([Change::Chunk(key)]);
-            res.apply_changes(&snap, None, u64::MAX, |_| true, &mut batch)
+            res.apply_changes(&snap, None, u64::MAX, 8, |_| true, &mut batch)
         };
         let once = apply(&mut res);
         eprintln!("changes/{name}: {} summaries per change", once.summarized);

@@ -183,6 +183,9 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
+    // Summaries and brick encoding run on up to this many threads.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
+
     // Changes first: changed bricks and replaced chunks, nearest first,
     // while their summaries fit the budget; the rest wait.
     let split = res.chunk_level();
@@ -209,6 +212,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
             source,
             input.view.map(|v| v.eye),
             u64::from(input.config.max_summaries_per_frame),
+            threads,
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {
@@ -282,7 +286,6 @@ pub fn run_frame<S: VoxelSource + Sync>(
     if cost(batch) < budget && !loads.is_empty() {
         let room = (budget - cost(batch)) / mean.max(1) + 1;
         let take = loads.len().min((room as usize).saturating_mul(5) / 4 + 8);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
         let (loaded, full) =
             res.load_bricks(source, &loads[..take], threads, |b| cost(b) < budget, batch);
         report.loaded += loaded;
