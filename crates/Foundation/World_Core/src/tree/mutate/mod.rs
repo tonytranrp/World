@@ -106,7 +106,7 @@ impl<'a> Writer<'a> {
 
 impl Writer<'_> {
     /// The store the writer is working on.
-    #[inline]
+    #[inline(always)]
     fn store(&self) -> &Store {
         if let Some(chunk) = &self.held {
             return &chunk.store;
@@ -117,7 +117,7 @@ impl Writer<'_> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn store_mut(&mut self) -> &mut Store {
         let Some(id) = self.chunk else {
             return &mut self.forest.top;
@@ -189,7 +189,7 @@ impl Writer<'_> {
     }
 
     /// The index and contents of the node behind `child`, if it is one.
-    #[inline]
+    #[inline(always)]
     fn existing(&self, child: Child) -> Option<(u32, Node)> {
         match child {
             Child::Node(index) => Some((index, self.store().node(index))),

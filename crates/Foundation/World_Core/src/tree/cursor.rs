@@ -93,7 +93,9 @@ impl<'a> TreeCursor<'a> {
             if level == 0 {
                 return Some(record_voxel(reader, self.path[0], slot_at(local, 0)));
             }
-            match step(reader, self.path[level as usize], level, local) {
+            // One inlined copy of the step serves both sides of the chunk
+            // level; two cost more than the check they save.
+            match step::<true>(reader, self.path[level as usize], level, local) {
                 Step::Filled(m) => {
                     self.bottom = level;
                     return Some(m);

@@ -588,20 +588,32 @@ impl<'a> TreeView<'a> {
             Child::NotResident => return None,
             Child::Node(index) => index,
         };
+        // Above the chunk level, where words may be not resident.
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
-        loop {
-            match step(&mut storage, index, level, local) {
+        while level > CHUNK_LEVEL {
+            match step::<true>(&mut storage, index, level, local) {
                 Step::Filled(m) => return Some(m),
                 Step::NotResident => return None,
                 Step::Node(child) => {
                     level -= 1;
                     index = child;
-                    if level == CHUNK_LEVEL {
-                        let (chunk, root) = chunk_root(self.chunks, child);
-                        storage = chunk.reader();
-                        index = root;
-                    }
+                }
+                // Records hang below level 1 only.
+                Step::Record(_) => unreachable!("no records above the chunk level"),
+            }
+        }
+        // Inside the chunk `index` names: everything is resident.
+        let (chunk, root) = chunk_root(self.chunks, index);
+        let mut storage = chunk.reader();
+        index = root;
+        loop {
+            match step::<false>(&mut storage, index, level, local) {
+                Step::Filled(m) => return Some(m),
+                Step::NotResident => unreachable!("chunks are resident throughout"),
+                Step::Node(child) => {
+                    level -= 1;
+                    index = child;
                 }
                 Step::Record(at) => {
                     return Some(record_voxel(&mut storage, at, slot_at(local, 0)));
@@ -620,7 +632,7 @@ impl<'a> TreeView<'a> {
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         loop {
-            match step(&mut storage, index, level, local) {
+            match step::<true>(&mut storage, index, level, local) {
                 Step::Node(child) if level == CHUNK_LEVEL + 1 => return Some(child),
                 Step::Node(child) => {
                     index = child;
@@ -642,7 +654,7 @@ impl<'a> TreeView<'a> {
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         while level > CHUNK_LEVEL {
-            match step(&mut storage, index, level, local) {
+            match step::<true>(&mut storage, index, level, local) {
                 Step::NotResident => return false,
                 Step::Node(child) => {
                     index = child;
@@ -697,10 +709,12 @@ pub(crate) enum Step {
 }
 
 /// The child of node `index`, at `level`, that holds local coordinate `local`.
+/// `TOP` is whether the node is above the chunk level, the only place a word
+/// can be not resident; inside a chunk the check is left out.
 /// Always inlined: as a call, the reader's cached page goes through memory on
 /// every level, which Callgrind measured at 70% more instructions per lookup.
 #[inline(always)]
-pub(crate) fn step(
+pub(crate) fn step<const TOP: bool>(
     storage: &mut StorageReader<'_>,
     index: u32,
     level: u32,
@@ -720,7 +734,7 @@ pub(crate) fn step(
     }
     let k = rank(node.mask, slot) as u32;
     let word = storage.word(node.base + k);
-    if word == NOT_RESIDENT {
+    if TOP && word == NOT_RESIDENT {
         Step::NotResident
     } else if word & UNIFORM_BIT != 0 {
         Step::Filled(MaterialId(word as u16))
