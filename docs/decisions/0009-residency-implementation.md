@@ -140,19 +140,25 @@ from the CI artifact, compared function by function, found the causes:
   itself refuses at an unloaded child. Lookups test for not-resident words
   only above the chunk level.
 
-After the fixes the gate measures, against main: random reads +29%,
-single-voxel writes into an empty tree +23% and into a dense block +7%, box
-fills +9%, an edit after a snapshot +15% (the chunk's free lists are
-copied), batched edits +3%, encoding 0%, decoding -97%. What remains is the
-price of chunk-owned arenas: a lookup starts a second
-page reader (two more page lookups and its setup) when it enters a chunk,
-and a write to a new chunk allocates that chunk's own pages. In exchange a
-chunk is freed, moved or snapshotted whole, decoding is 97% cheaper, and
-generated chunks are 37 to 57% smaller. Wall time on Windows (Criterion)
-after these changes, against main: random reads 4.6 against 6.0 ms per
-100k, coherent cursor reads 0.46 against 0.45 ms per 64k, single-voxel
-writes 5.05 against 4.3 ms per 10k, batched edits 1.41 against 1.32 ms,
-box fills 0.57 against 0.49 ms.
+After those fixes reads were still +29% and writes +23%: a lookup crossed
+five top levels and then started a second page reader inside the chunk.
+The forest now keeps a **chunk index** (chunk key to id, and id to key,
+behind `Arc`s that snapshots share and that are copied with the chunk table
+on the first write after a snapshot, so snapshots stay O(1)). A point read,
+a single-chunk voxel batch or a single-chunk box goes straight to the chunk.
+A hit counts only when the id is live and its key matches, so a stale or
+missing entry costs a walk from the root and never a wrong answer; chunks
+are linked where their position is known (voxel writes, fills, grafts,
+region builds) and unlinked when freed, and a write that collapses an
+indexed chunk is recorded above it by a graft. Tests compare reads through
+the index with cursor walks across moves between trees, unloads, collapses
+and snapshots, and the one-million-edit suites pass.
+
+Criterion on Windows against main: random reads 2.3 against 6.0 ms per
+100k, coherent reads 1.4 against 3.1 ms per 64k, coherent cursor reads
+0.45 against 0.45 ms, single-voxel writes 3.8 against 4.3 ms per 10k,
+batched edits 1.34 against 1.32 ms, box fills 0.51 against 0.49 ms. A
+snapshot is 40 ns instead of 17 (two more reference counts).
 
 ## Measured (RTX 4070 laptop, i7-13620H, 2026-11-20)
 
