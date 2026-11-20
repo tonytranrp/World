@@ -45,6 +45,13 @@
         // Rays stop where a cell is smaller than this many pixel
         // footprints; 0.0 traces at full resolution. 0.0..=16.0
         footprint_bias: 1.0,
+        // Records stage 1 examines per frame; a larger walk resumes next
+        // frame. 1024..=16777216
+        max_visits_per_frame: 16384,
+        // Stage 1 looks for nodes to refine again once the camera moved
+        // this many voxels or the cache changed; 0 looks every frame.
+        // 0.0..=4096.0
+        regrow_voxels: 16.0,
     ),
     // A small built-in scene while nothing feeds the renderer a world.
     debug_scene: true,

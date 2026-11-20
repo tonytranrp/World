@@ -14,7 +14,9 @@ use world_render::internals::feedback::{Request, encode_request};
 use world_render::internals::format::decode::Sample;
 use world_render::internals::frame::{FrameInput, run_frame};
 use world_render::internals::key::{NodeKey, Shape, view_at};
-use world_render::internals::select::{ViewPoint, projected_pixels, select};
+use world_render::internals::select::{
+    Selection, ViewPoint, projected_pixels, select, select_budgeted,
+};
 use world_render::internals::{BrickCacheConfig, LodTuning, Stage};
 use world_testkit::dense::{Bounds, EditOp, VoxelModel};
 use world_testkit::profile::scale;
@@ -340,6 +342,8 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         detail_pixels: 1.0,
         hysteresis: 0.7,
         footprint_bias: 1.0,
+        max_visits_per_frame: 65536,
+        regrow_voxels: 16.0,
     };
     let brick = res.resident_bricks()[0];
     let pixel_angle = 0.002;
@@ -390,6 +394,65 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         pixel_angle,
     };
     assert!(select(&res, &far, &lod).evict.contains(&brick));
+}
+
+#[test]
+fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
+    let snap = slab().snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let mut lod = LodTuning {
+        detail_pixels: 1.0,
+        hysteresis: 0.7,
+        footprint_bias: 1.0,
+        max_visits_per_frame: 65536,
+        regrow_voxels: 16.0,
+    };
+    let view = ViewPoint {
+        eye: [3.0, 900.0, -5.0],
+        pixel_angle: 0.002,
+    };
+    let full = select(&res, &view, &lod);
+    assert!(!(full.load.is_empty() && full.evict.is_empty() && full.collapse.is_empty()));
+
+    // A handful of records per frame: the passes add up to the whole walk.
+    lod.max_visits_per_frame = 7;
+    let mut walk = Vec::new();
+    let mut union = Selection::default();
+    let mut frames = 0;
+    loop {
+        let s = select_budgeted(&res, &mut walk, &view, &lod, lod.max_visits_per_frame, true);
+        union.collapse.extend(s.collapse);
+        union.evict.extend(s.evict);
+        union.expand.extend(s.expand);
+        union.load.extend(s.load);
+        frames += 1;
+        if walk.is_empty() {
+            break;
+        }
+    }
+    assert!(frames > 1, "the budget split the walk");
+    for v in [
+        &mut union.collapse,
+        &mut union.evict,
+        &mut union.expand,
+        &mut union.load,
+    ] {
+        // Growth runs whole every frame, so it repeats.
+        v.sort_unstable();
+        v.dedup();
+    }
+    let mut want = full;
+    for v in [
+        &mut want.collapse,
+        &mut want.evict,
+        &mut want.expand,
+        &mut want.load,
+    ] {
+        v.sort_unstable();
+    }
+    assert_eq!(union, want);
 }
 
 /// From the default camera, stage 1 refines the debug scene down to resident

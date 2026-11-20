@@ -14,7 +14,7 @@ use world_core::tree::VoxelSource;
 use super::batch::UploadBatch;
 use super::key::NodeKey;
 use super::residency::{Refused, Residency};
-use super::select::{ViewPoint, distance, select};
+use super::select::{ViewPoint, distance, select_budgeted};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -82,10 +82,20 @@ pub fn run_frame<S: VoxelSource + Sync>(
     let mean = u64::from(input.config.mean_brick_bytes);
 
     // Stage work, decided before edits so their reserve is known.
-    let selection = input
-        .view
-        .map(|view| select(res, &view, &input.config.lod))
-        .unwrap_or_default();
+    let lod = &input.config.lod;
+    let selection = match input.view {
+        Some(view) => {
+            let grow = res.growth().due(&view, lod.regrow_voxels);
+            let mut walk = res.take_walk();
+            let s = select_budgeted(res, &mut walk, &view, lod, lod.max_visits_per_frame, grow);
+            res.put_walk(walk);
+            if grow {
+                res.growth().ran(view);
+            }
+            s
+        }
+        None => Default::default(),
+    };
     let mut loads: Vec<NodeKey> = Vec::new();
     let mut expands: Vec<NodeKey> = selection.expand.clone();
     match input.config.stage {
@@ -183,18 +193,32 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
 
     report.upload_bytes = cost(batch);
-    let stats = res.stats();
+    // Anything that changed the table can change what growth finds; edits
+    // rewrite records even when no brick is uploaded.
+    if !dirty.is_empty()
+        || report.loaded
+            + report.expanded
+            + report.collapsed
+            + report.evicted
+            + report.victims_applied
+            + report.edited_uploaded
+            + report.edited_unlinked
+            > 0
+    {
+        res.growth().changed();
+    }
+    let bricks = res.brick_count();
     report.evict_target = eviction_target(
         res.brick_fill(),
         input.config.evict_threshold,
         input.config.evict_fraction,
-        stats.bricks,
+        bricks,
         input.victim_capacity,
     )
     .or_else(|| {
         // A full pool below the threshold (fragmentation): free a little.
-        (report.refused_full > 0 && stats.bricks > 0)
-            .then_some((stats.bricks as u32 / 20).clamp(1, input.victim_capacity))
+        (report.refused_full > 0 && bricks > 0)
+            .then_some((bricks as u32 / 20).clamp(1, input.victim_capacity))
     });
     report
 }

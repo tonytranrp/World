@@ -60,6 +60,13 @@ pub struct LodTuning {
     /// Rays stop descending where a cell is smaller than this many pixel
     /// footprints; `0.0` traces at full resolution. `0.0..=16.0`.
     pub footprint_bias: f32,
+    /// Records stage 1 examines per frame; a walk over more resumes next
+    /// frame. `1024..=16777216`.
+    pub max_visits_per_frame: u32,
+    /// Stage 1 looks for nodes to refine again once the camera moved this
+    /// many voxels, or the cache changed; `0` looks every frame.
+    /// `0.0..=4096.0`.
+    pub regrow_voxels: f32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -119,6 +126,8 @@ impl Default for BrickCacheConfig {
                 detail_pixels: 1.0,
                 hysteresis: 0.7,
                 footprint_bias: 1.0,
+                max_visits_per_frame: 16384,
+                regrow_voxels: 16.0,
             },
             debug_scene: true,
             debug_scene_edits: true,
@@ -206,6 +215,18 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.footprint_bias.into(),
             0.0,
             16.0,
+        );
+        range(
+            "lod.regrow_voxels",
+            self.lod.regrow_voxels.into(),
+            0.0,
+            4096.0,
+        );
+        range(
+            "lod.max_visits_per_frame",
+            self.lod.max_visits_per_frame.into(),
+            1024.0,
+            16777216.0,
         );
         if problems.is_empty() {
             Ok(())

@@ -22,6 +22,7 @@ use world_core::tree::{NodeView, VoxelSource};
 
 use super::batch::UploadBatch;
 use super::key::{NodeKey, Shape, view_at};
+use super::select::GrowthState;
 use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
     Content, Summary, Tally, content, exact_summary, node_volume,
@@ -97,6 +98,20 @@ pub struct Residency {
     id_keys: Vec<Option<NodeKey>>,
     frame: u32,
     tally: Tally,
+    /// Stage 1's walk in progress: nodes still to visit (see
+    /// [`select_budgeted`](super::select::select_budgeted)).
+    walk: Vec<NodeKey>,
+    /// When stage 1's growth last ran.
+    growth: GrowthState,
+}
+
+/// What stage 1 needs of one node, from a single table lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeState {
+    pub expanded: bool,
+    pub brick_resident: bool,
+    /// Children with content, by slot.
+    pub mask: u64,
 }
 
 impl Residency {
@@ -114,6 +129,8 @@ impl Residency {
             id_keys: vec![None; layout.brick_ids as usize],
             frame: 1,
             tally: Tally::default(),
+            walk: Vec::new(),
+            growth: GrowthState::default(),
         })
     }
 
@@ -142,6 +159,12 @@ impl Residency {
         }
     }
 
+    /// Resident bricks: each holds exactly one brick id. O(1), unlike
+    /// [`stats`](Self::stats), which scans the table.
+    pub fn brick_count(&self) -> usize {
+        self.ids.in_use() as usize
+    }
+
     pub fn brick_fill(&self) -> f32 {
         self.bricks.fill()
     }
@@ -152,6 +175,30 @@ impl Residency {
 
     pub fn has_record(&self, key: NodeKey) -> bool {
         self.entries.contains_key(&key)
+    }
+
+    /// The node's state, or `None` when it has no record.
+    pub fn node_state(&self, key: NodeKey) -> Option<NodeState> {
+        self.entries.get(&key).map(|e| NodeState {
+            expanded: e.group.is_some(),
+            brick_resident: e.brick.is_some(),
+            mask: e.record.mask(),
+        })
+    }
+
+    /// Takes stage 1's walk in progress, to resume it.
+    pub fn take_walk(&mut self) -> Vec<NodeKey> {
+        std::mem::take(&mut self.walk)
+    }
+
+    /// Puts back stage 1's walk in progress.
+    pub fn put_walk(&mut self, walk: Vec<NodeKey>) {
+        self.walk = walk;
+    }
+
+    /// When stage 1's growth last ran.
+    pub fn growth(&mut self) -> &mut GrowthState {
+        &mut self.growth
     }
 
     pub fn is_expanded(&self, key: NodeKey) -> bool {
@@ -431,6 +478,8 @@ impl Residency {
         }
         self.entries.clear();
         self.summaries.clear();
+        self.walk.clear();
+        self.growth.changed();
         self.write_root(source, batch);
     }
 

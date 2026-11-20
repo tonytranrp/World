@@ -58,13 +58,45 @@ Records are append-only, so the corrections and choices are recorded here.
 
 ### World_Gen and World_Cpu_Ref
 
-- Terrain v1 is heightfield-only (no caves yet), scalar Perlin of our own,
-  golden hashes run on Windows, macOS arm64 and macOS x86_64 under Rosetta.
+- Terrain v1 is heightfield-only, scalar Perlin of our own, golden hashes
+  run on Windows, macOS arm64 and macOS x86_64 under Rosetta.
+- **Caves are generator version 2** (now `CURRENT`; version 1 stays
+  supported and its hashes unchanged, since its fingerprint ignores the cave
+  parameters). Three 3D fBm fields are evaluated every metre, trilinearly
+  upsampled to a quarter-metre lattice where
+  `f = min(max(|a|, |b|) - tunnel_radius, cavern_threshold - c)` (tunnels
+  where two fields cross zero, caverns where a third is high), and `f` is
+  trilinearly interpolated to voxels; a solid voxel inside the cave band and
+  under `cover_m` of rock is air where `f < 0`. Upsampling the fields before
+  combining them costs a sixteenth of the noise of a quarter-metre lattice
+  and keeps tunnel walls sharp. Every lattice value depends only on its
+  global index and interpolation has a fixed order, so `Generator::material`
+  and a chunk's grid agree bit for bit. Interval skipping uses corner bounds
+  per cell and a pyramid over them; cubes inside one cell are decided by
+  their eight corner voxels (the interpolant is multilinear there), with a
+  `1e-3` margin. `Generator::chunk_source` builds a chunk with its caves;
+  the coarse tier stays heightfield-only.
 - `ChunkSource` proves air, bedrock and soil cubes uniform from a min/max
   pyramid; a surface chunk builds in about 47 ms. `CoarseSource` gives the
   coarse tier one material per cell.
 - The CPU reference tracer reports not-resident regions as hits with
   `resident: false`.
+
+### World_Render stage 1 at scale
+
+The first runs with caves showed stage 1 walking every resident record each
+frame: about 650,000 records, four random table lookups each, 140 to 220 ms
+a frame with nothing to do. The walk is now split. Growth (expand, load)
+descends only into nodes that want refining (a child projects to less than
+a quarter of its parent, so below a node that does not want refining nothing
+does), tests children by squared distance from four slab distances per axis
+before any lookup, and is skipped while the camera stays within
+`lod.regrow_voxels` of where it last ran and the table has not changed.
+Shrink (collapse, evict) resumes across frames under
+`lod.max_visits_per_frame`. An idle frame's `run_frame` went from 140 to
+220 ms to 4 to 6 ms (development build); a shrink pass within the budget
+gives exactly the whole walk's answer (tested). The per-frame eviction check
+reads the brick count from the id allocator instead of scanning the table.
 
 ### World_Game
 
@@ -104,6 +136,10 @@ Records are append-only, so the corrections and choices are recorded here.
 | Full-detail sphere around the player, debug build | 280 chunks, 298 MiB, 8.0 s | 276 chunks, 151 MiB, 4.8 s |
 | GPU trace at 1280x720, full / footprint detail | | 7.8 / 1.47 ms |
 | GPU brick encoder, one thread | 103 MiB/s | 326 MiB/s (stored palette blocks copied) |
+| Stage 1 frame with nothing to change, 650k records (development build) | 140 to 220 ms | 4 to 6 ms |
+| Surface chunk seed to tree, version 1 / version 2 with caves | | 77 / 112 ms |
+| Underground chunk with caves (columns and cave grid / build, 97k leaves, 1.4 MiB) | | 40 / 64 ms |
+| Full-detail sphere with caves, development build | | 276 chunks, 289 MiB, 9 to 10 s |
 | Loading bricks into the GPU pools, 1 / 8 threads | | 153 / 245 MiB/s |
 
 ## Consequences
