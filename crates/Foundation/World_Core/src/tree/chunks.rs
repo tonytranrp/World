@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::build::RegionSource;
+use super::build::{LeafFill, RegionSource, brick_by_leaves};
 use super::mutate::{self, Builder};
 use super::node::leaf::{Record, Voxels};
 use super::node::{CHUNK_LEVEL, Child, slot_at, slots};
@@ -580,6 +580,23 @@ impl<B: RegionSource> RegionSource for Overlaid<'_, B> {
             NodeRef::Uniform(m) => Some(m),
             NodeRef::Air => Some(MaterialId::AIR),
             _ => None,
+        }
+    }
+
+    fn brick(&self, min: VoxelPos, each: &mut dyn FnMut(u32, LeafFill<'_>)) {
+        // A brick the overlay leaves alone is the base's, which may share
+        // work between its leaves.
+        let untouched = path::world_local(min).is_none_or(|local| {
+            !self.inside(local)
+                || matches!(
+                    self.overlay_at(local, 16),
+                    NodeRef::Uniform(MaterialId::KEEP)
+                )
+        });
+        if untouched {
+            self.base.brick(min, each);
+        } else {
+            brick_by_leaves(self, min, each);
         }
     }
 
