@@ -6,11 +6,36 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# The library's unit tests are not benchmarks, and libtest rejects Criterion's flags.
+[lib]
+bench = false
+
 [dependencies]
 world_core.workspace = true
 bevy.workspace = true
 wgpu.workspace = true
 world_reload.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+offset-allocator.workspace = true
+
+[dev-dependencies]
+world_testkit.workspace = true
+world_testkit_bevy.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+wesl.workspace = true
+image.workspace = true
+
+# CPU-side hot paths: encoder throughput, allocator operations.
+[[bench]]
+name = "encode"
+harness = false
+
+# GPU timings of the trace and apply passes; prints SKIPPED without an adapter.
+[[bench]]
+name = "gpu_timing"
+harness = false
 
 [lints]
 workspace = true

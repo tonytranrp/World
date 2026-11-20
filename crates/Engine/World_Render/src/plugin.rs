@@ -4,11 +4,15 @@ use bevy::render::renderer::RenderAdapterInfo;
 use world_core::material::MaterialTable;
 use world_reload::AppConfigExt;
 
-use crate::passes;
 use crate::tier::RenderTier;
+use crate::{graph, passes};
 
 /// Registers everything the renderer needs. The tier is decided before the GPU
 /// device exists (see `tier`), so the app hands the decision in here.
+///
+/// The world to draw comes from the [`VoxelWorldFeed`](crate::prelude::VoxelWorldFeed)
+/// resource, which this plugin creates; until something publishes to it, a
+/// small built-in scene is shown (config `debug_scene`).
 pub struct WorldRenderPlugin {
     tier: RenderTier,
 }
@@ -25,6 +29,7 @@ impl Plugin for WorldRenderPlugin {
             .add_config::<MaterialTable>()
             .add_systems(Startup, log_active_adapter);
         passes::build(app);
+        graph::build(app, &self.tier);
     }
 }
 
