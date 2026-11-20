@@ -42,6 +42,14 @@ pub struct ResidencyConfig {
     pub save_dir: String,
     /// The player's velocity is averaged over about this long, in seconds.
     pub velocity_smoothing_secs: f32,
+    /// While the player moves, full-detail chunks near where they will be
+    /// this many seconds ahead load first, and a lookahead sphere there is
+    /// loaded too. 0 turns prefetching off.
+    pub prefetch_lookahead_secs: f32,
+    /// The lookahead sphere's radius, in metres. Its chunks load only once
+    /// every chunk within the full-detail radius is requested, and only out
+    /// to the evict radius.
+    pub prefetch_radius_m: f32,
 }
 
 impl Default for ResidencyConfig {
@@ -61,6 +69,8 @@ impl Default for ResidencyConfig {
             log_checkpoint_kib: 16384,
             save_dir: "saves/world".into(),
             velocity_smoothing_secs: 0.5,
+            prefetch_lookahead_secs: 2.0,
+            prefetch_radius_m: 64.0,
         }
     }
 }
@@ -108,6 +118,18 @@ impl ConfigAsset for ResidencyConfig {
             0.0,
             10.0,
         );
+        range(
+            "prefetch_lookahead_secs",
+            self.prefetch_lookahead_secs.into(),
+            0.0,
+            10.0,
+        );
+        range(
+            "prefetch_radius_m",
+            self.prefetch_radius_m.into(),
+            16.0,
+            1024.0,
+        );
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());
         }
@@ -142,9 +164,13 @@ mod tests {
             workers: 100,
             log_checkpoint_kib: 1,
             save_dir: " ".into(),
+            velocity_smoothing_secs: f32::NAN,
+            prefetch_lookahead_secs: -1.0,
+            prefetch_radius_m: 4.0,
+            warm_edited_weight: 0.5,
             ..ResidencyConfig::default()
         };
-        assert_eq!(bad.validate().unwrap_err().len(), 4);
+        assert_eq!(bad.validate().unwrap_err().len(), 8);
     }
 
     #[test]

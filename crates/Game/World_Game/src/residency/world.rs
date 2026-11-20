@@ -1069,7 +1069,7 @@ impl StreamedWorld {
         let in_flight_cap = (self.config.workers.max(1) as usize) * 4;
         let sphere = plan::sphere(eye, self.config.full_radius_m);
         self.count_holes(eye, &sphere);
-        for coord in sphere {
+        for coord in self.load_order(eye, sphere) {
             if self.loaded.contains_key(&coord)
                 || self.loading.contains(&coord)
                 || self.ready.iter().any(|(c, _, _)| *c == coord)
@@ -1100,6 +1100,33 @@ impl StreamedWorld {
                 saved: self.saved.contains(&coord),
             });
         }
+    }
+
+    /// The order to request chunks in: the full-detail `sphere` (nearest
+    /// first) ahead of the motion first, then, once all of it is requested
+    /// and while the hot tier is under its cap, the lookahead sphere. Every
+    /// chunk of the full-detail sphere precedes every lookahead chunk, so
+    /// prefetching never starves it.
+    fn load_order(&self, eye: VoxelPos, sphere: Vec<ChunkCoord>) -> Vec<ChunkCoord> {
+        let c = &self.config;
+        let Some(predicted) = self.motion.predicted(
+            eye,
+            c.prefetch_lookahead_secs,
+            plan::voxels(c.evict_radius_m),
+        ) else {
+            return sphere;
+        };
+        let mut order = plan::ahead_first(eye, predicted, &sphere);
+        if self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB {
+            order.extend(plan::lookahead(
+                eye,
+                predicted,
+                c.prefetch_radius_m,
+                c.full_radius_m,
+                c.evict_radius_m,
+            ));
+        }
+        order
     }
 
     /// Records the chunks of the full-detail `sphere` around `eye` that are

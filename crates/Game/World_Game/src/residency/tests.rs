@@ -895,3 +895,94 @@ fn the_warm_cache_keeps_to_its_budget_and_prefers_edited_chunks() {
         "weighted: it outlasts the generated chunks evicted after it"
     );
 }
+
+/// What a walk saw: the chunks joined in order, and the world at the end.
+struct Walk {
+    joined: Vec<world_gen::ChunkCoord>,
+    world: StreamedWorld,
+    eye: VoxelPos,
+}
+
+/// Opens a world and walks from (`x`, `z`) along +x at 8 m/s for `updates`
+/// updates of 1/60 s, zero workers (so at most four loads per update), with
+/// the given lookahead.
+fn walk(name: &str, x: i32, z: i32, lookahead_secs: f32, updates: i32) -> Walk {
+    let dir = temp_dir(name);
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            full_radius_m: 32.0,
+            evict_radius_m: 48.0,
+            prefetch_radius_m: 32.0,
+            prefetch_lookahead_secs: lookahead_secs,
+            velocity_smoothing_secs: 0.0,
+            ..config(0)
+        },
+    );
+    let mut joined = Vec::new();
+    let mut eye = eye_at(&world, x, z);
+    for i in 0..updates {
+        // 8 m/s is 512 voxels a second, 8.53 per update.
+        eye = eye_at(&world, x + i * 512 / 60, z);
+        world.update(eye, FRAME);
+        joined.extend(world.take_changes().loaded);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Walk { joined, world, eye }
+}
+
+/// Of `chunks`, how many lie ahead of (+x) and behind the chunk at `x`.
+fn split_ahead(chunks: &[world_gen::ChunkCoord], x: i32) -> (usize, usize) {
+    let at = world_gen::ChunkCoord::containing(VoxelPos::new(x, 0, 0))
+        .unwrap()
+        .x();
+    let ahead = chunks.iter().filter(|c| c.x() > at).count();
+    let behind = chunks.iter().filter(|c| c.x() < at).count();
+    (ahead, behind)
+}
+
+#[test]
+fn moving_loads_the_chunks_ahead_first() {
+    let (x, z) = (4500, -1500);
+    // Starting from nothing and walking at once, the sphere fills over a
+    // few dozen updates. The first 40 chunks joined:
+    let plain = walk("prefetch_off", x, z, 0.0, 12);
+    let ahead = walk("prefetch_on", x, z, 3.0, 12);
+    let first = |w: &Walk| w.joined[..40.min(w.joined.len())].to_vec();
+    let (p_ahead, p_behind) = split_ahead(&first(&plain), x);
+    let (a_ahead, a_behind) = split_ahead(&first(&ahead), x);
+    assert!(
+        a_ahead > p_ahead && a_behind <= p_behind,
+        "prefetch {a_ahead} ahead / {a_behind} behind, nearest first {p_ahead} / {p_behind}"
+    );
+    assert!(a_ahead > a_behind, "{a_ahead} / {a_behind}");
+    // The player's own chunk is never put off.
+    let own = world_gen::ChunkCoord::containing(eye_at(&ahead.world, x, z)).unwrap();
+    let pos = ahead.joined.iter().position(|&c| c == own).unwrap();
+    assert!(pos < 8, "{pos}");
+
+    // The same walk gives the same loads in the same order.
+    let again = walk("prefetch_again", x, z, 3.0, 12);
+    assert_eq!(again.joined, ahead.joined);
+}
+
+#[test]
+fn prefetch_loads_ahead_of_the_sphere_and_never_starves_it() {
+    let (x, z) = (-5500, 3500);
+    let mut w = walk("prefetch_long", x, z, 3.0, 240);
+    // Four loads an update keep up at 8 m/s: the sphere around the player is
+    // whole, and the lookahead has loaded chunks beyond it, all ahead.
+    assert_eq!(w.world.stats().holes, 0, "{:?}", w.world.stats());
+    let full = super::plan::voxels(32.0);
+    let beyond: Vec<_> = w
+        .world
+        .loaded_chunks()
+        .into_iter()
+        .filter(|&c| super::plan::chunk_distance(w.eye, c) > full)
+        .collect();
+    let (ahead, _) = split_ahead(&beyond, w.eye.x);
+    assert!(ahead > 0, "{beyond:?}");
+    // Standing still, everything around the player settles.
+    settle(&mut w.world, w.eye);
+    assert!(w.world.is_settled(w.eye));
+}
