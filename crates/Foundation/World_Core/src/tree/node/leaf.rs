@@ -219,7 +219,44 @@ pub(crate) fn encode(voxels: &Voxels) -> PackedLeaf {
         let high = bits(voxels, |m| m == hi);
         return two_materials(mask, MaterialId(lo), MaterialId(hi), high);
     }
+    if hi - lo < 64 {
+        return close_materials(voxels, mask, lo);
+    }
     many_materials(voxels, mask)
+}
+
+/// The palette leaf of solid voxels `mask` holding three or more materials,
+/// all within 64 ids from `lo`, the smallest: a bit per id says which are
+/// present, which lists the palette in ascending order and gives each
+/// material's index as the number of present ids below it.
+fn close_materials(voxels: &Voxels, mask: u64, lo: u16) -> PackedLeaf {
+    let mut present = 0u64;
+    for &m in voxels {
+        // Air voxels shift a zero; the mask keeps their shift in range.
+        present |= u64::from(!m.is_air()) << (m.0.wrapping_sub(lo) & 63);
+    }
+    let len = present.count_ones() as usize;
+    let bits = width_for(len);
+    let index_start = 1 + palette_words(len);
+    let mut words = [0u32; MAX_PALETTE_BLOCK];
+    words[0] = header(len, bits);
+    let mut rest = present;
+    for i in 0..len {
+        let m = lo + rest.trailing_zeros() as u16;
+        rest &= rest - 1;
+        words[1 + i / 2] |= u32::from(m) << (16 * (i % 2));
+    }
+    for (k, slot) in slots(mask).enumerate() {
+        let below = (1u64 << (voxels[slot as usize].0 - lo)) - 1;
+        let index = (present & below).count_ones();
+        let at = k * bits as usize;
+        words[index_start + at / 32] |= index << (at % 32);
+    }
+    let len = index_start + index_words(mask.count_ones() as usize, bits);
+    PackedLeaf::Palette {
+        mask,
+        block: PaletteBlock { words, len },
+    }
 }
 
 /// Bit `slot` set where `test` holds for voxel `slot`'s material id.
@@ -256,16 +293,16 @@ fn two_materials(mask: u64, lo: MaterialId, hi: MaterialId, high: u64) -> Packed
     }
 }
 
-/// The palette leaf of solid voxels `mask` holding three or more materials.
+/// The palette leaf of solid voxels `mask` holding three or more materials,
+/// spread over more than 64 ids.
 fn many_materials(voxels: &Voxels, mask: u64) -> PackedLeaf {
     // The distinct solid materials in order of first appearance; runs of
     // one material skip the scan.
     let mut distinct = [MaterialId::AIR; MAX_PALETTE];
     let mut len = 0;
     let mut last = MaterialId::AIR;
-    for slot in slots(mask) {
-        let m = voxels[slot as usize];
-        if m != last {
+    for &m in voxels {
+        if m != last && !m.is_air() {
             last = m;
             if !distinct[..len].contains(&m) {
                 distinct[len] = m;
@@ -464,7 +501,7 @@ mod tests {
         fn encode_matches_the_reference(
             // Few materials with long runs, like terrain, up to every slot
             // its own material.
-            spread in proptest::prop_oneof![1u16..5, 1u16..80],
+            spread in proptest::prop_oneof![1u16..5, 1u16..80, 60u16..400],
             run in 1usize..20,
             seed: u64,
         ) {
