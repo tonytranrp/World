@@ -1274,3 +1274,60 @@ fn a_kept_record_survives_an_edit_below_it() {
         &config,
     );
 }
+
+/// While a change waits, verify still checks every record that change
+/// cannot touch: a uniform sibling of the waiting chunk, in the group of a
+/// node on the change's path, must match the source.
+#[test]
+fn verify_still_checks_the_siblings_of_a_waiting_change() {
+    let mut tree = slab();
+    // A uniform chunk next to the one that will be replaced: a record in
+    // the level-5 group with no entry of its own.
+    let u = VoxelPos::new(1024, -1024, 0);
+    tree.fill_box(VoxelBox::from_min_size(u, [1024; 3]), MaterialId(5))
+        .unwrap();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    let c = VoxelPos::new(0, -1024, 0);
+    let p = key(c).parent();
+    assert_eq!(key(u).parent(), p);
+    assert!(!res.has_record(key(u)), "uniform: no entry");
+    tree.insert_chunk(c, rough_slab(256, 0).chunk_data(c).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[],
+            chunks: &[c],
+            view: None,
+            config: &config,
+        },
+    );
+    assert!(res.in_waiting_chunk(key(c)), "c waits");
+    verify(&mut res, &snap, &pools);
+
+    // Corrupt the uniform sibling's record in the pool.
+    let record = res.record(p).unwrap();
+    let slot = key(u).slot_in_parent();
+    let at = record.reference + (record.mask() & ((1u64 << slot) - 1)).count_ones();
+    let mut bad = pools.nodes[at as usize];
+    bad.info ^= 1;
+    pools.nodes[at as usize] = bad;
+    let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+    assert!(
+        res.verify(&snap, &pools.nodes, &segs, &pools.table)
+            .is_err(),
+        "the corrupted sibling went unnoticed"
+    );
+}

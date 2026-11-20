@@ -32,7 +32,7 @@ use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
     Content, Summary, Tally, content, count_voxels, exact_summary, node_volume,
 };
-use crate::brick_cache::format::{BrickRef, GpuNode, ROOT_NODE};
+use crate::brick_cache::format::{BrickRef, GpuNode, Kind, ROOT_NODE};
 use crate::brick_cache::pool::alloc::{BrickAlloc, BrickSpace, IdSpace, NodeAlloc, NodeSpace};
 use crate::brick_cache::pool::layout::PoolLayout;
 
@@ -1342,9 +1342,10 @@ impl Residency {
                 stats.expanded, stats.bricks
             ));
         }
-        // Records on the path of a change not applied yet, and everything in
-        // a waiting chunk, describe the content before it: only their
-        // structure is checked.
+        // Only the nodes on the path of a change not applied yet, and those
+        // in a waiting chunk, may describe the content before it: their
+        // records and blocks are checked for structure, not content.
+        // Everything else, their siblings included, must match the source.
         let mut pending_paths: HashSet<NodeKey> = HashSet::default();
         for change in &self.pending {
             let k = change.key();
@@ -1418,43 +1419,74 @@ impl Residency {
                     }
                 }
             }
-            if let Some(g) = e.group.filter(|_| !stale) {
-                for (k, (slot, child)) in view.children().enumerate() {
+            // The record points at what the entry holds.
+            let linked_right = match (e.group, e.brick) {
+                (Some(g), _) => e.record.kind() == Kind::Internal && e.record.reference == g.first,
+                (None, Some(b)) => {
+                    e.record.kind() == Kind::Brick && e.record.reference == b.alloc.block.pack()
+                }
+                (None, None) => key == self.shape.root() || e.record.kind() == Kind::NotResident,
+            };
+            if !linked_right {
+                return Err(format!(
+                    "{key:?}: record {:?} does not point at what the entry holds",
+                    e.record
+                ));
+            }
+            // Every record of the group, in the order of its layout.
+            if let Some(g) = e.group {
+                let mut todo = e.layout;
+                let mut at = g.first;
+                while todo != 0 {
+                    let slot = todo.trailing_zeros();
+                    todo &= todo - 1;
+                    let have = nodes.get(at as usize).copied();
+                    at += 1;
                     if affected(self, key.child(slot)) {
                         continue;
                     }
-                    let want = self.child_record(key.child(slot), child);
-                    let have = nodes.get((g.first + k as u32) as usize).copied();
+                    let want = self.child_record(key.child(slot), view.child(slot));
                     if want != have {
                         return Err(format!(
                             "{key:?} child {slot}: pool {have:?}, source {want:?}"
                         ));
                     }
                 }
-            }
-            if let Some(b) = e.brick.filter(|_| !stale) {
-                let mut want = Vec::new();
-                encode_brick(
-                    view,
-                    b.id,
-                    self.edited_bit(key),
-                    &mut want,
-                    &mut Tally::default(),
-                );
-                let seg = segments
-                    .get(b.alloc.block.segment as usize)
-                    .ok_or_else(|| format!("{key:?}: no segment {}", b.alloc.block.segment))?;
-                let at = b.alloc.block.word();
-                let have = seg.get(at..at + want.len());
-                if have != Some(&want[..]) {
-                    return Err(format!(
-                        "{key:?}: block at {:?} differs from the source",
-                        b.alloc.block
-                    ));
+                // A child the layout lacks must be one a pending change made.
+                let mut missing = view.mask() & !e.layout;
+                while missing != 0 {
+                    let slot = missing.trailing_zeros();
+                    missing &= missing - 1;
+                    if !affected(self, key.child(slot)) {
+                        return Err(format!("{key:?} child {slot}: not in the group"));
+                    }
                 }
+            }
+            if let Some(b) = e.brick {
                 let t = (b.id * 2) as usize;
                 if table.get(t) != Some(&b.alloc.block.pack()) || table.get(t + 1) == Some(&0) {
                     return Err(format!("{key:?}: brick table entry {} is wrong", b.id));
+                }
+                if !stale {
+                    let mut want = Vec::new();
+                    encode_brick(
+                        view,
+                        b.id,
+                        self.edited_bit(key),
+                        &mut want,
+                        &mut Tally::default(),
+                    );
+                    let seg = segments
+                        .get(b.alloc.block.segment as usize)
+                        .ok_or_else(|| format!("{key:?}: no segment {}", b.alloc.block.segment))?;
+                    let at = b.alloc.block.word();
+                    let have = seg.get(at..at + want.len());
+                    if have != Some(&want[..]) {
+                        return Err(format!(
+                            "{key:?}: block at {:?} differs from the source",
+                            b.alloc.block
+                        ));
+                    }
                 }
             }
         }
