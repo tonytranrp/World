@@ -1129,7 +1129,8 @@ impl Residency {
     }
 
     /// Applies an edit batch's changed bricks at once (see
-    /// [`apply_changes`](Self::apply_changes)).
+    /// [`apply_changes`](Self::apply_changes)), after freeing everything
+    /// buried, which an edit below would otherwise wait for.
     pub fn apply_edits<S: VoxelSource + Sync>(
         &mut self,
         source: &S,
@@ -1137,6 +1138,7 @@ impl Residency {
         reupload: impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
     ) {
+        self.free_buried(u32::MAX, batch);
         self.queue_changes(dirty.iter().map(|&k| Change::Brick(k)));
         self.apply_changes(source, None, u64::MAX, 1, reupload, batch);
     }

@@ -82,7 +82,9 @@ and tests stay deterministic.
   expanded ancestor, the whole group only when the ancestor's mask
   changed.
 - **Expansions:** at most `lod.max_expansions_per_frame` (128), and only
-  while they have computed fewer than `max_summaries_per_frame` summaries;
+  while they have computed fewer than
+  `lod.max_expansion_summaries_per_frame` summaries (2048; they shared
+  `max_summaries_per_frame` until that rose to 8192);
   the rest are carried, as upload-limited candidates already were.
 - **Growth queues only children that can need work.** Each entry keeps
   the slots of its children that have records and, at level 2, of those

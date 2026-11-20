@@ -348,6 +348,7 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         regrow_voxels: 16.0,
         restart_voxels: 128.0,
         max_expansions_per_frame: 128,
+        max_expansion_summaries_per_frame: 2048,
         max_shrink_visits_per_frame: 4096,
         max_collapses_per_frame: 256,
     };
@@ -416,6 +417,7 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         regrow_voxels: 16.0,
         restart_voxels: 128.0,
         max_expansions_per_frame: 128,
+        max_expansion_summaries_per_frame: 2048,
         max_shrink_visits_per_frame: 4096,
         max_collapses_per_frame: 256,
     };

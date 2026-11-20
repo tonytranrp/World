@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5279fb821d6ccf1f8ff3eda938499321aa09a2af5e0fa841a01345093612cc37 # shrinks to steps = [([], 0, 20600, false), ([Set(Edit { pos: VoxelPos { x: -20, y: 0, z: -40 }, material: MaterialId(1) })], 0, 0, false)]

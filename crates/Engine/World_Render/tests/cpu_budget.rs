@@ -1535,7 +1535,7 @@ fn collapsed_subtrees_are_freed_a_bounded_number_a_frame() {
     };
     config.lod.max_collapses_per_frame = max_collapses;
     config.lod.max_expansions_per_frame = 1 << 20;
-    config.max_summaries_per_frame = 1 << 24;
+    config.lod.max_expansion_summaries_per_frame = 1 << 24;
     let near = ViewPoint {
         eye: [1024.0, -8.0, 1024.0],
         pixel_angle: 1e-4,

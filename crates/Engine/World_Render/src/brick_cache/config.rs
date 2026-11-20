@@ -75,6 +75,9 @@ pub struct LodTuning {
     /// Nodes stage 1 or 2 expands per frame at most; the rest wait for the
     /// next frame. `1..=1048576`.
     pub max_expansions_per_frame: u32,
+    /// Node summaries expansions may compute per frame (on one thread,
+    /// unlike a replaced chunk's); the rest wait. `1..=16777216`.
+    pub max_expansion_summaries_per_frame: u32,
     /// Records the shrink walk (collapse, evict) examines per frame; it
     /// only frees memory, so it may lag behind growth. A pass started by
     /// node pool pressure takes `max_visits_per_frame` if that is larger.
@@ -112,8 +115,8 @@ pub struct BrickCacheConfig {
     pub victim_capacity: u32,
     pub lod: LodTuning,
     /// Node summaries (each over up to 64 children) that applying changed
-    /// bricks and replaced chunks may compute per frame, and again that
-    /// expansions may; the rest waits for later frames, nearest first. A
+    /// bricks and replaced chunks may compute per frame; the rest waits for
+    /// later frames, nearest first. A
     /// replaced 16 m chunk costs one per mixed node in it (up to about
     /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
     /// needs 1,500 to 2,500 a frame. `1..=16777216`.
@@ -158,6 +161,7 @@ impl Default for BrickCacheConfig {
                 regrow_voxels: 16.0,
                 restart_voxels: 128.0,
                 max_expansions_per_frame: 128,
+                max_expansion_summaries_per_frame: 2048,
                 max_shrink_visits_per_frame: 4096,
                 max_collapses_per_frame: 256,
             },
@@ -285,6 +289,12 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.max_collapses_per_frame.into(),
             1.0,
             1048576.0,
+        );
+        range(
+            "lod.max_expansion_summaries_per_frame",
+            self.lod.max_expansion_summaries_per_frame.into(),
+            1.0,
+            16777216.0,
         );
         range(
             "lod.max_expansions_per_frame",

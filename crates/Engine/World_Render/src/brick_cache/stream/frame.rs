@@ -12,8 +12,8 @@
 //! clock, so frames stay deterministic (decision 0012): changes are applied
 //! nearest first until they have computed `max_summaries_per_frame`
 //! node summaries; at most `lod.max_expansions_per_frame` nodes are
-//! expanded, and only while they too have computed fewer summaries than
-//! that; the shrink walk takes `lod.max_shrink_visits_per_frame` records;
+//! expanded, and only while they have computed fewer than
+//! `lod.max_expansion_summaries_per_frame` summaries; the shrink walk takes `lod.max_shrink_visits_per_frame` records;
 //! the records of collapsed or replaced subtrees are freed
 //! `max_frees_per_frame` at a time.
 //! The rest waits for later frames.
@@ -259,7 +259,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // number is bounded as well as their bytes.
     let mut attempts = 0u32;
     let summaries_before = res.summaries_computed();
-    let max_summaries = u64::from(input.config.max_summaries_per_frame);
+    let max_summaries = u64::from(lod.max_expansion_summaries_per_frame);
     for &k in &expands {
         if cost(batch) >= budget
             || attempts >= lod.max_expansions_per_frame
