@@ -118,6 +118,37 @@ reads the brick count from the id allocator instead of scanning the table.
   picking by the CPU reference tracer until World_Core's own ray module
   exists.
 
+### World_Core point operations against main
+
+CI's instruction gate (`bench-instructions`, Callgrind, 5% limit against
+main) first measured the chunked tree at +73% for random reads, +31 to +77%
+for single-voxel writes, +22% for box fills and +27% for an edit after a
+snapshot, against 97% fewer instructions for decoding. Callgrind profiles
+from the CI artifact, compared function by function, found the causes:
+
+- `step` compiled as a call, so the page reader's cached page went through
+  memory at every level. It is now `inline(always)`.
+- Every store access inside a chunk ran `Arc::make_mut` on the chunk table
+  and the chunk. The writer now checks the chunk out once, at its first
+  write, and back in when it leaves.
+- A full leaf of several materials was treated like a full single-material
+  leaf, so every edit in a dense mixed block repacked its brick. Only
+  single-material full leaves are brick defaults; the others patch in place.
+- Brick packing made three passes and cleared two arrays; it makes one pass
+  and moves the array.
+- `set` walked the top levels to check residency before writing; the write
+  itself refuses at an unloaded child. Lookups test for not-resident words
+  only above the chunk level.
+
+What remains is the price of chunk-owned arenas: a lookup starts a second
+page reader (two more page lookups and its setup) when it enters a chunk,
+and a write to a new chunk allocates that chunk's own pages. In exchange a
+chunk is freed, moved or snapshotted whole, decoding is 97% cheaper, and
+generated chunks are 37 to 57% smaller. Wall time on Windows (Criterion)
+after these changes, against main: random reads 4.6 against 6.0 ms per
+100k, coherent cursor reads 0.46 against 0.45 ms per 64k, single-voxel
+writes 5.5 to 5.7 against 4.3 ms per 10k, box fills 0.59 against 0.49 ms.
+
 ## Measured (RTX 4070 laptop, i7-13620H, 2026-11-20)
 
 | What | Before | After |
