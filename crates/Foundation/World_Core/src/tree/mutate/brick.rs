@@ -182,6 +182,29 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
 
 /// The default material of a brick and the leaves it stands for.
 fn default_leaves(records: &Records) -> BrickHeader {
+    // Usually no leaf is full, or every full leaf is one material: one pass.
+    let mut first: Option<MaterialId> = None;
+    let mut full = 0u64;
+    let mut mixed = false;
+    for (slot, r) in (0..).zip(records) {
+        if let Some(m) = r.uniform() {
+            match first {
+                None => first = Some(m),
+                Some(f) if f != m => {
+                    mixed = true;
+                    break;
+                }
+                Some(_) => {}
+            }
+            full |= bit(slot);
+        }
+    }
+    if !mixed {
+        return first.map_or_else(BrickHeader::default, |default| BrickHeader {
+            full,
+            default,
+        });
+    }
     let mut counts: [(MaterialId, u32); TREE_FANOUT as usize] =
         [(MaterialId::AIR, 0); TREE_FANOUT as usize];
     let mut distinct = 0;
@@ -249,5 +272,30 @@ mod tests {
         // A second full material is stored; the more common one is default.
         records[7] = Record::filled(MaterialId(3));
         assert!(matches!(pack(&records), Packed::Node(p) if p.words().len() == 6));
+    }
+
+    #[test]
+    fn the_most_common_full_material_wins_ties_to_the_lower_id() {
+        let mut records = [Record::AIR; 64];
+        for slot in [1, 2, 9] {
+            records[slot] = Record::filled(MaterialId(7));
+        }
+        for slot in [4, 5, 6] {
+            records[slot] = Record::filled(MaterialId(3));
+        }
+        records[8] = Record::single(1, MaterialId(3));
+        let h = default_leaves(&records);
+        assert_eq!(h.default, MaterialId(3), "a tie goes to the lower id");
+        assert_eq!(h.full, bit(4) | bit(5) | bit(6));
+        records[10] = Record::filled(MaterialId(7));
+        assert_eq!(default_leaves(&records).default, MaterialId(7));
+        let one = default_leaves(&{
+            let mut r = [Record::AIR; 64];
+            r[0] = Record::filled(MaterialId(2));
+            r[63] = Record::filled(MaterialId(2));
+            r
+        });
+        assert_eq!((one.default, one.full), (MaterialId(2), bit(0) | bit(63)));
+        assert_eq!(default_leaves(&[Record::AIR; 64]), BrickHeader::default());
     }
 }

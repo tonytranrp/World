@@ -39,13 +39,15 @@ use crate::material::MaterialId;
 
 /// Sets voxels. `edits` must be sorted by `node::path_key` with at most one
 /// edit per voxel. Calls `changed` with every edit that changed its voxel and
-/// the material the voxel held before.
+/// the material the voxel held before. Edits whose path meets a region that
+/// is not resident are skipped; returns whether any was. A single edit that
+/// is skipped changes nothing.
 pub(crate) fn set_voxels(
     forest: &mut Forest,
     root: &mut Child,
     edits: &[LocalEdit],
     changed: &mut impl FnMut(LocalEdit, MaterialId),
-) {
+) -> bool {
     debug_assert!(
         edits.windows(2).all(|w| {
             let key = |e: &LocalEdit| super::node::path_key(e.local, TREE_DEPTH);
@@ -53,10 +55,13 @@ pub(crate) fn set_voxels(
         }),
         "voxel edits must be in tree order, one per voxel"
     );
-    let new = Writer::new(forest).set_voxels(*root, ROOT_LEVEL, edits, changed);
+    let mut writer = Writer::new(forest);
+    let new = writer.set_voxels(*root, ROOT_LEVEL, edits, changed);
+    let refused = writer.refused;
     if let Some(child) = new {
         *root = child;
     }
+    refused
 }
 
 /// Sets every voxel of `region`. Returns whether anything changed.
@@ -84,6 +89,8 @@ struct Writer<'a> {
     /// That chunk, checked out of the forest at its first write and put back
     /// when the writer leaves it.
     held: Option<Arc<Chunk>>,
+    /// A voxel write met a region that is not resident.
+    refused: bool,
 }
 
 impl<'a> Writer<'a> {
@@ -92,6 +99,7 @@ impl<'a> Writer<'a> {
             forest,
             chunk: None,
             held: None,
+            refused: false,
         }
     }
 }

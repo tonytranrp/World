@@ -24,6 +24,10 @@ impl Writer<'_> {
         edits: &[LocalEdit],
         changed: &mut impl FnMut(LocalEdit, MaterialId),
     ) -> Option<Child> {
+        if child == Child::NotResident {
+            self.refused = true;
+            return None;
+        }
         if let Child::Air | Child::Uniform(_) = child
             && edits.iter().all(|e| Child::filled(e.material) == child)
         {

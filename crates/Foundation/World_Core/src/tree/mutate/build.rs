@@ -142,6 +142,7 @@ impl Writer<'_> {
                     forest: &mut *self.forest,
                     chunk: self.chunk,
                     held: self.held.take(),
+                    refused: false,
                 },
             };
             let new = make(&mut builder);

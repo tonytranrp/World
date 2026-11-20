@@ -114,14 +114,16 @@ impl VoxelTree {
     /// nothing, outside the world or in a region that is not resident.
     pub fn set(&mut self, pos: VoxelPos, material: MaterialId) -> Result<bool, EditError> {
         let local = path::world_local(pos).ok_or(EditError::OutOfWorld { pos })?;
-        if !self.view().resident(local) {
-            return Err(EditError::NotResident { pos });
-        }
         let mut changed = false;
         let edit = LocalEdit { local, material };
-        mutate::set_voxels(&mut self.forest, &mut self.root, &[edit], &mut |_, _| {
+        // The write walks the voxel's path anyway: one that meets an unloaded
+        // region is refused there, before anything changed.
+        let refused = mutate::set_voxels(&mut self.forest, &mut self.root, &[edit], &mut |_, _| {
             changed = true;
         });
+        if refused {
+            return Err(EditError::NotResident { pos });
+        }
         Ok(changed)
     }
 
@@ -194,12 +196,14 @@ impl VoxelTree {
         // Each voxel is written once with its final material, so a change is
         // a net change of the batch.
         let mut bricks = Vec::new();
-        mutate::set_voxels(&mut self.forest, &mut self.root, &edits, &mut |edit, _| {
-            let brick = path::from_world_local(edit.local).brick();
-            if bricks.last() != Some(&brick) {
-                bricks.push(brick);
-            }
-        });
+        let refused =
+            mutate::set_voxels(&mut self.forest, &mut self.root, &edits, &mut |edit, _| {
+                let brick = path::from_world_local(edit.local).brick();
+                if bricks.last() != Some(&brick) {
+                    bricks.push(brick);
+                }
+            });
+        debug_assert!(!refused, "residency was checked above");
         Ok(DirtyBricks::from_unsorted(bricks))
     }
 
