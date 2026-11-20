@@ -79,3 +79,13 @@ Whole-frame times with the display on, still camera, 600 frames, frames
 101 to 600: mac-floor 59.9 ms mean at the start of the session; default
 profile 130.4 ms. They need measuring again with every change above, the
 display awake and the screen unlocked, still and walking.
+
+## Hot-patching on macOS
+
+`cargo xtask hot --smoke -- --exit-after-frames 100000` passes on this Mac,
+the first run outside Windows: the first `dx serve --hot-patch` build took
+19.5 minutes (Bevy without dynamic linking), and an edit to
+`app/src/startup/hot_probe.rs` reached the running game in 3.1 s (dx
+reported 2.8 s for the patch). dx was built from source against a static
+OpenSSL 3.5 (`OPENSSL_DIR=$HOME/.local/openssl OPENSSL_STATIC=1 cargo install
+dioxus-cli --version 0.7.10 --locked`), since there is no Homebrew here.
