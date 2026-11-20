@@ -66,6 +66,32 @@ impl Forest {
         }
     }
 
+    /// Takes a chunk built elsewhere, as it is, and returns its new id.
+    pub fn adopt_chunk(&mut self, chunk: Arc<Chunk>) -> u32 {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let id = match self.free.pop() {
+            Some(id) => {
+                chunks[id as usize] = Some(chunk);
+                id
+            }
+            None => {
+                chunks.push(Some(chunk));
+                (chunks.len() - 1) as u32
+            }
+        };
+        self.touch(id);
+        id
+    }
+
+    /// The shared handle of a live chunk.
+    pub fn chunk_arc(&self, id: u32) -> Arc<Chunk> {
+        Arc::clone(
+            self.chunks[id as usize]
+                .as_ref()
+                .expect("stored chunk ids are live"),
+        )
+    }
+
     /// Drops a chunk and everything in it.
     pub fn free_chunk(&mut self, id: u32) {
         Arc::make_mut(&mut self.chunks)[id as usize] = None;

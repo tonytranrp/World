@@ -186,3 +186,46 @@ fn an_unedited_chunk_has_a_one_word_overlay() {
     assert_eq!(overlay.stats().chunks, 0, "uniform KEEP needs no chunk");
     assert!(overlay.overlay(CHUNK, &base).is_ok());
 }
+
+#[test]
+fn chunks_move_between_trees_without_copying() {
+    let mut ops_world = DenseWorld::new(B);
+    for i in 0..400 {
+        ops_world.set(
+            VoxelPos::new(8 + i % 70, 8 + i % 30, 8 + (i * 7) % 70),
+            MaterialId(1 + (i % 9) as u16),
+        );
+    }
+    let mut worker = VoxelTree::new();
+    worker.build_region(CHUNK_LEVEL, CHUNK, &ops_world).unwrap();
+    let held = worker.chunks()[0].stats.bytes;
+    let data = worker.take_chunk(CHUNK).unwrap();
+    assert_eq!(data.bytes(), held, "the chunk's pages travel as they are");
+    assert!(!worker.is_resident(CHUNK));
+    assert_eq!(worker.stats().chunks, 0);
+
+    let mut world = VoxelTree::unloaded();
+    assert_eq!(world.insert_chunk(CHUNK, data.clone()), Ok(true));
+    assert!(assert_tree_agrees(&world, &ops_world, B).is_ok());
+    check_canonical(&world).unwrap();
+    // Edits after the move stay private to the tree that makes them.
+    world.set(VoxelPos::new(9, 9, 9), MaterialId(42)).unwrap();
+    let mut other = VoxelTree::unloaded();
+    other.insert_chunk(CHUNK, data).unwrap();
+    assert_ne!(other.get(VoxelPos::new(9, 9, 9)), MaterialId(42));
+
+    // Uniform regions move as a value.
+    let mut solid = VoxelTree::new();
+    solid
+        .fill_box(
+            world_core::VoxelBox::from_min_size(CHUNK, [1024; 3]),
+            MaterialId(5),
+        )
+        .unwrap();
+    let block = solid.take_chunk(CHUNK).unwrap();
+    assert_eq!(block.uniform(), Some(MaterialId(5)));
+    let mut target = VoxelTree::unloaded();
+    target.insert_chunk(CHUNK, block).unwrap();
+    assert_eq!(target.get(VoxelPos::new(500, 500, 500)), MaterialId(5));
+    assert_eq!(target.stats().chunks, 0);
+}

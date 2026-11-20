@@ -89,6 +89,13 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Takes a whole chunk built elsewhere and returns the child its parent
+    /// holds. Only valid where a chunk-level node is being built from the top.
+    pub fn adopt_chunk(&mut self, chunk: std::sync::Arc<crate::tree::forest::Chunk>) -> Child {
+        debug_assert!(self.writer.chunk.is_none(), "chunks do not nest");
+        Child::Node(self.writer.forest.adopt_chunk(chunk))
+    }
+
     /// Frees a subtree made by this builder that will not be used.
     #[cfg(test)]
     pub fn discard(&mut self, child: Child, level: u32) {

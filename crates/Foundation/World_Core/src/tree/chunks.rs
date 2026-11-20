@@ -30,6 +30,50 @@ pub struct ChunkInfo {
     pub stats: TreeStats,
 }
 
+/// The content of one chunk-level region, detached from its tree: air, one
+/// material, or a whole chunk's arenas. Moving it between trees costs O(1),
+/// which is how chunks built on worker threads join the world.
+#[derive(Clone)]
+pub struct ChunkData {
+    content: ChunkContent,
+}
+
+#[derive(Clone)]
+enum ChunkContent {
+    Filled(Child),
+    Chunk(std::sync::Arc<super::forest::Chunk>),
+}
+
+impl ChunkData {
+    /// Bytes held by the chunk's pages; 0 for air or one material.
+    pub fn bytes(&self) -> usize {
+        match &self.content {
+            ChunkContent::Filled(_) => 0,
+            ChunkContent::Chunk(c) => c.store.stats().bytes,
+        }
+    }
+
+    /// The material of every voxel, when the region is air or one material.
+    pub fn uniform(&self) -> Option<MaterialId> {
+        match self.content {
+            ChunkContent::Filled(Child::Uniform(m)) => Some(m),
+            ChunkContent::Filled(_) => Some(MaterialId::AIR),
+            ChunkContent::Chunk(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ChunkData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.content {
+            ChunkContent::Filled(c) => write!(f, "ChunkData({c:?})"),
+            ChunkContent::Chunk(c) => {
+                write!(f, "ChunkData(chunk, {} bytes)", c.store.stats().bytes)
+            }
+        }
+    }
+}
+
 /// Where the bytes of a tree go, for budgets and for deciding format changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryBreakdown {
@@ -200,6 +244,43 @@ impl VoxelTree {
             origin: local,
         };
         self.build_region(CHUNK_LEVEL, min, &source)
+    }
+
+    /// The content of the chunk-level region at `min`, detached: the region
+    /// becomes not resident here. O(1) apart from the path above it. Fails if
+    /// the region is not resident.
+    pub fn take_chunk(&mut self, min: VoxelPos) -> Result<ChunkData, EditError> {
+        let local = node_origin(CHUNK_LEVEL, min)?;
+        if !self.view().resident(local) {
+            return Err(EditError::NotResident { pos: min });
+        }
+        let content = match self.view().chunk_id(local) {
+            Some(id) => ChunkContent::Chunk(self.forest.chunk_arc(id)),
+            None => ChunkContent::Filled(match node_at(self.root(), CHUNK_LEVEL, local) {
+                NodeRef::Uniform(m) => Child::Uniform(m),
+                _ => Child::Air,
+            }),
+        };
+        self.unload(CHUNK_LEVEL, min)?;
+        Ok(ChunkData { content })
+    }
+
+    /// Puts detached chunk content at the chunk-level region at `min`,
+    /// replacing whatever was there (loading it if it was not resident).
+    /// O(1) apart from the path above it. Returns whether anything changed.
+    pub fn insert_chunk(&mut self, min: VoxelPos, data: ChunkData) -> Result<bool, EditError> {
+        let local = node_origin(CHUNK_LEVEL, min)?;
+        Ok(mutate::graft(
+            &mut self.forest,
+            &mut self.root,
+            ROOT_LEVEL,
+            CHUNK_LEVEL,
+            local,
+            |builder| match data.content {
+                ChunkContent::Filled(child) => child,
+                ChunkContent::Chunk(chunk) => builder.adopt_chunk(chunk),
+            },
+        ))
     }
 
     /// Where the bytes go, node kind by node kind.
