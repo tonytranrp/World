@@ -592,7 +592,7 @@ impl<'a> TreeView<'a> {
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         while level > CHUNK_LEVEL {
-            match step::<true>(&mut storage, index, level, local) {
+            match step::<true, false>(&mut storage, index, level, local) {
                 Step::Filled(m) => return Some(m),
                 Step::NotResident => return None,
                 Step::Node(child) => {
@@ -608,7 +608,7 @@ impl<'a> TreeView<'a> {
         let mut storage = chunk.reader();
         index = root;
         loop {
-            match step::<false>(&mut storage, index, level, local) {
+            match step::<false, true>(&mut storage, index, level, local) {
                 Step::Filled(m) => return Some(m),
                 Step::NotResident => unreachable!("chunks are resident throughout"),
                 Step::Node(child) => {
@@ -632,7 +632,7 @@ impl<'a> TreeView<'a> {
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         loop {
-            match step::<true>(&mut storage, index, level, local) {
+            match step::<true, false>(&mut storage, index, level, local) {
                 Step::Node(child) if level == CHUNK_LEVEL + 1 => return Some(child),
                 Step::Node(child) => {
                     index = child;
@@ -654,7 +654,7 @@ impl<'a> TreeView<'a> {
         let mut storage = self.top.reader();
         let mut level = ROOT_LEVEL;
         while level > CHUNK_LEVEL {
-            match step::<true>(&mut storage, index, level, local) {
+            match step::<true, false>(&mut storage, index, level, local) {
                 Step::NotResident => return false,
                 Step::Node(child) => {
                     index = child;
@@ -709,12 +709,13 @@ pub(crate) enum Step {
 }
 
 /// The child of node `index`, at `level`, that holds local coordinate `local`.
-/// `TOP` is whether the node is above the chunk level, the only place a word
-/// can be not resident; inside a chunk the check is left out.
+/// `UNLOADED` says the node may hold not-resident words (it is above the
+/// chunk level); `BRICK` says it may be a level-1 node (it is inside a
+/// chunk). Callers that know which side they are on leave the other test out.
 /// Always inlined: as a call, the reader's cached page goes through memory on
 /// every level, which Callgrind measured at 70% more instructions per lookup.
 #[inline(always)]
-pub(crate) fn step<const TOP: bool>(
+pub(crate) fn step<const UNLOADED: bool, const BRICK: bool>(
     storage: &mut StorageReader<'_>,
     index: u32,
     level: u32,
@@ -725,7 +726,7 @@ pub(crate) fn step<const TOP: bool>(
     if node.mask & bit(slot) == 0 {
         return Step::Filled(MaterialId::AIR);
     }
-    if level == 1 {
+    if BRICK && level == 1 {
         let header = BrickHeader::read(storage.block(node.base, BRICK_HEADER_WORDS));
         if header.full & bit(slot) != 0 {
             return Step::Filled(header.default);
@@ -738,7 +739,7 @@ pub(crate) fn step<const TOP: bool>(
     // ones, so the common path tests a single bit.
     if word & UNIFORM_BIT == 0 {
         Step::Node(word)
-    } else if TOP && word == NOT_RESIDENT {
+    } else if UNLOADED && word == NOT_RESIDENT {
         Step::NotResident
     } else {
         Step::Filled(MaterialId(word as u16))

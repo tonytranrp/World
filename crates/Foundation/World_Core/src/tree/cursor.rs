@@ -95,7 +95,7 @@ impl<'a> TreeCursor<'a> {
             }
             // One inlined copy of the step serves both sides of the chunk
             // level; two cost more than the check they save.
-            match step::<true>(reader, self.path[level as usize], level, local) {
+            match step::<true, true>(reader, self.path[level as usize], level, local) {
                 Step::Filled(m) => {
                     self.bottom = level;
                     return Some(m);
