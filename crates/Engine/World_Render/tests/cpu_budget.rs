@@ -827,3 +827,60 @@ fn a_waiting_chunk_stays_consistent_when_its_parent_group_is_rewritten() {
     let s = res.stats();
     assert_eq!((s.expanded, s.bricks), (0, 0), "{s:?}");
 }
+
+/// An edit inside a replaced chunk that waits is folded into the chunk's
+/// own change, which rebuilds it anyway: it never uploads new content into
+/// the old structure or summarizes the new chunk outside the budget.
+#[test]
+fn an_edit_inside_a_waiting_chunk_waits_for_the_chunk() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let c1 = VoxelPos::new(0, -1024, 0);
+    tree.insert_chunk(c1, rough_slab(256, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    // An edit in a brick that is resident in the old content.
+    let at = VoxelPos::new(3, -5, 3);
+    let dirty = tree
+        .apply(&[world_core::Edit::new(at, MaterialId(2))])
+        .unwrap();
+    let snap = tree.snapshot();
+    let budget = 4u64;
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: budget as u32,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [at.x as f32, at.y as f32, at.z as f32],
+        pixel_angle: 1e-6,
+    };
+    let one = [c1];
+    let mut frame = 10;
+    loop {
+        let before = res.summaries_computed();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: if frame == 10 { dirty.as_slice() } else { &[] },
+                chunks: if frame == 10 { &one } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        let spent = res.summaries_computed() - before;
+        // The budget, one grandchild (65), the chunk's path once applied.
+        let slack = 65 + u64::from(shape.root_level()) + 64;
+        assert!(spent <= budget + slack, "frame {frame}: {spent} summaries");
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < 200, "never applied");
+    }
+    verify(&mut res, &snap, &pools);
+}

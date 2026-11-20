@@ -457,12 +457,15 @@ impl Residency {
         }
     }
 
-    fn forget_summary(&mut self, key: NodeKey) {
+    /// Forgets the cached summary of `key`; whether there was one.
+    fn forget_summary(&mut self, key: NodeKey) -> bool {
         let split = self.chunk_level();
         if key.level() >= split {
-            self.summaries.remove(&key);
+            self.summaries.remove(&key).is_some()
         } else if let Some(m) = self.chunk_summaries.get_mut(&key.ancestor(split)) {
-            m.remove(&key);
+            m.remove(&key).is_some()
+        } else {
+            false
         }
     }
 
@@ -1119,6 +1122,13 @@ impl Residency {
             }
             worked = true;
             let done = match change {
+                Change::Brick(k) if self.in_waiting_chunk(k) => {
+                    // Its chunk is rebuilt when applied; only the edited
+                    // marks carry over.
+                    self.mark_edited(k);
+                    applied += 1;
+                    continue;
+                }
                 Change::Brick(k) => {
                     self.apply_brick(source, k, &mut reupload, batch);
                     true
@@ -1182,29 +1192,37 @@ impl Residency {
         }
     }
 
+    /// Marks the path of changed brick `k` edited.
+    fn mark_edited(&mut self, k: NodeKey) {
+        for level in 1..=self.shape.root_level() {
+            self.edited.insert(k.ancestor(level));
+        }
+    }
+
     /// The first half of applying a changed brick: its path forgets its
     /// summaries and is marked edited, and a resident brick is uploaded
-    /// again or unlinked.
+    /// again or unlinked. Returns how many cached summaries it forgot,
+    /// which rewriting the path computes again.
     fn apply_brick<S: VoxelSource>(
         &mut self,
         source: &S,
         k: NodeKey,
         reupload: &mut impl FnMut(u64) -> bool,
         batch: &mut UploadBatch,
-    ) {
+    ) -> u64 {
+        self.mark_edited(k);
+        let mut forgot = 0;
         for level in 1..=self.shape.root_level() {
-            let a = k.ancestor(level);
-            self.forget_summary(a);
-            self.edited.insert(a);
+            forgot += u64::from(self.forget_summary(k.ancestor(level)));
         }
         let Some(slot) = self.entries.get(&k).and_then(|e| e.brick) else {
-            return;
+            return forgot;
         };
         self.free_brick(slot, batch);
         self.set_brick(k, None);
         let view = view_at(source, k);
         if content(&view) != Content::Branch {
-            return;
+            return forgot;
         }
         let wanted = u64::from(slot.alloc.units) * 16;
         if reupload(wanted)
@@ -1213,6 +1231,7 @@ impl Residency {
             self.set_brick(k, Some(new_slot));
             self.set_layout(k, view.mask());
         }
+        forgot
     }
 
     /// Summarizes the grandchildren of the replaced chunk `c` (and each
