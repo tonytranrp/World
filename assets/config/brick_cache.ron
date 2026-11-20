@@ -60,12 +60,15 @@
         // frame. Each costs tens of microseconds on the floor Mac.
         // 1..=1048576
         max_expansions_per_frame: 128,
+        // Records the shrink walk (collapse, evict) examines per frame; it
+        // only frees memory, so it may lag behind growth. 256..=16777216
+        max_shrink_visits_per_frame: 4096,
     ),
     // Node summaries (each over up to 64 children) that applying edits and
-    // replaced chunks may compute per frame; further changes wait for later
-    // frames, nearest first. A replaced 16 m chunk costs one per mixed node
-    // in it. 1..=16777216
-    max_change_summaries_per_frame: 2048,
+    // replaced chunks may compute per frame, and again that expansions may;
+    // the rest waits for later frames, nearest first. A replaced 16 m chunk
+    // costs one per mixed node in it. 1..=16777216
+    max_summaries_per_frame: 2048,
     // A small built-in scene while nothing feeds the renderer a world.
     debug_scene: true,
     // Animate a carve in the debug scene, exercising edit uploads.

@@ -10,9 +10,11 @@
 //!
 //! Work that costs CPU time per item is bounded by counts, never by the
 //! clock, so frames stay deterministic (decision 0012): changes are applied
-//! nearest first until they have computed `max_change_summaries_per_frame`
-//! node summaries, and at most `lod.max_expansions_per_frame` nodes are
-//! expanded; the rest waits for later frames.
+//! nearest first until they have computed `max_summaries_per_frame`
+//! node summaries; at most `lod.max_expansions_per_frame` nodes are
+//! expanded, and only while they too have computed fewer summaries than
+//! that; the shrink walk takes `lod.max_shrink_visits_per_frame` records.
+//! The rest waits for later frames.
 
 use world_core::tree::VoxelSource;
 use world_core::{BrickPos, VoxelPos};
@@ -20,7 +22,7 @@ use world_core::{BrickPos, VoxelPos};
 use super::batch::UploadBatch;
 use super::key::NodeKey;
 use super::residency::{Change, Refused, Residency};
-use super::select::{ViewPoint, projected_pixels, select_budgeted};
+use super::select::{ViewPoint, projected_pixels, select_split};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -130,15 +132,24 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let selection = match input.view {
         Some(view) => {
-            let visits = if res.take_full_shrink() {
+            let shrink_visits = if res.take_full_shrink() {
                 u32::MAX
             } else {
-                lod.max_visits_per_frame
+                lod.max_shrink_visits_per_frame
             };
             let mut walk = res.take_walk();
             let mut growth = res.take_growth();
             let pressure = res.pressure();
-            let s = select_budgeted(res, &mut walk, &mut growth, &view, lod, pressure, visits);
+            let s = select_split(
+                res,
+                &mut walk,
+                &mut growth,
+                &view,
+                lod,
+                pressure,
+                lod.max_visits_per_frame,
+                shrink_visits,
+            );
             res.put_walk(walk);
             res.put_growth(growth);
             s
@@ -187,7 +198,7 @@ pub fn run_frame<S: VoxelSource + Sync>(
         let applied = res.apply_changes(
             source,
             input.view.map(|v| v.eye),
-            u64::from(input.config.max_change_summaries_per_frame),
+            u64::from(input.config.max_summaries_per_frame),
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {
@@ -229,8 +240,13 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // Each expansion rewrites a group and summarizes its children, so their
     // number is bounded as well as their bytes.
     let mut attempts = 0u32;
+    let summaries_before = res.summaries_computed();
+    let max_summaries = u64::from(input.config.max_summaries_per_frame);
     for &k in &expands {
-        if cost(batch) >= budget || attempts >= lod.max_expansions_per_frame {
+        if cost(batch) >= budget
+            || attempts >= lod.max_expansions_per_frame
+            || res.summaries_computed() - summaries_before >= max_summaries
+        {
             break;
         }
         let result = res.expand(source, k, batch);

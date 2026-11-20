@@ -181,7 +181,7 @@ fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
     let (mut res, mut pools) = cpu_cache(shape);
     make_resident(&mut res, &snap, &mut pools);
     let config = BrickCacheConfig {
-        max_change_summaries_per_frame: 1,
+        max_summaries_per_frame: 1,
         ..Default::default()
     };
     for min in CHUNKS {
@@ -288,7 +288,7 @@ fn a_large_replaced_chunk_is_summarized_across_frames() {
     make_resident(&mut res, &snap, &mut pools);
     let budget = 20u64;
     let config = BrickCacheConfig {
-        max_change_summaries_per_frame: budget as u32,
+        max_summaries_per_frame: budget as u32,
         ..Default::default()
     };
     // A rough slab over a 256 x 256 footprint: 16 mixed level-2 nodes of
@@ -340,6 +340,32 @@ fn a_large_replaced_chunk_is_summarized_across_frames() {
     }
     assert!(frame > 13, "spread over frames");
     verify(&mut res, &snap, &pools);
+}
+
+/// Nothing in a replaced chunk that waits is expanded or loaded: applying
+/// it drops what the table held there.
+#[test]
+fn a_waiting_chunk_is_not_refined() {
+    use world_render::internals::residency::{Change, Refused};
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let min = CHUNKS[1];
+    let key = NodeKey::containing(shape.local(min).unwrap(), 4);
+    let mut batch = UploadBatch::default();
+    res.collapse(key, &mut batch).unwrap();
+    tree.insert_chunk(min, replacement(min)).unwrap();
+    let snap = tree.snapshot();
+    res.queue_changes([Change::Chunk(key)]);
+    assert!(res.in_waiting_chunk(key));
+    assert!(res.in_waiting_chunk(key.child(0)));
+    assert_eq!(res.expand(&snap, key, &mut batch), Err(Refused::Waiting));
+    // Applied, it refines as usual.
+    res.apply_changes(&snap, None, u64::MAX, |_| true, &mut batch);
+    assert!(!res.in_waiting_chunk(key));
+    assert!(res.expand(&snap, key, &mut batch).is_ok());
 }
 
 /// An edit recomputes one summary per level on its path, however much of

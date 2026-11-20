@@ -321,6 +321,26 @@ pub fn select_budgeted(
     pressure: f32,
     max_visits: u32,
 ) -> Selection {
+    select_split(
+        res, walk, growth, view, lod, pressure, max_visits, max_visits,
+    )
+}
+
+/// [`select_budgeted`] with separate visit budgets for growth and shrink.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two halves' state and budgets"
+)]
+pub fn select_split(
+    res: &Residency,
+    walk: &mut Vec<NodeKey>,
+    growth: &mut GrowthState,
+    view: &ViewPoint,
+    lod: &LodTuning,
+    pressure: f32,
+    max_visits: u32,
+    max_shrink_visits: u32,
+) -> Selection {
     let shape = res.shape();
     let always = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
     let mut out = Selection::default();
@@ -386,6 +406,11 @@ pub fn select_budgeted(
         let Some(node) = res.node_state(key) else {
             continue;
         };
+        // A replaced chunk not applied yet is rebuilt when it is: nothing
+        // in it is worth refining until then.
+        if res.in_waiting_chunk(key) {
+            continue;
+        }
         if key.level >= 2 {
             if node.expanded {
                 // Per-axis squared distances to the four child slabs.
@@ -444,6 +469,7 @@ pub fn select_budgeted(
     // Candidates carried from earlier frames, if they still apply.
     for key in std::mem::take(&mut growth.carry_expand) {
         let still = res.node_state(key).is_some_and(|n| !n.expanded)
+            && !res.in_waiting_chunk(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             let priority = if forced(key.level) {
@@ -456,6 +482,7 @@ pub fn select_budgeted(
     }
     for key in std::mem::take(&mut growth.carry_load) {
         let still = res.node_state(key).is_some_and(|n| !n.brick_resident)
+            && !res.in_waiting_chunk(key)
             && wanted(key, distance2(origin, key, eye));
         if still {
             load.push((projected_pixels(shape.origin, key, view), key));
@@ -472,7 +499,7 @@ pub fn select_budgeted(
         walk.push(shape.root());
     }
     let mut visits = 0u32;
-    while visits < max_visits {
+    while visits < max_shrink_visits {
         let Some(key) = walk.pop() else {
             break;
         };

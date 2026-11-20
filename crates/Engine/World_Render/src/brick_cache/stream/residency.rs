@@ -40,6 +40,9 @@ pub enum Refused {
     AlreadyDone,
     /// The node or brick pool, or the brick ids, are exhausted.
     PoolFull,
+    /// The node lies in a replaced chunk not applied yet: what the table
+    /// holds there is about to be rebuilt.
+    Waiting,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,7 +189,14 @@ impl Residency {
     pub fn new(shape: Shape, layout: &PoolLayout) -> Option<Self> {
         Some(Self {
             shape,
-            entries: HashMap::default(),
+            // Growing a table of a million entries rehashes it in one go,
+            // over 100 ms on the floor Mac: reserve what a full node pool
+            // typically holds (entries are the mixed records, about a third
+            // of them) so that never happens mid-walk.
+            entries: HashMap::with_capacity_and_hasher(
+                (layout.node_count as usize).saturating_mul(7) / 16,
+                Default::default(),
+            ),
             summaries: HashMap::default(),
             chunk_summaries: HashMap::default(),
             edited: HashSet::default(),
@@ -447,46 +457,42 @@ impl Residency {
     /// (see [`stand_in`]) instead of a walk over its whole content: the
     /// records above it are rewritten when it is applied.
     fn summary<N: NodeView>(&mut self, key: NodeKey, view: N) -> Summary {
+        // Only branches are cached: the others answer without a lookup.
+        let level = match content(&view) {
+            Content::Air | Content::Unloaded => return Summary::default(),
+            Content::Uniform(m) => {
+                return Summary {
+                    material: m,
+                    solid: node_volume(key.level()),
+                };
+            }
+            Content::Leaf => return exact_summary(view, 0),
+            Content::Branch => key.level(),
+        };
         if let Some(s) = self.cached_summary(key) {
             return s;
         }
-        let kind = content(&view);
-        if kind == Content::Branch
-            && key.level() == self.chunk_level()
-            && self.pending_chunks.contains(&key)
-        {
+        if level == self.chunk_level() && self.pending_chunks.contains(&key) {
             return stand_in(key, view);
         }
-        let s = match kind {
-            Content::Air | Content::Unloaded => Summary::default(),
-            Content::Uniform(m) => Summary {
-                material: m,
-                solid: node_volume(key.level()),
-            },
-            Content::Leaf | Content::Branch if key.level <= 1 => {
-                // The scratch tally: no allocation per brick.
-                self.tally.clear();
-                let level = if kind == Content::Leaf { 0 } else { 1 };
-                count_voxels(view, level, &mut self.tally);
-                self.tally.summary()
+        let s = if level <= 1 {
+            // The scratch tally: no allocation per brick.
+            self.tally.clear();
+            count_voxels(view, 1, &mut self.tally);
+            self.tally.summary()
+        } else {
+            let mut tally = self.spare_tallies.pop().unwrap_or_default();
+            tally.clear();
+            for (slot, child) in view.children() {
+                let c = self.summary(key.child(slot), child);
+                tally.add(c.material, c.solid);
             }
-            Content::Leaf => exact_summary(view, 0),
-            Content::Branch => {
-                let mut tally = self.spare_tallies.pop().unwrap_or_default();
-                tally.clear();
-                for (slot, child) in view.children() {
-                    let c = self.summary(key.child(slot), child);
-                    tally.add(c.material, c.solid);
-                }
-                let s = tally.summary();
-                self.spare_tallies.push(tally);
-                s
-            }
+            let s = tally.summary();
+            self.spare_tallies.push(tally);
+            s
         };
-        if kind == Content::Branch {
-            self.summarized += 1;
-            self.cache_summary(key, s);
-        }
+        self.summarized += 1;
+        self.cache_summary(key, s);
         s
     }
 
@@ -723,6 +729,9 @@ impl Residency {
         if e.group.is_some() {
             return Err(Refused::AlreadyDone);
         }
+        if self.in_waiting_chunk(key) {
+            return Err(Refused::Waiting);
+        }
         let view = view_at(source, key);
         if content(&view) != Content::Branch {
             return Err(Refused::NotApplicable);
@@ -776,6 +785,9 @@ impl Residency {
         if e.brick.is_some() {
             return Err(Refused::AlreadyDone);
         }
+        if self.in_waiting_chunk(key) {
+            return Err(Refused::Waiting);
+        }
         let view = view_at(source, key);
         if content(&view) != Content::Branch {
             return Err(Refused::NotApplicable);
@@ -806,7 +818,9 @@ impl Residency {
         // is mixed is decided by the encoder threads, which read it anyway.
         let mut jobs: Vec<(NodeKey, u32, bool)> = Vec::new();
         for &key in keys {
-            let ok = key.level == 1 && self.entries.get(&key).is_some_and(|e| e.brick.is_none());
+            let ok = key.level == 1
+                && self.entries.get(&key).is_some_and(|e| e.brick.is_none())
+                && !self.in_waiting_chunk(key);
             if !ok {
                 continue;
             }
@@ -942,6 +956,17 @@ impl Residency {
     /// Changes queued and not applied yet.
     pub fn pending_changes(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Whether `key` lies in (or is) a replaced chunk not applied yet.
+    /// Expanding or loading there is wasted: applying the chunk drops it,
+    /// and summarizing what its old content cached can cost a walk over
+    /// the whole chunk.
+    pub fn in_waiting_chunk(&self, key: NodeKey) -> bool {
+        let split = self.chunk_level();
+        !self.pending_chunks.is_empty()
+            && key.level() <= split
+            && self.pending_chunks.contains(&key.ancestor(split))
     }
 
     /// Applies queued changes, nearest to `eye` first (in key order without

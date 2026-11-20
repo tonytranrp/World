@@ -13,7 +13,7 @@
 //! - `changes`: applying one replaced chunk (a generated surface chunk with
 //!   caves, and a coarse one), the work the residency hands the cache each
 //!   time it swaps a chunk; bounded per frame by
-//!   `max_change_summaries_per_frame`.
+//!   `max_summaries_per_frame`.
 //!
 //! Deterministic input.
 

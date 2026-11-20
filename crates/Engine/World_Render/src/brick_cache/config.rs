@@ -75,6 +75,9 @@ pub struct LodTuning {
     /// Nodes stage 1 or 2 expands per frame at most; the rest wait for the
     /// next frame. `1..=1048576`.
     pub max_expansions_per_frame: u32,
+    /// Records the shrink walk (collapse, evict) examines per frame; it
+    /// only frees memory, so it may lag behind growth. `256..=16777216`.
+    pub max_shrink_visits_per_frame: u32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -104,10 +107,10 @@ pub struct BrickCacheConfig {
     pub victim_capacity: u32,
     pub lod: LodTuning,
     /// Node summaries (each over up to 64 children) that applying changed
-    /// bricks and replaced chunks may compute per frame; further changes
-    /// wait for later frames, nearest first. A replaced 16 m chunk costs
-    /// one per mixed node in it. `1..=16777216`.
-    pub max_change_summaries_per_frame: u32,
+    /// bricks and replaced chunks may compute per frame, and again that
+    /// expansions may; the rest waits for later frames, nearest first. A
+    /// replaced 16 m chunk costs one per mixed node in it. `1..=16777216`.
+    pub max_summaries_per_frame: u32,
     /// Show a small built-in scene while nothing feeds the renderer a world.
     pub debug_scene: bool,
     /// Animate a carve in the debug scene, to exercise edit uploads.
@@ -143,8 +146,9 @@ impl Default for BrickCacheConfig {
                 regrow_voxels: 16.0,
                 restart_voxels: 128.0,
                 max_expansions_per_frame: 128,
+                max_shrink_visits_per_frame: 4096,
             },
-            max_change_summaries_per_frame: 2048,
+            max_summaries_per_frame: 2048,
             debug_scene: true,
             debug_scene_edits: true,
         }
@@ -239,8 +243,8 @@ impl ConfigAsset for BrickCacheConfig {
             4096.0,
         );
         range(
-            "max_change_summaries_per_frame",
-            self.max_change_summaries_per_frame.into(),
+            "max_summaries_per_frame",
+            self.max_summaries_per_frame.into(),
             1.0,
             16777216.0,
         );
@@ -249,6 +253,12 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.restart_voxels.into(),
             0.0,
             65536.0,
+        );
+        range(
+            "lod.max_shrink_visits_per_frame",
+            self.lod.max_shrink_visits_per_frame.into(),
+            256.0,
+            16777216.0,
         );
         range(
             "lod.max_expansions_per_frame",
