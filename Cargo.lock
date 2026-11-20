@@ -7900,7 +7900,13 @@ dependencies = [
 name = "world_cpu_ref"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "png",
+ "proptest",
+ "ron",
  "world_core",
+ "world_gen",
+ "world_testkit",
 ]
 
 [[package]]
@@ -7921,7 +7927,12 @@ dependencies = [
 name = "world_gen"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "proptest",
+ "ron",
+ "serde",
  "world_core",
+ "world_testkit",
 ]
 
 [[package]]
