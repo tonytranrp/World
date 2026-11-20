@@ -1,4 +1,8 @@
-//! `xtask check`, `xtask coverage` and `xtask miri`.
+//! `xtask check`, and the heavier on-demand quality tools: `xtask coverage`,
+//! `xtask miri`, `xtask fuzz` and `xtask mutants`.
+
+pub mod fuzz;
+pub mod mutants;
 
 use crate::process::{self, cargo, cargo_tool_installed};
 use crate::testing::{self, TestProfile};

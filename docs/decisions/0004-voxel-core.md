@@ -1,6 +1,9 @@
 # 0004: Voxel core
 
-Status: accepted, 2026-11-19
+Status: accepted, 2026-11-19. The leaf nodes in "Node layout" and the flat
+page list in "Storage and snapshots" are superseded by decision 0005 (leaves
+inline in their level-1 parent, a two-level page directory). Decision 0006
+replaces the assumption that the whole world is resident with chunk tiers.
 
 ## Context
 

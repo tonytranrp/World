@@ -1,5 +1,6 @@
 //! Running other programs, with the command line printed first.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Runs `command` to completion, failing on a nonzero exit.
@@ -27,6 +28,17 @@ pub fn cargo_tool_installed(subcommand: &str) -> bool {
         .args([subcommand, "--version"])
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// The workspace root, wherever xtask was started from inside it.
+pub fn workspace_root() -> PathBuf {
+    // tools/Xtask -> tools -> the workspace root.
+    let xtask = Path::new(env!("CARGO_MANIFEST_DIR"));
+    xtask
+        .parent()
+        .and_then(Path::parent)
+        .expect("xtask lives two levels below the workspace root")
+        .to_path_buf()
 }
 
 pub fn cargo() -> Command {

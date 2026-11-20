@@ -1,4 +1,7 @@
-//! `xtask bench`: run Criterion benchmarks and gate on regressions.
+//! `xtask bench`: run Criterion benchmarks and gate on regressions, or with
+//! `--instructions` the gungraun instruction-count benchmarks (Linux only).
+
+mod instructions;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +16,11 @@ pub fn run(
     save: Option<String>,
     check: Option<String>,
     threshold_percent: f64,
+    instruction_counts: bool,
 ) -> Result<(), String> {
+    if instruction_counts {
+        return instructions::run(save.as_deref(), check.as_deref(), threshold_percent);
+    }
     match (save, check) {
         (Some(name), _) => bench(&["--save-baseline", &name]),
         (None, Some(name)) => compare(&name, threshold_percent),

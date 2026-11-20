@@ -1,0 +1,224 @@
+name: quality
+
+# Performance, fuzzing and test-quality checks for the voxel core. None of
+# these jobs is a required check: they inform reviews, they do not block
+# merges. World_Core and World_Testkit have no Bevy dependency, so everything
+# here runs on Linux without building the engine.
+#
+#   bench-instructions  every push to main and every PR touching the core
+#   fuzz                weekly and on demand
+#   mutants             weekly and on demand
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/Foundation/**"
+      - "tools/Xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/quality.yml"
+  pull_request:
+    paths:
+      - "crates/Foundation/**"
+      - "tools/Xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/quality.yml"
+  workflow_dispatch:
+    inputs:
+      fuzz-seconds:
+        description: Seconds to fuzz each target
+        default: "300"
+  schedule:
+    - cron: "41 5 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-instructions:
+    # Instruction counts (gungraun under Valgrind's Callgrind) for World_Core's
+    # hot operations, compared with the latest run on main.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Outside target/ so rust-cache never mixes baselines into its cache.
+      GUNGRAUN_HOME: ${{ github.workspace }}/gungraun
+      GUNGRAUN_SAVE_SUMMARY: pretty-json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-instructions
+
+      # gungraun-runner must match the gungraun crate exactly; read the
+      # version from Cargo.lock so a dependency bump never leaves CI behind.
+      - name: Read the gungraun version
+        id: versions
+        run: |
+          version=$(grep -A1 '^name = "gungraun"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "gungraun $version"
+          echo "gungraun=$version" >> "$GITHUB_OUTPUT"
+
+      # The setup action gungraun's guide recommends for CI: Valgrind (with
+      # libc debug symbols) and the matching gungraun-runner.
+      - name: Install Valgrind and gungraun-runner
+        uses: gungraun/setup-gungraun@v1
+        with:
+          runner-version: ${{ steps.versions.outputs.gungraun }}
+
+      # The newest baseline saved by a run on main. Pull requests can read
+      # caches written on the base branch.
+      - name: Restore the main baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: gungraun
+          key: gungraun-main-${{ github.sha }}
+          restore-keys: gungraun-main-
+
+      # On main: record the new baseline.
+      - name: Instruction counts (save baseline)
+        if: github.event_name == 'push'
+        run: cargo xtask bench --instructions --save main
+
+      # Elsewhere: compare with main and fail when any benchmark executes more
+      # than 5% more instructions. Counts on these runners vary by about 0.1%
+      # between runs (wall time varies several-fold), so 5% is far above the
+      # noise yet catches real regressions; small intended costs show up in
+      # the log and the uploaded summaries without failing the job. With no
+      # baseline yet (first run, expired cache), gungraun records one and
+      # compares nothing.
+      - name: Instruction counts (compare with main)
+        if: github.event_name != 'push'
+        run: cargo xtask bench --instructions --check main --threshold 5
+
+      - name: Save the main baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: gungraun
+          key: gungraun-main-${{ github.sha }}
+
+      - name: Upload Callgrind profiles and summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gungraun-results
+          path: gungraun
+          if-no-files-found: ignore
+
+  fuzz:
+    # cargo-fuzz (libFuzzer) on serialize::decode: no panics, no allocation
+    # beyond what the input justifies, and decode-encode round trips.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pinned toolchain builds xtask; nightly builds the fuzz targets.
+      - name: Install the pinned and nightly toolchains
+        run: |
+          rustup show
+          rustup toolchain install nightly --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: |
+            . -> target
+            crates/Foundation/World_Core/fuzz -> target
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # Keep what libFuzzer learned: each run starts from the last corpus.
+      - name: Restore the fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: crates/Foundation/World_Core/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz each target
+        run: cargo xtask fuzz --time "${{ inputs.fuzz-seconds || '300' }}"
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: crates/Foundation/World_Core/fuzz/artifacts
+          if-no-files-found: ignore
+
+  mutants:
+    # cargo-mutants on World_Core (.cargo/mutants.toml), split into shards
+    # that run in parallel. Missed mutants do not fail the job: they are
+    # findings to read in the summary and the uploaded mutants.out.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-mutants
+
+      # Called directly rather than through `cargo xtask mutants` so the step
+      # can tell cargo-mutants' exit codes apart: 2 (missed mutants) and 3
+      # (timeouts) are results, anything else is a broken run.
+      - name: Mutation testing, shard ${{ matrix.shard }} of 4
+        run: |
+          set +e
+          cargo mutants --package world_core --shard ${{ matrix.shard }}/4 --jobs 2
+          code=$?
+          set -e
+          {
+            echo "### Mutants, shard ${{ matrix.shard }} of 4"
+            for outcome in caught missed timeout unviable; do
+              echo "- $outcome: $(wc -l < mutants.out/$outcome.txt 2>/dev/null || echo 0)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          case $code in
+            0|2|3) exit 0 ;;
+            *) exit $code ;;
+          esac
+
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore

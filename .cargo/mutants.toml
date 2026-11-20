@@ -1,0 +1,33 @@
+# cargo-mutants: mutation testing for World_Core. Each mutant is a small
+# deliberate bug (a replaced return value, a flipped operator); a mutant that
+# no test catches points at missing or weak tests.
+#
+#   cargo xtask mutants                       # all of World_Core
+#   cargo xtask mutants -- --file 'crates/Foundation/World_Core/src/coords/**'
+#   cargo xtask mutants -- --list             # what would be mutated
+#
+# Always name the package (xtask passes `--package world_core`): the
+# workspace's default member is the game, which cargo-mutants would pick
+# otherwise. Only the mutated package is built and tested, so Bevy and the
+# Engine crates never are. The package is not set here because globs in this
+# file would override `--file` on the command line.
+#
+# Results land in mutants.out/ (caught.txt, missed.txt, timeout.txt,
+# unviable.txt). CI runs this weekly and on demand (the `mutants` job in
+# .github/workflows/quality.yml). Install with
+# `cargo install cargo-mutants --locked`.
+
+# Inline test modules are not code under test.
+exclude_globs = ["crates/Foundation/World_Core/src/**/tests.rs"]
+
+# Debug output is diagnostic only; mutating it produces noise, not findings.
+exclude_re = ["impl Debug for", "impl fmt::Debug for"]
+
+# nextest runs each test in its own process, the project's standard runner.
+test_tool = "nextest"
+
+# Property tests run at the fast profile (256 cases per property), the same
+# scale as every commit. A mutant that loops forever is cut off at five
+# times the unmutated test time, with a floor for slow CI machines.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60

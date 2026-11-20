@@ -16,4 +16,4 @@ pub use config::ConfigAsset;
 pub use coords::{BrickPos, VoxelBox, VoxelPos};
 pub use edit::{DirtyBricks, Edit, EditError};
 pub use material::{MaterialDef, MaterialId, MaterialTable};
-pub use tree::{TreeRead, TreeSnapshot, VoxelTree};
+pub use tree::{DenseGrid, TreeCursor, TreeRead, TreeSnapshot, VoxelSource, VoxelTree};

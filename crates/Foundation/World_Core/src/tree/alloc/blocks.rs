@@ -1,4 +1,4 @@
-//! Word block allocation: blocks of 1 to 64 words, recycled by exact size.
+//! Word block allocation: blocks of 1 to 192 words, recycled by exact size.
 
 use super::MAX_BLOCK_LEN;
 use super::pages::Pages;
@@ -7,7 +7,7 @@ use super::pages::Pages;
 ///
 /// New blocks are cut from the end of the last page. A block never straddles
 /// a page, so when the next block does not fit, the rest of the page (always
-/// shorter than the block, so under 64 words) becomes a free block of its own
+/// shorter than the block, so under 192 words) becomes a free block of its own
 /// size and the new block starts the next page. Freed blocks go on a LIFO
 /// list per size and are reused only by a request of exactly that size.
 pub(super) struct WordBlocks {
@@ -31,7 +31,7 @@ impl Default for WordBlocks {
 }
 
 impl WordBlocks {
-    /// The base of a block of `len` words, 1 to 64, inside one page. Panics
+    /// The base of a block of `len` words, 1 to 192, inside one page. Panics
     /// on any other length or when word offsets would overflow `u32`.
     pub fn alloc<const N: usize>(&mut self, len: usize, pages: &mut Pages<u32, N>) -> u32 {
         assert!(
@@ -93,7 +93,7 @@ impl WordBlocks {
 mod tests {
     use super::*;
 
-    const PAGE: usize = 128;
+    const PAGE: usize = 256;
 
     fn arena() -> (WordBlocks, Pages<u32, PAGE>) {
         (WordBlocks::default(), Pages::default())
@@ -129,16 +129,17 @@ mod tests {
     #[test]
     fn blocks_never_straddle_a_page_and_the_rest_is_recycled() {
         let (mut blocks, mut pages) = arena();
-        let first = blocks.alloc(60, &mut pages);
-        let second = blocks.alloc(60, &mut pages);
-        let third = blocks.alloc(60, &mut pages);
-        assert_eq!((first, second), (0, 60));
-        assert_eq!(third, PAGE as u32, "the third block starts the next page");
-        assert_eq!(pages.page_count(), 2);
-        assert_eq!(blocks.free_words(), 8);
+        let bases: Vec<u32> = (0..5).map(|_| blocks.alloc(60, &mut pages)).collect();
+        assert_eq!(bases[..4], [0, 60, 120, 180]);
         assert_eq!(
-            blocks.alloc(8, &mut pages),
-            120,
+            bases[4], PAGE as u32,
+            "the fifth block starts the next page"
+        );
+        assert_eq!(pages.page_count(), 2);
+        assert_eq!(blocks.free_words(), 16);
+        assert_eq!(
+            blocks.alloc(16, &mut pages),
+            240,
             "the page's tail is reused"
         );
         assert_eq!(blocks.free_words(), 0);
@@ -174,9 +175,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "1 to 64 words")]
+    #[should_panic(expected = "1 to 192 words")]
     fn oversized_blocks_are_refused() {
         let (mut blocks, mut pages) = arena();
-        blocks.alloc(65, &mut pages);
+        blocks.alloc(MAX_BLOCK_LEN + 1, &mut pages);
     }
 }
