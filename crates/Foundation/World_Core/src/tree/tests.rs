@@ -949,3 +949,21 @@ proptest! {
         prop_assert!(same_content(&grid, &grid.clone()));
     }
 }
+
+/// An empty batch is a no-op everywhere, also on a tree whose root is not
+/// loaded yet (`StreamedWorld::apply` before anything has loaded, with every
+/// edit waiting for its chunk).
+#[test]
+fn an_empty_batch_changes_nothing_even_where_nothing_is_loaded() {
+    let mut unloaded = VoxelTree::unloaded();
+    assert!(unloaded.apply(&[]).unwrap().is_empty());
+    assert!(matches!(unloaded.root(), NodeRef::NotResident));
+
+    let mut tree = VoxelTree::new();
+    tree.fill_box(cube([0, 0, 0], 5), STONE).unwrap();
+    let before = tree.snapshot();
+    let stats = tree.stats();
+    assert!(tree.apply(&[]).unwrap().is_empty());
+    assert_eq!(tree.stats(), stats);
+    assert!(tree.shares_everything_with(&before));
+}

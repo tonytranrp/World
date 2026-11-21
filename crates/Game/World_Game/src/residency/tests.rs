@@ -225,6 +225,24 @@ fn edits_to_unloaded_chunks_wait_and_save_all_keeps_them() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Before anything has loaded, every edit waits for its chunk and the tree
+/// is given an empty batch on a root that is not loaded: a no-op, not a
+/// refused edit (it tripped a debug assertion, decision 0022).
+#[test]
+fn edits_before_anything_loads_all_wait() {
+    let dir = temp_dir("before_load");
+    let mut world = open(&dir, config(0));
+    let target = VoxelPos::new(0, 0, 0);
+    assert_eq!(world.snapshot().lookup(target), None, "nothing is loaded");
+    let bricks = world.apply(&[Edit::new(target, MaterialId(3))]).unwrap();
+    assert!(bricks.is_empty());
+    assert_eq!(world.stats().pending_chunks, 1);
+    assert!(world.apply(&[]).unwrap().is_empty());
+    assert_eq!(world.stats().pending_chunks, 1);
+    drop(world);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn coarse_columns_surround_the_player() {
     let dir = temp_dir("coarse");
