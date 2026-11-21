@@ -156,6 +156,51 @@ pub(crate) fn solid_voxel(block: &[u32], k: usize) -> MaterialId {
     palette_entry(block, index as usize)
 }
 
+/// Passes the solid voxels of a packed leaf to `each`: every palette entry
+/// that holds any, with how many. `block` is the leaf's whole palette block
+/// and `solid` its number of solid voxels. Entries a stored palette holds
+/// without using them are skipped. Two-material leaves, the common kind,
+/// cost a popcount per index word.
+pub(crate) fn count_solid(block: &[u32], solid: u32, each: &mut impl FnMut(MaterialId, u32)) {
+    let header = block[0];
+    let len = palette_len(header);
+    let bits = index_bits(header);
+    let indices = &block[1 + palette_words(len)..];
+    let mut emit = |i: usize, n: u32| {
+        if n > 0 && i < len {
+            each(palette_entry(block, i), n);
+        }
+    };
+    match bits {
+        0 => emit(0, solid),
+        1 => {
+            // Index 1 is a set bit; only the first `solid` bits are indices.
+            let (whole, rest) = ((solid / 32) as usize, solid % 32);
+            let mut ones: u32 = indices[..whole].iter().map(|w| w.count_ones()).sum();
+            if rest > 0 {
+                ones += (indices[whole] & ((1 << rest) - 1)).count_ones();
+            }
+            emit(0, solid - ones);
+            emit(1, ones);
+        }
+        _ => {
+            let mut counts = [0u32; MAX_PALETTE];
+            let index_mask = (1u32 << bits) - 1;
+            for k in 0..solid {
+                let at = k * bits;
+                let index = (indices[(at / 32) as usize] >> (at % 32)) & index_mask;
+                // Indices stay below the palette's length, at most 64.
+                if let Some(c) = counts.get_mut(index as usize) {
+                    *c += 1;
+                }
+            }
+            for (i, &n) in counts.iter().enumerate().take(len) {
+                emit(i, n);
+            }
+        }
+    }
+}
+
 /// Every voxel of a leaf. `block` is its palette block, empty when the
 /// record has none.
 pub(crate) fn decode(record: Record, block: &[u32]) -> Voxels {
