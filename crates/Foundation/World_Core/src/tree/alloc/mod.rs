@@ -96,25 +96,25 @@ pub(crate) struct StorageReader<'a> {
 }
 
 impl<'a> StorageReader<'a> {
-    #[inline]
+    #[inline(always)]
     pub fn node(&mut self, index: u32) -> Node {
         self.nodes.get(index)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn word(&mut self, index: u32) -> u32 {
         self.words.get(index)
     }
 
     /// The `len` words of the block at `base`.
-    #[inline]
+    #[inline(always)]
     pub fn block(&mut self, base: u32, len: usize) -> &'a [u32] {
         self.words.slice(base, len)
     }
 
     /// The words from `start` to the end of its page: a whole block whose
     /// length is not known until its first word is read.
-    #[inline]
+    #[inline(always)]
     pub fn block_from(&mut self, start: u32) -> &'a [u32] {
         self.words.tail(start)
     }

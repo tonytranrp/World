@@ -738,15 +738,19 @@ pub(crate) fn step<const UNLOADED: bool, const BRICK: bool>(
         return Step::Filled(MaterialId::AIR);
     }
     if BRICK && level == 1 {
-        let words = if node.info & BRICK_OTHER_FULL != 0 {
-            BRICK_HEADER_MAX_WORDS
-        } else {
-            BRICK_HEADER_WORDS
-        };
-        let header = BrickHeader::read(storage.block(node.base, words), node.info);
-        if header.full & bit(slot) != 0 {
-            return Step::Filled(header.default);
+        let head = storage.block(node.base, BRICK_HEADER_WORDS);
+        let full = u64::from(head[0]) | u64::from(head[1]) << 32;
+        if full & bit(slot) != 0 {
+            return Step::Filled(MaterialId(head[2] as u16));
         }
+        // Most bricks have no other-full leaves: every stored leaf is a
+        // record, one rank as before decision 0021.
+        let stored = node.mask & !full;
+        if node.info & BRICK_OTHER_FULL == 0 {
+            let at = BRICK_HEADER_WORDS + RECORD_WORDS * rank(stored, slot);
+            return Step::Record(node.base + at as u32);
+        }
+        let header = BrickHeader::read(storage.block(node.base, BRICK_HEADER_MAX_WORDS), node.info);
         let at = node.base + header.record_offset(node.mask, slot) as u32;
         if header.other & bit(slot) != 0 {
             return Step::Filled(MaterialId(storage.word(at) as u16));

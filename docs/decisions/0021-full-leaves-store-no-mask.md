@@ -160,6 +160,24 @@ do not change):
   every brick step, two more header loads and a popcount in bricks with
   other full leaves, and the GPU encoder's extra pass over a brick's 64
   children (World_Render's `encode` bench was not run, for disk space).
+- Point reads, measured after the merge. CI's instruction gate on PR #5
+  (`get_10k terrain`, 10,000 `get`s on the edit-built terrain) counted
+  3,003,915 instructions on main, 3,190,892 after decision 0020 (+6.2%)
+  and 3,365,887 after this change (+12.1%, over the 5% limit). Locally,
+  with macOS's retired-instruction counter (`/usr/bin/time -l` on a
+  release build running the same scene and probes 200 times, less a run
+  of none; i7-9750H; the steps reproduce CI's 0020 step exactly but show
+  this change at +2.6%), the cause was not the flag test but inlining: the
+  extra code pushed `PageReader::get`, `slice` and `tail` out of line, so
+  every word read in `lookup` became a call. The read step now gives
+  bricks without other full leaves (81% of terrain bricks) the old
+  one-popcount path after a single flag test, and the page and storage
+  readers' accessors are `#[inline(always)]`. Measured the same way:
+  3,025,000 before 0020, 3,300,000 before the fix, 3,044,000 after.
+  Thin `Arc<[T; N]>` pages (with a trimmed last page kept apart) measured
+  2,918,000 when every page read is branch-free, but every way of finding
+  the trimmed page added a branch on each page miss and cost more than
+  the fat pointer, so 0020's `Arc<[T]>` pages stay.
 - GPU reads: the brick header is now two 16-byte rows instead of one;
   default leaves skip the leaf mask and payload loads.
 - `MemoryBreakdown` gains `long_headers` and counts other full leaves at 4
