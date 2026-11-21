@@ -44,9 +44,15 @@ fn eye_at(world: &StreamedWorld, x: i32, z: i32) -> VoxelPos {
     VoxelPos::new(x, ground + 2 * VOXELS_PER_METER as i32, z)
 }
 
+/// How long a test waits for the world to settle. A deadline, not a count of
+/// updates: on a loaded machine one chunk can take seconds to generate, and
+/// a stuck load still fails.
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Updates until everything around `eye` is loaded and nothing is in flight.
 fn settle(world: &mut StreamedWorld, eye: VoxelPos) {
-    for _ in 0..2000 {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    while std::time::Instant::now() < deadline {
         world.update(eye, FRAME);
         let s = world.stats();
         if world.is_settled(eye) && s.loading == 0 && s.saving == 0 && s.compressing == 0 {
@@ -1241,7 +1247,8 @@ fn chunks_waiting_to_be_compressed_do_not_push_the_hot_tier_over_its_cap() {
 /// Settles `world` around `eye` and returns the chunks joined, in order.
 fn settle_joined(world: &mut StreamedWorld, eye: VoxelPos) -> Vec<world_gen::ChunkCoord> {
     let mut joined = Vec::new();
-    for _ in 0..2000 {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    while std::time::Instant::now() < deadline {
         world.update(eye, FRAME);
         joined.extend(world.take_changes().loaded);
         let s = world.stats();
