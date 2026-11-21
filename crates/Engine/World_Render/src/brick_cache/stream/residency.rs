@@ -79,9 +79,20 @@ struct Entry {
     layout: u64,
     /// Slots of the children whose bricks are resident (level 2).
     bricks: u64,
+    /// Slots of the children that are expanded.
+    grown: u64,
+    /// Slots of the expanded children with nothing to load: every child
+    /// of theirs with an entry has its brick resident (see [`Entry::done`]).
+    done: u64,
 }
 
 impl Entry {
+    /// Expanded, with every child that has an entry holding its brick:
+    /// stage 1 finds nothing to do below it.
+    fn done(&self) -> bool {
+        self.group.is_some() && self.kids & !self.bricks == 0
+    }
+
     fn new(index: u32, record: GpuNode) -> Self {
         Self {
             index,
@@ -92,6 +103,8 @@ impl Entry {
             kids: 0,
             layout: 0,
             bricks: 0,
+            grown: 0,
+            done: 0,
         }
     }
 }
@@ -203,6 +216,11 @@ pub struct NodeState {
     pub kids: u64,
     /// Children whose bricks are resident, by slot (level 2).
     pub bricks: u64,
+    /// Expanded children, by slot.
+    pub grown: u64,
+    /// Expanded children with nothing to load, by slot: every child of
+    /// theirs with an entry has its brick resident.
+    pub done: u64,
 }
 
 impl Residency {
@@ -297,6 +315,8 @@ impl Residency {
             mask: e.record.mask(),
             kids: e.kids,
             bricks: e.bricks,
+            grown: e.grown,
+            done: e.done,
         })
     }
 
@@ -596,24 +616,74 @@ impl Residency {
                 self.entries.insert(key, Entry::new(index, record));
             }
         }
+        let mut flip = None;
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
+            let was = p.done();
             p.kids |= 1u64 << key.slot_in_parent();
+            flip = (p.done() != was).then_some(!was);
+        }
+        if let Some(done) = flip {
+            self.set_done_bit(key.parent(), done);
         }
     }
 
     /// Removes the entry of `key`, keeping its parent's child masks.
     fn remove_entry(&mut self, key: NodeKey) -> Option<Entry> {
         let e = self.entries.remove(&key)?;
+        let mut flip = None;
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
+            let was = p.done();
             let bit = 1u64 << key.slot_in_parent();
             p.kids &= !bit;
             p.bricks &= !bit;
+            p.grown &= !bit;
+            p.done &= !bit;
+            flip = (p.done() != was).then_some(!was);
+        }
+        if let Some(done) = flip {
+            self.set_done_bit(key.parent(), done);
         }
         Some(e)
+    }
+
+    /// Sets whether expanded `key` has nothing to load, in its parent's
+    /// mask. Only an expanded parent keeps these masks: the entries below a
+    /// buried node stay in the table until they are freed, and the parent
+    /// may meanwhile be a new, unexpanded entry with the same key.
+    fn set_done_bit(&mut self, key: NodeKey, done: bool) {
+        if key != self.shape.root()
+            && let Some(p) = self.entries.get_mut(&key.parent())
+            && p.group.is_some()
+        {
+            let bit = 1u64 << key.slot_in_parent();
+            if done {
+                p.done |= bit;
+            } else {
+                p.done &= !bit;
+            }
+        }
+    }
+
+    /// Sets the child group of `key`, keeping its parent's masks (only an
+    /// expanded parent keeps them, see [`set_done_bit`](Self::set_done_bit)).
+    fn set_group(&mut self, key: NodeKey, group: Option<NodeAlloc>) {
+        let Some(e) = self.entries.get_mut(&key) else {
+            return;
+        };
+        e.group = group;
+        let (grown, done) = (group.is_some(), e.done());
+        if key != self.shape.root()
+            && let Some(p) = self.entries.get_mut(&key.parent())
+            && p.group.is_some()
+        {
+            let bit = 1u64 << key.slot_in_parent();
+            p.grown = if grown { p.grown | bit } else { p.grown & !bit };
+            p.done = if done { p.done | bit } else { p.done & !bit };
+        }
     }
 
     /// Sets the resident brick of level-1 node `key`, keeping its parent's
@@ -623,15 +693,21 @@ impl Residency {
             return;
         };
         e.brick = slot;
+        let mut flip = None;
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
+            let was = p.done();
             let bit = 1u64 << key.slot_in_parent();
             if slot.is_some() {
                 p.bricks |= bit;
             } else {
                 p.bricks &= !bit;
             }
+            flip = (p.done() != was).then_some(!was);
+        }
+        if let Some(done) = flip {
+            self.set_done_bit(key.parent(), done);
         }
     }
 
@@ -719,9 +795,7 @@ impl Residency {
                     Some(g) => g,
                     None => {
                         // Give up the subtree rather than leave it stale.
-                        if let Some(e) = self.entries.get_mut(&key) {
-                            e.group = None;
-                        }
+                        self.set_group(key, None);
                         let children: Vec<u32> = (0..64).collect();
                         for slot in children {
                             self.drop_subtree(key.child(slot), batch);
@@ -731,8 +805,8 @@ impl Residency {
                 }
             }
         };
+        self.set_group(key, Some(group));
         if let Some(e) = self.entries.get_mut(&key) {
-            e.group = Some(group);
             e.layout = mask;
         }
 
@@ -892,9 +966,7 @@ impl Residency {
         if let Some(g) = e.group {
             self.nodes.free(g);
         }
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.group = None;
-        }
+        self.set_group(key, None);
         self.write_record(key, e.record.unlinked(), batch);
         Ok(())
     }
@@ -1317,9 +1389,7 @@ impl Residency {
                 let mut cleared = e;
                 cleared.brick = None;
                 self.release(a, cleared, batch);
-                if let Some(entry) = self.entries.get_mut(&a) {
-                    entry.group = None;
-                }
+                self.set_group(a, None);
             }
         }
         // Level-1 records of changed bricks whose parent is not expanded have
@@ -1557,7 +1627,7 @@ impl Residency {
                     e.record
                 ));
             }
-            let (mut kids, mut bricks) = (0u64, 0u64);
+            let (mut kids, mut bricks, mut grown, mut done) = (0u64, 0u64, 0u64, 0u64);
             if e.group.is_some() {
                 for slot in 0..64 {
                     if let Some(c) = self.entries.get(&key.child(slot)) {
@@ -1565,8 +1635,20 @@ impl Residency {
                         if c.brick.is_some() {
                             bricks |= 1u64 << slot;
                         }
+                        if c.group.is_some() {
+                            grown |= 1u64 << slot;
+                        }
+                        if c.done() {
+                            done |= 1u64 << slot;
+                        }
                     }
                 }
+            }
+            if (e.grown, e.done) != (grown, done) {
+                return Err(format!(
+                    "{key:?}: expanded child masks {:#x}/{:#x}, table holds {grown:#x}/{done:#x}",
+                    e.grown, e.done
+                ));
             }
             if (e.group.is_some() || e.brick.is_some()) && e.layout != e.record.mask() {
                 return Err(format!(

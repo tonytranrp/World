@@ -515,28 +515,23 @@ pub fn select_split(
                     if wanted(child, d2) {
                         // Pushes count too: a node can queue 64 children.
                         visits += 1;
-                        // A level-2 child is judged here, next to its
-                        // siblings in the table, instead of queued, when
-                        // it has nothing to do (expanded, and every brick
+                        // A level-2 child is judged here from its
+                        // parent's masks instead of queued, when it has
+                        // nothing to do (expanded, and every brick
                         // resident or too far to want: a brick is no
                         // nearer than its level-2 node) or would only be
                         // an expansion candidate past those this frame
                         // keeps: a pass reaches far more than a frame
                         // expands.
                         if key.level == 3 {
-                            match res.node_state(child) {
-                                None => continue,
-                                Some(n)
-                                    if n.expanded
-                                        && (n.kids & !n.bricks == 0 || !reach.wants(1, d2)) =>
-                                {
-                                    continue;
-                                }
-                                Some(n) if !n.expanded && expand.len() >= budgets.keep_expand => {
+                            let bit = 1u64 << slot;
+                            if node.grown & bit == 0 {
+                                if expand.len() >= budgets.keep_expand {
                                     left_out = true;
                                     continue;
                                 }
-                                Some(_) => {}
+                            } else if node.done & bit != 0 || !reach.wants(1, d2) {
+                                continue;
                             }
                         }
                         growth.frontier.push(Pending {

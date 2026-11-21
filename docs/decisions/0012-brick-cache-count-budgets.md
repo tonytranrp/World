@@ -150,6 +150,22 @@ and tests stay deterministic.
   to 2.0 ms lower in all six alternating pairs at 4 and 8 m/s, and the
   median 1 to 3 ms lower, with the CPU throttled to between 100% and 35%
   of its speed during the runs.
+- **Every entry keeps two masks of its children**: the expanded ones
+  (`grown`), and the expanded ones with nothing to load (`done`: every
+  child of theirs with an entry holds its brick). A level-3 visit then
+  judges its level-2 children without looking any of them up; the
+  lookups it made instead had become half of `select_split`. The masks
+  are kept where `kids` and `bricks` are (an entry inserted or removed,
+  a brick set, a group set, now always through one function), and a
+  grandparent is touched only when its child's `done` flips. Only an
+  expanded parent keeps them: the entries below a buried node stay in
+  the table until they are freed, and their parent's key may meanwhile
+  hold a new, unexpanded entry (the burial stress test found this).
+  `verify` recomputes both. They cost 16 bytes an entry, about 21 MiB at
+  1.3 million entries. In a 20 s profile of an 8 m/s walk,
+  `select_split` fell from 2,295 to 1,138 samples and its table lookups
+  from 1,126 to 290; its share of the brick cache's frame work fell from
+  37% to 22%.
 
 ## Alternatives considered
 
