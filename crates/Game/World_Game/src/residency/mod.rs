@@ -217,8 +217,8 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
     let mean = |sum: u64, before: u64| sum.saturating_sub(before) as f64 / updates;
     let v = world.0.velocity_m_s();
     debug!(
-        "world: {} chunks loaded ({} edited, {} loading, {} saving), {:.0} MiB hot, \
-         {} warm ({} edited, {:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
+        "world: {} chunks loaded ({} edited, {} loading, {} saving, {:.0} MiB held), {:.0} MiB hot, \
+         {} joining ({:.0} MiB), {} compressing ({:.0} MiB), {} warm ({} edited, {:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
          interval: holes {:.1} mean ({:.1} ahead), {} now, loads {} generated / {} warm / \
          {} disk, generation {:.1} ms mean per chunk (longest {:.0} ms so far, {} uniform), columns {} hits / {} \
          computed ({:.0} MiB held), speed {:.1} m/s",
@@ -226,7 +226,12 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
         s.edited,
         s.loading,
         s.saving,
+        s.saving_bytes as f64 / 1048576.0,
         s.hot_bytes as f64 / 1048576.0,
+        s.ready,
+        s.ready_bytes as f64 / 1048576.0,
+        s.compressing,
+        s.compressing_bytes as f64 / 1048576.0,
         s.warm_chunks,
         s.warm_edited,
         s.warm_bytes as f64 / 1048576.0,

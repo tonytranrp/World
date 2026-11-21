@@ -108,6 +108,9 @@ pub struct ResidencyStats {
     /// toward the hot cap.
     pub saving_bytes: usize,
     pub pending_chunks: usize,
+    /// Loaded chunks waiting for a graft slot, and their bytes.
+    pub ready: usize,
+    pub ready_bytes: usize,
     /// Bytes of the loaded chunks.
     pub hot_bytes: usize,
     pub warm_chunks: usize,
@@ -196,10 +199,10 @@ pub struct StreamedWorld {
     /// than the region file).
     compressing: BTreeMap<ChunkCoord, u64>,
     tickets: u64,
-    /// Compressions waiting for idle workers, oldest first, with their
-    /// tickets and bytes. Loads come first: a chunk is compressed only
-    /// while fewer loads than the in-flight cap are outstanding, and the
-    /// oldest waiting ones are dropped (not kept warm) past a bound.
+    /// Compressions waiting for a worker, oldest first, with their tickets
+    /// and bytes. Loads come first, but a few compressions are always in
+    /// flight (`compress_reserve`), and the oldest waiting ones are dropped
+    /// (not kept warm) past a bound.
     to_compress: VecDeque<(ChunkCoord, ChunkData, u64, usize)>,
     /// Sum of the bytes in `to_compress`; they count toward the hot cap.
     to_compress_bytes: usize,
@@ -447,6 +450,8 @@ impl StreamedWorld {
             saving: self.writes.len(),
             saving_bytes: self.held_bytes,
             pending_chunks: self.pending.len(),
+            ready: self.ready.len(),
+            ready_bytes: self.ready.iter().map(|(_, d, _)| d.bytes()).sum(),
             hot_bytes: self.hot_bytes,
             warm_chunks: self.warm.len(),
             warm_edited: self.warm.edited(),
@@ -1052,12 +1057,26 @@ impl StreamedWorld {
         }
     }
 
-    /// Hands waiting compressions to the workers while fewer loads than the
-    /// in-flight cap are outstanding, the most recently evicted first (the
-    /// nearest to the player, so the likeliest to be wanted again).
+    /// Compressions kept in flight even while loads fill the in-flight cap:
+    /// one per worker. A waiting chunk holds its whole pages, about 1 MiB,
+    /// and compressing it takes a small part of a load's time, so waiting
+    /// for idle workers kept up to 64 of them in RAM for nothing whenever
+    /// generation fell behind (decision 0020).
+    fn compress_reserve(&self) -> usize {
+        self.config.workers.max(1) as usize
+    }
+
+    /// Hands waiting compressions to the workers, the most recently evicted
+    /// first (the nearest to the player, so the likeliest to be wanted
+    /// again): up to [`compress_reserve`](Self::compress_reserve) at any
+    /// time, and more while fewer loads than the in-flight cap are
+    /// outstanding.
     fn submit_compressions(&mut self) {
         let cap = self.in_flight_cap();
-        while self.loading.len() + self.compress_in_flight < cap {
+        let reserve = self.compress_reserve();
+        while self.compress_in_flight < reserve
+            || self.loading.len() + self.compress_in_flight < cap
+        {
             let Some((coord, data, ticket, bytes)) = self.to_compress.pop_back() else {
                 break;
             };

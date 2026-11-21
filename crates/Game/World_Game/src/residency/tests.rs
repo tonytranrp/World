@@ -833,8 +833,9 @@ fn unedited_chunks_come_back_from_the_warm_cache_unchanged() {
 
     // Away: the unedited chunks are evicted, nothing is written, and they
     // stay compressed in RAM.
-    // Loads come first: while they fill the in-flight cap, the evicted
-    // chunks wait (counted toward the hot cap) instead of taking workers.
+    // Loads come first: while they fill the in-flight cap, only a reserve
+    // of compressions runs and the other evicted chunks wait (counted
+    // toward the hot cap).
     let away = eye_at(&world, eye.x + 200 * 64, eye.z);
     world.update(away, FRAME);
     let s = world.stats();
