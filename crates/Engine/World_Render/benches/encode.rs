@@ -308,9 +308,11 @@ fn load_bricks(c: &mut Criterion) {
 }
 
 fn changes(c: &mut Criterion) {
+    use criterion::BatchSize;
     use world_core::tree::CHUNK_LEVEL;
     use world_gen::{ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
     use world_render::internals::residency::Change;
+    use world_render::internals::summaries::ChunkSummaries;
     let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
         .expect("the default config is valid");
     // The chunk holding the surface in the middle of a central column.
@@ -364,6 +366,22 @@ fn changes(c: &mut Criterion) {
         eprintln!("changes/{name}: {} summaries per change", once.summarized);
         group.throughput(Throughput::Elements(once.summarized));
         group.bench_function(name, |b| b.iter(|| apply(&mut res)));
+        // The same change with the summaries computed where the chunk was
+        // built (decision 0022): the render thread only inserts them.
+        let offer = ChunkSummaries::compute(min, &tree.chunk_data(min).unwrap()).unwrap();
+        group.bench_function(format!("{name}_offered"), |b| {
+            b.iter_batched(
+                || offer.clone(),
+                |offer| {
+                    res.offer_summaries([offer]);
+                    apply(&mut res)
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        group.bench_function(format!("{name}_summaries_on_worker"), |b| {
+            b.iter(|| ChunkSummaries::compute(min, &tree.chunk_data(min).unwrap()))
+        });
     }
     group.finish();
 }

@@ -371,6 +371,8 @@ pub fn stream_brick_cache(
         Vec::new()
     };
     let victims = std::mem::take(&mut state.victims);
+    // Checked against the source when their chunks are applied.
+    state.residency.offer_summaries(feed.summaries);
     let input = FrameInput {
         source,
         frame: state.frame,
@@ -568,7 +570,7 @@ pub fn log_cache_stats(
     let s = state.residency.stats();
     let r = state.last_report;
     info!(
-        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} changes applied, {} pending, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
+        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} changes applied, {} pending, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}; so far {} summaries computed, {} chunks applied with worker summaries ({} stale)",
         state.frame,
         s.entries,
         s.expanded,
@@ -587,6 +589,9 @@ pub fn log_cache_stats(
         r.upload_bytes,
         state.ring.skipped,
         state.residency.pressure(),
+        state.residency.summaries_computed(),
+        state.residency.offers_used().0,
+        state.residency.offers_used().1,
     );
     if let Some(v) = view.as_ref().and_then(|v| v.0) {
         info!(

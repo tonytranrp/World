@@ -12,7 +12,7 @@ use super::build::{LeafFill, RegionSource, brick_by_leaves};
 use super::mutate::{self, Builder};
 use super::node::leaf::{Record, Voxels};
 use super::node::{CHUNK_LEVEL, Child, slot_at, slots};
-use super::read::{NodeRef, NodeView};
+use super::read::{NodeRef, NodeView, TreeView};
 use super::{ROOT_LEVEL, TreeStats, VoxelTree, node_origin};
 use crate::consts::TREE_FANOUT;
 use crate::coords::{VoxelPos, path};
@@ -61,6 +61,44 @@ impl ChunkData {
             ChunkContent::Chunk(_) => None,
         }
     }
+
+    /// Whether both are the very same content: the same material, or the
+    /// same arenas (page directories) and root. O(1). A chunk's arenas are
+    /// copied on write while anything else shares them, so as long as
+    /// `self` is alive, content that compares equal to it has not changed
+    /// since `self` was taken, whichever trees it moved through. `false`
+    /// says nothing: equal content built twice compares unequal.
+    pub fn same_arenas(&self, other: &ChunkData) -> bool {
+        match (&self.content, &other.content) {
+            (ChunkContent::Filled(a), ChunkContent::Filled(b)) => a == b,
+            (ChunkContent::Chunk(a), ChunkContent::Chunk(b)) => {
+                std::sync::Arc::ptr_eq(a, b)
+                    || (a.root == b.root
+                        && a.store.storage().shares_everything_with(b.store.storage()))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The content of the chunk-level region at world-local `local` in a tree
+/// or snapshot `view`, shared; `None` if it is not resident.
+pub(super) fn shared_chunk(view: TreeView<'_>, local: [u32; 3]) -> Option<ChunkData> {
+    if !view.resident(local) {
+        return None;
+    }
+    let content = match view.chunk_id(local) {
+        Some(id) => ChunkContent::Chunk(std::sync::Arc::clone(
+            view.chunks[id as usize]
+                .as_ref()
+                .expect("stored chunk ids are live"),
+        )),
+        None => ChunkContent::Filled(match node_at(view.root(), CHUNK_LEVEL, local) {
+            NodeRef::Uniform(m) => Child::Uniform(m),
+            _ => Child::Air,
+        }),
+    };
+    Some(ChunkData { content })
 }
 
 impl std::fmt::Debug for ChunkData {
@@ -273,18 +311,7 @@ impl VoxelTree {
     /// detached: O(1), and later edits to this tree copy what they change,
     /// so the returned data never sees them. `None` if not resident.
     pub fn chunk_data(&self, min: VoxelPos) -> Option<ChunkData> {
-        let local = node_origin(CHUNK_LEVEL, min).ok()?;
-        if !self.view().resident(local) {
-            return None;
-        }
-        let content = match self.view().chunk_id(local) {
-            Some(id) => ChunkContent::Chunk(self.forest.chunk_arc(id)),
-            None => ChunkContent::Filled(match node_at(self.root(), CHUNK_LEVEL, local) {
-                NodeRef::Uniform(m) => Child::Uniform(m),
-                _ => Child::Air,
-            }),
-        };
-        Some(ChunkData { content })
+        shared_chunk(self.view(), node_origin(CHUNK_LEVEL, min).ok()?)
     }
 
     /// Puts detached chunk content at the chunk-level region at `min`,

@@ -27,7 +27,9 @@ pub mod internals {
     pub use crate::brick_cache::feedback::{self, Request, Victim};
     pub use crate::brick_cache::format::{self, GpuNode};
     pub use crate::brick_cache::pool::{alloc, gpu::GpuPools, layout};
-    pub use crate::brick_cache::stream::{batch, feed, frame, key, residency, select, upload};
+    pub use crate::brick_cache::stream::{
+        batch, feed, frame, key, residency, select, summaries, upload,
+    };
     pub use crate::debug::scene;
     pub mod gpu_timing {
         pub use crate::gpu_timing::*;

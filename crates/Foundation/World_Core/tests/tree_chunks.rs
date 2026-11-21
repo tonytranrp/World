@@ -318,3 +318,73 @@ fn reads_through_the_chunk_index_stay_exact_as_chunks_move_and_go() {
     probe(&before, "old snapshot");
     assert_eq!(before.get(VoxelPos::new(5, 5, 5)), MaterialId::AIR);
 }
+
+/// `same_arenas` recognises a chunk's content wherever it moves (into a
+/// world tree, from there into another tree, in their snapshots) until
+/// something writes to it, and never content merely equal to it.
+#[test]
+fn same_arenas_follows_a_chunk_until_it_is_written() {
+    use world_core::tree::VoxelSource;
+    let mut ops_world = DenseWorld::new(B);
+    for i in 0..400 {
+        ops_world.set(
+            VoxelPos::new(8 + i % 70, 8 + i % 30, 8 + (i * 7) % 70),
+            MaterialId(1 + (i % 9) as u16),
+        );
+    }
+    let mut worker = VoxelTree::new();
+    worker.build_region(CHUNK_LEVEL, CHUNK, &ops_world).unwrap();
+    let data = worker.take_chunk(CHUNK).unwrap();
+
+    let mut world = VoxelTree::unloaded();
+    world.insert_chunk(CHUNK, data.clone()).unwrap();
+    let mut render = VoxelTree::unloaded();
+    render
+        .insert_chunk(CHUNK, world.chunk_data(CHUNK).unwrap())
+        .unwrap();
+    let snap = render.snapshot();
+    assert!(data.same_arenas(&world.chunk_data(CHUNK).unwrap()));
+    assert!(data.same_arenas(&snap.chunk_data(CHUNK).unwrap()));
+    assert!(data.same_arenas(&VoxelSource::shared_chunk(&snap, CHUNK).unwrap()));
+    assert!(data.same_arenas(&VoxelSource::shared_chunk(&render, CHUNK).unwrap()));
+
+    // A write anywhere copies the arenas: the written tree no longer holds
+    // `data`'s content, the others still do.
+    world.set(VoxelPos::new(9, 9, 9), MaterialId(42)).unwrap();
+    assert!(!data.same_arenas(&world.chunk_data(CHUNK).unwrap()));
+    assert!(data.same_arenas(&render.chunk_data(CHUNK).unwrap()));
+    render
+        .insert_chunk(CHUNK, world.chunk_data(CHUNK).unwrap())
+        .unwrap();
+    assert!(!data.same_arenas(&render.chunk_data(CHUNK).unwrap()));
+    assert!(
+        data.same_arenas(&snap.chunk_data(CHUNK).unwrap()),
+        "the snapshot is kept"
+    );
+    // Writing it back to equal content is still another content.
+    world
+        .set(
+            VoxelPos::new(9, 9, 9),
+            ops_world.get(VoxelPos::new(9, 9, 9)),
+        )
+        .unwrap();
+    assert!(!data.same_arenas(&world.chunk_data(CHUNK).unwrap()));
+
+    // Equal content built again is not the same arenas.
+    let mut again = VoxelTree::new();
+    again.build_region(CHUNK_LEVEL, CHUNK, &ops_world).unwrap();
+    let rebuilt = again.chunk_data(CHUNK).unwrap();
+    assert_eq!(
+        again.get(VoxelPos::new(9, 9, 9)),
+        snap.get(VoxelPos::new(9, 9, 9))
+    );
+    assert!(!data.same_arenas(&rebuilt));
+
+    // Air and one material compare by value; nothing where not resident.
+    let air = VoxelTree::new().chunk_data(CHUNK).unwrap();
+    assert!(air.same_arenas(&VoxelTree::new().snapshot().chunk_data(CHUNK).unwrap()));
+    assert!(!air.same_arenas(&data));
+    assert!(VoxelTree::unloaded().snapshot().chunk_data(CHUNK).is_none());
+    let grid = world_core::DenseGrid::new(3, CHUNK);
+    assert!(VoxelSource::shared_chunk(&grid, CHUNK).is_none());
+}

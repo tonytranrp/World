@@ -5,6 +5,8 @@ use std::sync::Arc;
 use bevy::prelude::Resource;
 use world_core::{BrickPos, DirtyBricks, TreeSnapshot, VoxelPos};
 
+use super::summaries::ChunkSummaries;
+
 /// The world the renderer mirrors. Whoever owns the `VoxelTree` updates it
 /// once per frame after applying that frame's edits:
 ///
@@ -22,6 +24,7 @@ pub struct VoxelWorldFeed {
     snapshot: Option<Arc<TreeSnapshot>>,
     dirty: Vec<BrickPos>,
     chunks: Vec<VoxelPos>,
+    summaries: Vec<ChunkSummaries>,
     refresh: bool,
     /// Counts [`replace`](Self::replace) and [`clear`](Self::clear) calls:
     /// a publisher that remembers it can tell when another one took over.
@@ -35,6 +38,9 @@ pub struct FeedFrame {
     pub dirty: Vec<BrickPos>,
     /// Chunks replaced wholesale, by any voxel inside.
     pub chunks: Vec<VoxelPos>,
+    /// Summaries of replaced chunks computed where they were built, oldest
+    /// first (see [`VoxelWorldFeed::offer_summaries`]).
+    pub summaries: Vec<ChunkSummaries>,
     pub refresh: bool,
 }
 
@@ -60,11 +66,21 @@ impl VoxelWorldFeed {
         self.chunks.extend_from_slice(chunks);
     }
 
+    /// Summaries of chunks published as replaced, computed off the frame
+    /// where they were built (decision 0022), so the renderer need not
+    /// compute them. Optional: the renderer uses one only while its
+    /// snapshot holds exactly the content it was computed from, and
+    /// computes the summaries itself otherwise.
+    pub fn offer_summaries(&mut self, summaries: impl IntoIterator<Item = ChunkSummaries>) {
+        self.summaries.extend(summaries);
+    }
+
     /// A different world: everything resident is dropped and rebuilt.
     pub fn replace(&mut self, snapshot: Arc<TreeSnapshot>) {
         self.snapshot = Some(snapshot);
         self.dirty.clear();
         self.chunks.clear();
+        self.summaries.clear();
         self.refresh = true;
         self.generation += 1;
     }
@@ -74,6 +90,7 @@ impl VoxelWorldFeed {
         self.snapshot = None;
         self.dirty.clear();
         self.chunks.clear();
+        self.summaries.clear();
         self.refresh = true;
         self.generation += 1;
     }
@@ -95,6 +112,7 @@ impl VoxelWorldFeed {
             snapshot: self.snapshot.clone(),
             dirty: std::mem::take(&mut self.dirty),
             chunks: std::mem::take(&mut self.chunks),
+            summaries: std::mem::take(&mut self.summaries),
             refresh: std::mem::take(&mut self.refresh),
         }
     }
@@ -111,6 +129,7 @@ impl FeedFrame {
         self.snapshot = later.snapshot;
         self.dirty.extend(later.dirty);
         self.chunks.extend(later.chunks);
+        self.summaries.extend(later.summaries);
     }
 }
 

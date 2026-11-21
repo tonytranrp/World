@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 use world_core::serialize::region::RecordKind;
 use world_core::tree::ChunkData;
 use world_gen::ChunkCoord;
+use world_render::prelude::ChunkSummaries;
 
 use super::columns::ColumnCache;
 use super::jobs::{self, Generators, LoadSource, WarmChunk};
@@ -56,6 +57,10 @@ pub enum Done {
     Loaded {
         coord: ChunkCoord,
         data: ChunkData,
+        /// The renderer's summaries of its nodes, computed here so the
+        /// render thread need not (decision 0022); `None` for air or one
+        /// material.
+        summaries: Option<ChunkSummaries>,
         refused: bool,
         error: Option<String>,
         source: LoadSource,
@@ -76,7 +81,8 @@ pub enum Done {
     Coarse {
         x: u32,
         z: u32,
-        chunks: Vec<(ChunkCoord, ChunkData)>,
+        /// Each chunk with the renderer's summaries of its nodes.
+        chunks: Vec<(ChunkCoord, ChunkData, Option<ChunkSummaries>)>,
         /// The lowest and highest coarse sample of the column's footprint
         /// (the true columns may reach a little beyond).
         heights: Option<(i32, i32)>,
@@ -382,8 +388,10 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 ),
                 Err(e) => jobs::unreadable(&shared.generators, &shared.columns, coord, e),
             };
+            let summaries = ChunkSummaries::compute(coord.min_voxel(), &loaded.data);
             Ran::Done(Done::Loaded {
                 coord,
+                summaries,
                 data: loaded.data,
                 refused: loaded.refused,
                 error: loaded.error,
@@ -417,6 +425,13 @@ fn run(shared: &Shared, job: WorkJob) -> Ran {
                 shared.coarse_level,
                 &saved,
             );
+            let chunks = chunks
+                .into_iter()
+                .map(|(coord, data)| {
+                    let summaries = ChunkSummaries::compute(coord.min_voxel(), &data);
+                    (coord, data, summaries)
+                })
+                .collect();
             Ran::Done(Done::Coarse {
                 x,
                 z,

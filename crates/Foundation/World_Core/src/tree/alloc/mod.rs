@@ -80,8 +80,9 @@ impl Storage {
     }
 
     /// Whether both hold the very same page directories: nothing was written
-    /// or added between them.
-    #[cfg(test)]
+    /// or added between them. While either is alive, a write through any
+    /// other copy copies the directory first, so equal directories mean equal
+    /// content.
     pub fn shares_everything_with(&self, other: &Self) -> bool {
         self.nodes.shares_list(&other.nodes) && self.words.shares_list(&other.words)
     }

@@ -31,6 +31,7 @@ pub struct Table<V> {
 }
 
 /// The values below one node, by slot path.
+#[derive(Clone)]
 struct Node<V> {
     /// Slots of the children that have values.
     has: u64,
@@ -201,6 +202,71 @@ impl Path {
     }
 }
 
+/// The values below one node at a table's split level, built apart from
+/// any table (on another thread, say) and handed over whole with
+/// [`Table::insert_part`]: one hash map insertion, however many values.
+/// Keys are given under any node at the split level; only their path below
+/// it counts.
+#[derive(Clone)]
+pub struct Part<V> {
+    split: u32,
+    node: Node<V>,
+    len: usize,
+}
+
+impl<V> Part<V> {
+    /// An empty part for a table split at `split`.
+    pub fn new(split: u32) -> Self {
+        assert!((1..=8).contains(&split), "split level {split}");
+        Self {
+            split,
+            node: Node::default(),
+            len: 0,
+        }
+    }
+
+    /// Inserts or replaces the value of `key`, a node below the split level;
+    /// returns the value replaced. Keys inserted in slot order, children
+    /// before their parent, only ever append.
+    pub fn insert(&mut self, key: NodeKey, value: V) -> Option<V> {
+        assert!(
+            key.level() < self.split,
+            "a part holds keys below its split"
+        );
+        let path = Path::of(&key, self.split);
+        let (last, down) = path
+            .slots()
+            .split_last()
+            .expect("a key below the split has a path");
+        let mut n = &mut self.node;
+        for &s in down {
+            n = n.sub_or_insert(s);
+        }
+        let old = n.put(*last, value);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    /// The value of `key`, by its path below the split level.
+    pub fn get(&self, key: &NodeKey) -> Option<&V> {
+        if key.level() >= self.split {
+            return None;
+        }
+        let (n, slot) = Table::holder(&self.node, &Path::of(key, self.split))?;
+        n.value(slot)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 impl<V> Table<V> {
     /// An empty table whose keys below level `split` are kept by their
     /// ancestor at `split`.
@@ -309,6 +375,20 @@ impl<V> Table<V> {
         n.walk(*part, &mut |_, _| count += 1);
         self.len -= count;
         count
+    }
+
+    /// Replaces every key below `part`, a node at the split level, with the
+    /// values of `values`: one hash map insertion. Returns how many keys
+    /// were removed.
+    pub fn insert_part(&mut self, part: NodeKey, values: Part<V>) -> usize {
+        assert_eq!(part.level(), self.split, "a part goes at the split level");
+        assert_eq!(values.split, self.split, "a part built for this split");
+        let removed = self.remove_below(&part);
+        if !values.node.is_empty() {
+            self.len += values.len;
+            self.parts.insert(part, values.node);
+        }
+        removed
     }
 
     pub fn len(&self) -> usize {
@@ -430,6 +510,42 @@ mod tests {
         all.sort_unstable();
         assert_eq!(all, reference.into_iter().collect::<Vec<_>>());
         assert_eq!(t.remove_below(&part), 0);
+    }
+
+    #[test]
+    fn a_part_built_apart_reads_like_inserted_keys() {
+        let split = 3;
+        let mut direct = Table::new(split);
+        let mut built = Table::new(split);
+        let (here, elsewhere) = (key(3, 5, 6, 7), key(3, 0, 0, 0));
+        let mut part = Part::new(split);
+        let mut n = 0;
+        for s in (0..64).step_by(3) {
+            let child = here.child(s);
+            for g in (0..64).step_by(5) {
+                direct.insert(child.child(g), n);
+                // The part is built under another node: only paths count.
+                part.insert(elsewhere.child(s).child(g), n);
+                n += 1;
+            }
+            direct.insert(child, n);
+            part.insert(elsewhere.child(s), n);
+            n += 1;
+        }
+        built.insert(here.child(1), 999);
+        built.insert(key(4, 0, 0, 0), 1);
+        direct.insert(key(4, 0, 0, 0), 1);
+        assert_eq!(part.len(), n as usize);
+        assert_eq!(part.get(&elsewhere.child(3)), part.get(&here.child(3)));
+        assert_eq!(built.insert_part(here, part), 1, "the old key went");
+        assert_eq!(built.len(), direct.len());
+        let mut a: Vec<_> = built.iter().map(|(k, &v)| (k, v)).collect();
+        let mut b: Vec<_> = direct.iter().map(|(k, &v)| (k, v)).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+        assert_eq!(built.insert_part(here, Part::new(split)), n as usize);
+        assert_eq!(built.len(), 1);
     }
 
     #[test]

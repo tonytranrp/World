@@ -409,6 +409,158 @@ fn the_gpu_cache_refines_the_streamed_world_to_bricks() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The GPU cache fed the summaries the workers computed (decision 0022)
+/// writes exactly the GPU records of a cache that computes them itself,
+/// frame by frame, while the world streams in around a walking player who
+/// digs as he goes, with edits waiting for chunks that are not loaded yet
+/// (applied as they join, so their summaries no longer describe them).
+/// Both caches apply every change at once, so they stay in step; a third,
+/// fed the summaries under the default budgets, keeps every invariant.
+#[test]
+fn worker_summaries_give_the_gpu_cache_the_same_records() {
+    use world_render::internals::BrickCacheConfig;
+    use world_render::internals::batch::{CpuPools, UploadBatch};
+    use world_render::internals::frame::{FrameInput, run_frame};
+    use world_render::internals::key::Shape;
+    use world_render::internals::layout::PoolLayout;
+    use world_render::internals::residency::Residency;
+    use world_render::internals::select::ViewPoint;
+    let dir = temp_dir("worker_summaries");
+    let mut world = open(
+        &dir,
+        ResidencyConfig {
+            coarse_radius_m: 64.0,
+            coarse_cell_level: 2,
+            ..config(0)
+        },
+    );
+    let start = eye_at(&world, 2000, 1000);
+    let shape = Shape::of(&world.render_snapshot());
+    let layout = PoolLayout {
+        node_count: 1 << 21,
+        segments: vec![64 << 20],
+        brick_ids: 1 << 17,
+        allocs_per_segment: 1 << 17,
+        node_groups: 1 << 19,
+        upload_budget: 24 << 20,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let unbounded = BrickCacheConfig {
+        max_summaries_per_frame: u32::MAX,
+        ..BrickCacheConfig::default()
+    };
+    let budgeted = BrickCacheConfig::default();
+    let mut given = Residency::new(shape, &layout).unwrap();
+    let mut computed = Residency::new(shape, &layout).unwrap();
+    let mut checked = Residency::new(shape, &layout).unwrap();
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    // Edits waiting ahead of the walk (dug once something is loaded): their
+    // chunks join with them applied.
+    let ahead = VoxelPos::new(start.x + 1500, start.y, start.z);
+    let (mut a, mut b, mut c) = (
+        UploadBatch::default(),
+        UploadBatch::default(),
+        UploadBatch::default(),
+    );
+    let (mut words_a, mut words_b, mut words_c) = (Vec::new(), Vec::new(), Vec::new());
+    let mut offered = 0;
+    for frame in 1..=240u32 {
+        // 4 m/s along x, digging every half second.
+        let x = start.x + (frame as i32 * 4 * VOXELS_PER_METER as i32) / 60;
+        let eye = eye_at(&world, x, start.z);
+        world.update(eye, FRAME);
+        if frame == 10 {
+            assert!(world.stats().loaded > 0);
+            let waiting = ground_below(&world, ahead);
+            dig(&mut world, waiting);
+        }
+        if frame % 30 == 0 {
+            let target = ground_below(&world, eye);
+            dig(&mut world, target);
+        }
+        let snapshot = world.render_snapshot();
+        let changes = world.take_changes();
+        let summaries = world.take_render_summaries();
+        offered += summaries.len();
+        let dirty = world_core::DirtyBricks::from_unsorted(changes.render_bricks);
+        let view = ViewPoint {
+            eye: [eye.x as f32, eye.y as f32, eye.z as f32],
+            pixel_angle: 2.0 / (1.43 * 720.0),
+        };
+        let input = |config| FrameInput {
+            source: &snapshot,
+            frame,
+            refresh: frame == 1,
+            dirty: dirty.as_slice(),
+            chunks: &changes.render_chunks,
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        given.offer_summaries(summaries.iter().cloned());
+        checked.offer_summaries(summaries);
+        let ra = run_frame(&mut given, &input(&unbounded), &mut a);
+        let rb = run_frame(&mut computed, &input(&unbounded), &mut b);
+        run_frame(&mut checked, &input(&budgeted), &mut c);
+        assert_eq!(ra, rb, "frame {frame}");
+        words_a.clear();
+        words_b.clear();
+        words_c.clear();
+        a.serialize(&mut words_a);
+        b.serialize(&mut words_b);
+        c.serialize(&mut words_c);
+        assert!(words_a == words_b, "frame {frame}: the uploads differ");
+        pools.apply(&words_c);
+    }
+    let (used, stale) = given.offers_used();
+    assert!(
+        used > 20,
+        "{used} offers used, {stale} stale, {offered} offered"
+    );
+    assert!(
+        given.summaries_computed() * 4 < computed.summaries_computed(),
+        "{} summaries computed with offers, {} without",
+        given.summaries_computed(),
+        computed.summaries_computed()
+    );
+    assert_eq!(given.stats(), computed.stats());
+    // Finish what the budgets left, then check the budgeted cache.
+    let snapshot = world.render_snapshot();
+    for frame in 241..=400u32 {
+        let input = FrameInput {
+            source: &snapshot,
+            frame,
+            refresh: false,
+            dirty: &[],
+            chunks: &[],
+            view: None,
+            requests: &[],
+            victims: &[],
+            config: &budgeted,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        let r = run_frame(&mut checked, &input, &mut c);
+        words_c.clear();
+        c.serialize(&mut words_c);
+        pools.apply(&words_c);
+        if r.changes_pending == 0 && checked.buried() == 0 {
+            break;
+        }
+    }
+    let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        checked.verify(&snapshot, &pools.nodes, &segs, &pools.table),
+        Ok(())
+    );
+    assert!(checked.offers_used().0 > 20);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The lowest voxel of the chunk holding `eye`, which every plan loads.
 fn eye_chunk_min(eye: VoxelPos) -> VoxelPos {
     world_gen::ChunkCoord::containing(eye).unwrap().min_voxel()

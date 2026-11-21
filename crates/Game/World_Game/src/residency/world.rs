@@ -33,6 +33,7 @@ use super::plan::{self, Heights, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
 use super::warm::Warm;
+use world_render::prelude::ChunkSummaries;
 
 /// What one loaded chunk is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,9 +184,10 @@ pub struct StreamedWorld {
     writes: BTreeMap<ChunkCoord, Write>,
     /// Sum of the held bytes in `writes`.
     held_bytes: usize,
-    /// Loaded chunks waiting for a graft slot, and whether they hold changes
-    /// that may not be on disk.
-    ready: VecDeque<(ChunkCoord, ChunkData, bool)>,
+    /// Loaded chunks waiting for a graft slot, whether they hold changes
+    /// that may not be on disk, and their summaries for the renderer when
+    /// a worker computed them.
+    ready: VecDeque<(ChunkCoord, ChunkData, bool, Option<ChunkSummaries>)>,
     pending: BTreeMap<ChunkCoord, Vec<PendingEdit>>,
     /// Chunks with records in region files.
     saved: BTreeSet<ChunkCoord>,
@@ -228,6 +230,10 @@ pub struct StreamedWorld {
     /// Chunk writes that failed since the world opened.
     write_failures: usize,
     changes: WorldChanges,
+    /// Summaries of chunks put into the render tree this frame, computed by
+    /// the workers (decision 0022); the ones that still describe the render
+    /// tree go to the renderer with the frame's changes.
+    render_summaries: Vec<ChunkSummaries>,
     errors: Vec<String>,
     motion: Motion,
     /// Load and hole figures for [`ResidencyStats`].
@@ -355,6 +361,7 @@ impl StreamedWorld {
             writes_submitted: 0,
             write_failures: 0,
             changes: WorldChanges::default(),
+            render_summaries: Vec::new(),
             errors: Vec::new(),
             motion: Motion::default(),
             counters: Counters::default(),
@@ -436,6 +443,18 @@ impl StreamedWorld {
         std::mem::take(&mut self.changes)
     }
 
+    /// Summaries of chunks put into the render tree since the last call,
+    /// computed by the workers where the chunks were built (decision 0022),
+    /// for the renderer to use instead of computing them: only those that
+    /// describe exactly what the render tree holds now (a chunk edited
+    /// after it joined, or replaced again, has none). Take them with the
+    /// changes that report their chunks.
+    pub fn take_render_summaries(&mut self) -> Vec<ChunkSummaries> {
+        let mut out = std::mem::take(&mut self.render_summaries);
+        out.retain(|s| s.describes(&self.render));
+        out
+    }
+
     /// Problems met while loading or saving (unreadable records, failed
     /// writes), since the last call.
     pub fn take_errors(&mut self) -> Vec<String> {
@@ -451,7 +470,7 @@ impl StreamedWorld {
             saving_bytes: self.held_bytes,
             pending_chunks: self.pending.len(),
             ready: self.ready.len(),
-            ready_bytes: self.ready.iter().map(|(_, d, _)| d.bytes()).sum(),
+            ready_bytes: self.ready.iter().map(|(_, d, _, _)| d.bytes()).sum(),
             hot_bytes: self.hot_bytes,
             warm_chunks: self.warm.len(),
             warm_edited: self.warm.edited(),
@@ -504,6 +523,9 @@ impl StreamedWorld {
             self.config.velocity_smoothing_secs,
             plan::voxels(self.config.evict_radius_m),
         );
+        // Summaries the renderer did not take last frame are dropped: it
+        // computes them itself.
+        self.render_summaries.clear();
         for done in self.pool.drain() {
             self.finish(done, eye);
         }
@@ -615,7 +637,7 @@ impl StreamedWorld {
             .filter(|c| !self.loaded.contains_key(c))
             .collect();
         for c in waiting {
-            if self.loading.contains(&c) || self.ready.iter().any(|(r, _, _)| *r == c) {
+            if self.loading.contains(&c) || self.ready.iter().any(|(r, _, _, _)| *r == c) {
                 continue;
             }
             if let Some(w) = self.writes.get_mut(&c) {
@@ -623,7 +645,7 @@ impl StreamedWorld {
                 // write, and its content now rejoins (and is written below).
                 if let Some((data, bytes)) = w.held.take() {
                     self.held_bytes -= bytes;
-                    self.ready.push_back((c, data, true));
+                    self.ready.push_back((c, data, true, None));
                 }
                 if !w.in_flight {
                     self.writes.remove(&c);
@@ -882,6 +904,7 @@ impl StreamedWorld {
             Done::Loaded {
                 coord,
                 data,
+                summaries,
                 refused,
                 error,
                 source,
@@ -914,7 +937,7 @@ impl StreamedWorld {
                     || plan::chunk_distance(eye, coord) <= plan::voxels(self.config.evict_radius_m)
                     || self.pending.contains_key(&coord);
                 if wanted && !self.loaded.contains_key(&coord) {
-                    self.ready.push_back((coord, data, false));
+                    self.ready.push_back((coord, data, false, summaries));
                 } else if !wanted {
                     // The player moved on before it arrived: keep it warm
                     // for a return.
@@ -949,7 +972,7 @@ impl StreamedWorld {
                     return;
                 }
                 let mut entry = Vec::new();
-                for (coord, data) in chunks {
+                for (coord, data, summaries) in chunks {
                     let bytes = data.bytes();
                     if self
                         .coarse
@@ -959,7 +982,9 @@ impl StreamedWorld {
                         entry.push((coord, bytes));
                         self.coarse_bytes += bytes;
                         self.coarse_chunks.insert(coord, data);
-                        self.refresh_render_if_coarse(coord);
+                        if self.refresh_render_if_coarse(coord) {
+                            self.render_summaries.extend(summaries);
+                        }
                     }
                 }
                 self.coarse_loaded.insert((x, z), entry);
@@ -1190,31 +1215,41 @@ impl StreamedWorld {
     }
 
     /// Refreshes the render tree at `coord` when it shows the coarse chunk
-    /// there (the chunk is neither loaded nor held).
-    fn refresh_render_if_coarse(&mut self, coord: ChunkCoord) {
+    /// there (the chunk is neither loaded nor held); returns whether it did.
+    fn refresh_render_if_coarse(&mut self, coord: ChunkCoord) -> bool {
         let held = self.writes.get(&coord).is_some_and(|w| w.held.is_some());
-        if !self.loaded.contains_key(&coord) && !held {
+        let shown = !self.loaded.contains_key(&coord) && !held;
+        if shown {
             self.refresh_render(coord);
         }
+        shown
     }
 
     fn graft_ready(&mut self) {
         for _ in 0..self.config.grafts_per_frame {
-            let Some((coord, data, edited)) = self.ready.pop_front() else {
+            let Some((coord, data, edited, summaries)) = self.ready.pop_front() else {
                 break;
             };
-            self.join(coord, data, edited);
+            self.join(coord, data, edited, summaries);
         }
     }
 
     fn graft_all_ready(&mut self) {
-        while let Some((coord, data, edited)) = self.ready.pop_front() {
-            self.join(coord, data, edited);
+        while let Some((coord, data, edited, summaries)) = self.ready.pop_front() {
+            self.join(coord, data, edited, summaries);
         }
     }
 
     /// Joins a loaded chunk to the tree and applies its waiting edits.
-    fn join(&mut self, coord: ChunkCoord, data: ChunkData, edited: bool) {
+    /// `summaries`, computed by the worker, go to the renderer if nothing
+    /// changed the chunk before the frame's changes are taken.
+    fn join(
+        &mut self,
+        coord: ChunkCoord,
+        data: ChunkData,
+        edited: bool,
+        summaries: Option<ChunkSummaries>,
+    ) {
         let min = coord.min_voxel();
         if self.tree.insert_chunk(min, data).is_err() {
             return;
@@ -1236,6 +1271,7 @@ impl StreamedWorld {
         self.loaded.insert(coord, state);
         self.changes.loaded.push(coord);
         self.refresh_render(coord);
+        self.render_summaries.extend(summaries);
     }
 
     fn request_loads(&mut self, eye: VoxelPos) {
@@ -1245,7 +1281,7 @@ impl StreamedWorld {
         for coord in self.load_order(eye, sphere) {
             if self.loaded.contains_key(&coord)
                 || self.loading.contains(&coord)
-                || self.ready.iter().any(|(c, _, _)| *c == coord)
+                || self.ready.iter().any(|(c, _, _, _)| *c == coord)
             {
                 continue;
             }
@@ -1259,7 +1295,7 @@ impl StreamedWorld {
                         // A failed write: the content is only here now.
                         self.writes.remove(&coord);
                     }
-                    self.ready.push_back((coord, data, true));
+                    self.ready.push_back((coord, data, true, None));
                 }
                 continue;
             }

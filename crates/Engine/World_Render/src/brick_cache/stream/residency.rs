@@ -29,6 +29,7 @@ use world_core::tree::{NodeView, VoxelSource};
 use super::batch::UploadBatch;
 use super::key::{NodeKey, Shape, view_at};
 use super::select::GrowthState;
+use super::summaries::{ChunkSummaries, WARMED_LEVEL, summarize_level2_node};
 use super::table::Table;
 use crate::brick_cache::format::brick::encode_brick;
 use crate::brick_cache::format::summary::{
@@ -37,6 +38,13 @@ use crate::brick_cache::format::summary::{
 use crate::brick_cache::format::{BrickRef, GpuNode, Kind, ROOT_NODE};
 use crate::brick_cache::pool::alloc::{BrickAlloc, BrickSpace, IdSpace, NodeAlloc, NodeSpace};
 use crate::brick_cache::pool::layout::PoolLayout;
+
+/// What a replaced chunk applied with offered summaries is charged against
+/// the change budget, besides the summaries it then computes (its own, and
+/// those of its ancestors when their paths are rewritten): its offer is
+/// inserted in one step, but the chunk still buries what its old content
+/// held and rewrites one record per level of its path. A group's worth.
+pub const OFFER_CHARGE: u64 = 64;
 
 /// Why an operation did nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +148,14 @@ pub struct Residency {
     warming: HashMap<NodeKey, u32>,
     /// Node summaries computed so far, the unit of the change budget.
     summarized: u64,
+    /// Summaries of replaced chunks computed where they were built, by
+    /// chunk, until the chunk is applied (decision 0022). Each is checked
+    /// against the source when used.
+    offered: HashMap<NodeKey, ChunkSummaries>,
+    /// Chunks applied with offered summaries, and offers refused because the
+    /// source no longer held the content they describe.
+    offers_used: u64,
+    offers_stale: u64,
     /// Entries taken out of the tree by a collapse or a replaced chunk and
     /// not freed yet, with the node they were taken from: freeing a large
     /// subtree is spread over frames (see [`free_buried`](Self::free_buried)).
@@ -236,6 +252,9 @@ impl Residency {
             pending_chunks: HashSet::default(),
             warming: HashMap::default(),
             summarized: 0,
+            offered: HashMap::default(),
+            offers_used: 0,
+            offers_stale: 0,
             graveyard: std::collections::VecDeque::new(),
             burying: HashMap::default(),
             nodes: NodeSpace::new(layout.node_count, layout.node_groups)?,
@@ -482,6 +501,36 @@ impl Residency {
     /// for budgets and tests.
     pub fn summaries_computed(&self) -> u64 {
         self.summarized
+    }
+
+    /// Takes the summaries of replaced chunks computed where they were built
+    /// (decision 0022), to use when their chunks are applied instead of
+    /// computing them. Offer them with the feed that reports the chunks:
+    /// only offers for chunks waiting to be applied are kept (a later offer
+    /// for the same chunk replaces an earlier one), and each is used only if
+    /// the source then holds exactly the content it describes.
+    pub fn offer_summaries(&mut self, offers: impl IntoIterator<Item = ChunkSummaries>) {
+        let split = self.chunk_level();
+        if split != WARMED_LEVEL {
+            return;
+        }
+        for offer in offers {
+            if let Some(local) = self.shape.local(offer.min()) {
+                self.offered
+                    .insert(NodeKey::containing(local, split), offer);
+            }
+        }
+    }
+
+    /// Chunks applied with offered summaries, and offers refused because
+    /// the source had changed since (an edit, a newer replacement).
+    pub fn offers_used(&self) -> (u64, u64) {
+        (self.offers_used, self.offers_stale)
+    }
+
+    /// Offers held for chunks not applied yet.
+    pub fn offers_held(&self) -> usize {
+        self.offered.len()
     }
 
     /// The summary of the node `key`, whose view is `view`; cached for
@@ -929,6 +978,7 @@ impl Residency {
         self.pending.clear();
         self.pending_chunks.clear();
         self.warming.clear();
+        self.offered.clear();
         self.walk.clear();
         self.growth.changed();
         self.write_root(source, batch);
@@ -1294,14 +1344,18 @@ impl Residency {
     /// grandchild at a time and across calls if the budget runs out (at
     /// least one grandchild per call), and applied once that is done; an
     /// edit inside it meanwhile only marks its path edited, since applying
-    /// the chunk rebuilds everything below it. At least one change makes
+    /// the chunk rebuilds everything below it. A replaced chunk whose
+    /// summaries were offered ([`offer_summaries`](Self::offer_summaries))
+    /// and still describe the source skips the summarizing: it is charged
+    /// [`OFFER_CHARGE`] and applied at once. At least one change makes
     /// progress per call. The rest wait for the next call, and until then
     /// the records above them describe the content they had before.
     ///
     /// The budget can be exceeded by the last change it lets in: a chunk's
     /// planned grandchildren stop once they reach it, so by at most one
     /// grandchild (65 summaries), plus the children whose grandchildren
-    /// that completes (up to 64) and the chunk itself when it is applied;
+    /// that completes (up to 64) and the chunk itself when it is applied
+    /// (an offered chunk by its charge and the chunk itself);
     /// a changed brick by its path (up to the tree's depth); and the path
     /// rewrites that follow.
     ///
@@ -1321,6 +1375,10 @@ impl Residency {
         batch: &mut UploadBatch,
     ) -> Applied {
         let start = self.summarized;
+        if !self.offered.is_empty() {
+            let waiting = &self.pending_chunks;
+            self.offered.retain(|k, _| waiting.contains(k));
+        }
         let mut order = std::mem::take(&mut self.pending);
         if let Some(eye) = eye {
             let origin = self.shape.origin;
@@ -1370,8 +1428,12 @@ impl Residency {
                     true
                 }
                 Change::Chunk(c) => {
-                    let ready =
-                        self.warm_chunk(source, c, max_summaries.saturating_sub(spent), threads);
+                    let ready = if self.take_offer(source, c) {
+                        charged += OFFER_CHARGE;
+                        true
+                    } else {
+                        self.warm_chunk(source, c, max_summaries.saturating_sub(spent), threads)
+                    };
                     if ready {
                         self.apply_chunk(source, c);
                     }
@@ -1469,6 +1531,28 @@ impl Residency {
         forgot
     }
 
+    /// Uses the offered summaries of the replaced chunk `c`, if it has not
+    /// started warming and the source holds exactly the content they were
+    /// computed from: they replace whatever its old content cached, as
+    /// [`warm_chunk`](Self::warm_chunk) would leave it. Returns whether they
+    /// were used; an offer that does not describe the source is dropped.
+    fn take_offer<S: VoxelSource>(&mut self, source: &S, c: NodeKey) -> bool {
+        if self.offered.is_empty() || self.warming.contains_key(&c) {
+            return false;
+        }
+        let Some(offer) = self.offered.remove(&c) else {
+            return false;
+        };
+        if c.level() != WARMED_LEVEL || !offer.describes(source) {
+            self.offers_stale += 1;
+            return false;
+        }
+        self.summaries.insert_part(c, offer.into_part());
+        self.warming.insert(c, 64 * 64);
+        self.offers_used += 1;
+        true
+    }
+
     /// Summarizes the grandchildren of the replaced chunk `c` (and each
     /// child once its grandchildren are done) from where the last call
     /// stopped: as many as fit `budget` summaries, counted exactly before
@@ -1548,6 +1632,7 @@ impl Residency {
     fn apply_chunk<S: VoxelSource>(&mut self, source: &S, c: NodeKey) {
         self.pending_chunks.remove(&c);
         self.warming.remove(&c);
+        self.offered.remove(&c);
         for level in c.level()..=self.shape.root_level() {
             self.forget_summary(c.ancestor(level));
         }
@@ -1809,7 +1894,9 @@ fn stand_in<N: NodeView>(key: NodeKey, view: N) -> Summary {
 /// child weighs a level-1 node's volume) and of their mixed children,
 /// computed in up to `threads` tasks: for each node, its mixed
 /// children's then its own, as [`Residency::summary`] computes them with
-/// nothing cached. Pure, so the result does not depend on the threads.
+/// nothing cached, and as [`ChunkSummaries`] computes them where a chunk is
+/// built (the same function). Pure, so the result does not depend on the
+/// threads.
 fn summarize_level2<S: VoxelSource + Sync>(
     source: &S,
     keys: &[NodeKey],
@@ -1819,28 +1906,9 @@ fn summarize_level2<S: VoxelSource + Sync>(
         let mut out = Vec::new();
         let mut tally = Tally::default();
         for &key in chunk {
-            debug_assert_eq!(key.level, 2, "summarize_level2 weighs level-1 children");
-            let view = view_at(source, key);
-            let mut node = Tally::default();
-            for (slot, child) in view.children() {
-                let s = match content(&child) {
-                    Content::Air | Content::Unloaded => Summary::default(),
-                    Content::Uniform(m) => Summary {
-                        material: m,
-                        solid: node_volume(1),
-                    },
-                    Content::Leaf => exact_summary(child, 0),
-                    Content::Branch => {
-                        tally.clear();
-                        count_voxels(child, 1, &mut tally);
-                        let s = tally.summary();
-                        out.push((key.child(slot), s));
-                        s
-                    }
-                };
-                node.add(s.material, s.solid);
-            }
-            out.push((key, node.summary()));
+            summarize_level2_node(view_at(source, key), key, &mut tally, &mut |k, s| {
+                out.push((k, s));
+            });
         }
         out
     };
@@ -1927,6 +1995,209 @@ fn encode_parallel<S: VoxelSource + Sync>(
 #[cfg(test)]
 mod tests {
     use super::in_parallel;
+    use super::*;
+    use world_core::tree::CHUNK_LEVEL;
+    use world_core::{Edit, VoxelPos, VoxelTree};
+    use world_gen::{ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
+
+    fn layout() -> PoolLayout {
+        PoolLayout {
+            node_count: 1 << 20,
+            segments: vec![256 << 20],
+            brick_ids: 1 << 18,
+            allocs_per_segment: 1 << 18,
+            node_groups: 1 << 18,
+            upload_budget: 1 << 30,
+            request_capacity: 1024,
+            victim_capacity: 1024,
+        }
+    }
+
+    /// Real terrain, as the residency workers build it: the default
+    /// terrain's surface chunk in a central column and the chunk below it,
+    /// both at full detail, and the surface chunk of the next column built
+    /// from coarse cells, each built in a tree of its own and moved into
+    /// one world tree. Returns the tree and the chunks' lowest voxels.
+    fn terrain() -> (VoxelTree, Vec<VoxelPos>) {
+        let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
+            .expect("the default config is valid");
+        let surface = |cx: u32| {
+            let probe = ChunkCoord::new(cx, 0, 512).unwrap().min_voxel();
+            let (x, z) = (probe.x + 512, probe.z + 512);
+            let height = generator.column(x, z).unwrap().height;
+            ChunkCoord::containing(VoxelPos::new(x, height, z)).unwrap()
+        };
+        let top = surface(512);
+        let below = ChunkCoord::new(top.x(), top.y() - 1, top.z()).unwrap();
+        let far = surface(513);
+        let mut world = VoxelTree::unloaded();
+        let mut mins = Vec::new();
+        for (coord, coarse) in [(top, false), (below, false), (far, true)] {
+            let min = coord.min_voxel();
+            let mut t = VoxelTree::new();
+            if coarse {
+                let columns = generator.coarse_columns(coord, 2).unwrap();
+                t.build_region(CHUNK_LEVEL, min, &CoarseSource::new(columns))
+                    .unwrap();
+            } else {
+                t.build_region(CHUNK_LEVEL, min, &generator.chunk_source(coord))
+                    .unwrap();
+            }
+            world.insert_chunk(min, t.take_chunk(min).unwrap()).unwrap();
+            mins.push(min);
+        }
+        (world, mins)
+    }
+
+    fn chunk_key(res: &Residency, min: VoxelPos) -> NodeKey {
+        NodeKey::containing(res.shape().local(min).unwrap(), CHUNK_LEVEL)
+    }
+
+    /// A table over `snap` with every chunk of `mins` applied as replaced,
+    /// offered `offers` first; the upload of applying them, and the
+    /// summaries applying them computed.
+    fn apply_chunks(
+        snap: &world_core::TreeSnapshot,
+        mins: &[VoxelPos],
+        offers: Vec<ChunkSummaries>,
+    ) -> (Residency, UploadBatch, u64) {
+        let shape = Shape::of(snap);
+        let mut res = Residency::new(shape, &layout()).unwrap();
+        let mut batch = UploadBatch::default();
+        res.reset(snap, &mut batch);
+        // Expand the paths down to the chunks, as stage 1 keeps them.
+        for &min in mins {
+            let key = chunk_key(&res, min);
+            for level in (CHUNK_LEVEL..=shape.root_level()).rev() {
+                let _ = res.expand(snap, key.ancestor(level), &mut batch);
+            }
+        }
+        batch.clear();
+        res.offer_summaries(offers);
+        let changes: Vec<_> = mins
+            .iter()
+            .map(|&m| Change::Chunk(chunk_key(&res, m)))
+            .collect();
+        res.queue_changes(changes);
+        let applied = res.apply_changes(snap, None, u64::MAX, 4, |_| true, &mut batch);
+        assert_eq!(applied.pending, 0);
+        (res, batch, applied.summarized)
+    }
+
+    fn summaries_below(res: &Residency, c: NodeKey) -> Vec<(NodeKey, Summary)> {
+        let mut v: Vec<_> = res
+            .summaries
+            .iter()
+            .filter(|(k, _)| k.level() < c.level() && k.ancestor(c.level()) == c)
+            .map(|(k, s)| (k, *s))
+            .collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    }
+
+    fn all_summaries(res: &Residency) -> Vec<(NodeKey, Summary)> {
+        let mut v: Vec<_> = res.summaries.iter().map(|(k, s)| (k, *s)).collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    }
+
+    /// Summaries computed where a chunk is built are exactly the ones the
+    /// render thread computes on applying it, node for node, on real
+    /// terrain chunks at full and coarse detail; and a table given them
+    /// writes exactly the same GPU records while computing none of them.
+    #[test]
+    fn worker_summaries_equal_the_render_threads_on_real_terrain() {
+        let (world, mins) = terrain();
+        let snap = world.snapshot();
+        let offers: Vec<_> = mins
+            .iter()
+            .map(|&m| ChunkSummaries::compute(m, &world.chunk_data(m).unwrap()).unwrap())
+            .collect();
+        let (computed, computed_batch, a) = apply_chunks(&snap, &mins, Vec::new());
+        for offer in &offers {
+            let c = chunk_key(&computed, offer.min());
+            let expected = summaries_below(&computed, c);
+            assert!(expected.len() > 100, "{} mixed nodes", expected.len());
+            assert_eq!(
+                offer.len(),
+                expected.len(),
+                "every mixed node below the chunk"
+            );
+            for (k, s) in expected {
+                assert_eq!(offer.get(&k), Some(s), "{k:?}");
+            }
+        }
+        let (given, given_batch, b) = apply_chunks(&snap, &mins, offers);
+        assert_eq!(given.offers_used(), (3, 0));
+        assert_eq!(all_summaries(&given), all_summaries(&computed));
+        let records = |b: &UploadBatch| b.node_writes().collect::<Vec<_>>();
+        assert!(!records(&computed_batch).is_empty());
+        assert_eq!(records(&given_batch), records(&computed_batch));
+        assert!(
+            b * 20 < a,
+            "applying computed {b} summaries with offers, {a} without"
+        );
+    }
+
+    /// An offer is used only while the source holds the very content it
+    /// was computed from: a chunk edited after its summaries were computed
+    /// (an edit applied on joining, or one in the same frame) and a chunk
+    /// replaced again are summarized on the render thread instead, with the
+    /// same result as never offering them.
+    #[test]
+    fn an_edited_chunk_never_takes_summaries_of_its_old_content() {
+        let (mut world, mins) = terrain();
+        let offers: Vec<_> = mins
+            .iter()
+            .map(|&m| ChunkSummaries::compute(m, &world.chunk_data(m).unwrap()).unwrap())
+            .collect();
+        // Edit the first chunk; replace the second with an equal copy built
+        // again (same content, other arenas); leave the third.
+        let p = VoxelPos::new(mins[0].x + 300, mins[0].y + 500, mins[0].z + 300);
+        let flipped = if world.get(p).is_air() {
+            MaterialId(3)
+        } else {
+            MaterialId::AIR
+        };
+        world.apply(&[Edit::new(p, flipped)]).unwrap();
+        let mut copy = world.extract(CHUNK_LEVEL, mins[1]).unwrap();
+        world
+            .insert_chunk(mins[1], copy.take_chunk(mins[1]).unwrap())
+            .unwrap();
+        let snap = world.snapshot();
+        assert!(!offers[0].describes(&snap) && !offers[1].describes(&snap));
+        assert!(offers[2].describes(&snap));
+        let (computed, computed_batch, _) = apply_chunks(&snap, &mins, Vec::new());
+        let (given, given_batch, _) = apply_chunks(&snap, &mins, offers);
+        assert_eq!(given.offers_used(), (1, 2));
+        assert_eq!(all_summaries(&given), all_summaries(&computed));
+        let records = |b: &UploadBatch| b.node_writes().collect::<Vec<_>>();
+        assert_eq!(records(&given_batch), records(&computed_batch));
+    }
+
+    /// Offers for chunks that are not waiting are not kept, and sources
+    /// that do not store chunks (a dense grid) never use one.
+    #[test]
+    fn offers_are_kept_only_for_waiting_chunks() {
+        let (world, mins) = terrain();
+        let snap = world.snapshot();
+        let mut res = Residency::new(Shape::of(&snap), &layout()).unwrap();
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        let offer = ChunkSummaries::compute(mins[0], &world.chunk_data(mins[0]).unwrap()).unwrap();
+        res.offer_summaries([offer]);
+        assert_eq!(res.offers_held(), 1);
+        res.apply_changes(&snap, None, u64::MAX, 1, |_| true, &mut batch);
+        assert_eq!(res.offers_held(), 0, "no change waits for it");
+        let air = ChunkSummaries::compute(
+            VoxelPos::new(0, 0, 0),
+            &VoxelTree::new().chunk_data(VoxelPos::new(0, 0, 0)).unwrap(),
+        );
+        assert!(air.is_none(), "air has nothing to summarize");
+        let grid = world_core::DenseGrid::new(3, VoxelPos::new(0, 0, 0));
+        let offer = ChunkSummaries::compute(mins[0], &world.chunk_data(mins[0]).unwrap()).unwrap();
+        assert!(!offer.describes(&grid));
+    }
 
     #[test]
     fn parallel_parts_keep_their_order() {
