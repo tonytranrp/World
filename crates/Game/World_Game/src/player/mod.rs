@@ -21,11 +21,17 @@ pub struct PlayerCamera;
 /// A plain camera so the window has something to present, with the sky
 /// composited over it. It becomes the first-person eye camera when the player
 /// body exists. Bevy's tonemapping is off: the voxel renderer does its own.
+///
+/// MSAA is off. The voxels arrive as one fullscreen triangle, so every
+/// sample of a pixel gets the same colour and depth and the resolve changes
+/// nothing; Bevy's default of four samples only multiplied the composite's
+/// writes at the window's size and added a resolve (decision 0017).
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         PlayerCamera,
         ReloadScoped,
         Camera3d::default(),
+        Msaa::Off,
         Tonemapping::None,
         DebandDither::Disabled,
         SkyComposite::default(),
