@@ -456,7 +456,8 @@ impl Residency {
     // ----------------------------------------------------------- summaries --
 
     fn edited_bit(&self, key: NodeKey) -> bool {
-        self.edited.contains(&key)
+        // Nothing is edited until the player edits: no hashing until then.
+        !self.edited.is_empty() && self.edited.contains(&key)
     }
 
     /// The level of the chunks: summaries below it are kept per chunk.
@@ -603,6 +604,20 @@ impl Residency {
         }
     }
 
+    /// Adds `kids` to the children with entries of `key`, as
+    /// [`put_entry`](Self::put_entry) does for each child it inserts.
+    fn add_kids(&mut self, key: NodeKey, kids: u64) {
+        let mut flip = None;
+        if let Some(e) = self.entries.get_mut(&key) {
+            let was = e.done();
+            e.kids |= kids;
+            flip = (e.done() != was).then_some(!was);
+        }
+        if let Some(done) = flip {
+            self.set_done_bit(key, done);
+        }
+    }
+
     /// Removes the entry of `key`, keeping its parent's child masks.
     fn remove_entry(&mut self, key: NodeKey) -> Option<Entry> {
         let e = self.entries.remove(&key)?;
@@ -746,15 +761,16 @@ impl Residency {
     ) -> Result<(), Refused> {
         let mask = view.mask();
         let n = mask.count_ones();
-        // Children that became air or uniform lose their entries.
-        for slot in 0..64 {
-            let ck = key.child(slot);
-            if !self.entries.contains_key(&ck) {
-                continue;
-            }
+        // Children that became air or uniform lose their entries. The
+        // children with entries are exactly `kids` (verify checks it), so a
+        // node expanded afresh looks none up.
+        let mut kids = self.entries.get(&key).map_or(0, |e| e.kids);
+        while kids != 0 {
+            let slot = kids.trailing_zeros();
+            kids &= kids - 1;
             let gone = mask & (1u64 << slot) == 0 || content(&view.child(slot)) != Content::Branch;
             if gone {
-                self.drop_subtree(ck, batch);
+                self.drop_subtree(key.child(slot), batch);
             }
         }
 
@@ -780,10 +796,44 @@ impl Residency {
             }
         };
         self.set_group(key, Some(group));
-        if let Some(e) = self.entries.get_mut(&key) {
-            e.layout = mask;
-        }
+        let fresh = match self.entries.get_mut(&key) {
+            Some(e) => {
+                e.layout = mask;
+                e.kids == 0
+            }
+            None => false,
+        };
 
+        if fresh {
+            // No child has an entry (those with one are exactly `kids`), so
+            // none keeps its record or holds a group or brick: each record
+            // is what `group_record` gives a child without an entry, the
+            // entries go in in slot order, and the masks are set once.
+            let mut kids = 0u64;
+            for (k, (slot, child)) in view.children().enumerate() {
+                let ck = key.child(slot);
+                let index = group.first + k as u32;
+                let edited = self.edited_bit(ck);
+                let record = match content(&child) {
+                    Content::Air => continue,
+                    Content::Uniform(m) => GpuNode::uniform(m, edited),
+                    Content::Unloaded => GpuNode::not_resident(0, MaterialId::AIR, edited),
+                    c @ (Content::Branch | Content::Leaf) => {
+                        let material = self.summary(ck, child).material;
+                        let record = GpuNode::not_resident(child.mask(), material, edited);
+                        if c == Content::Branch {
+                            let old = self.entries.insert(ck, Entry::new(index, record));
+                            debug_assert!(old.is_none(), "{ck:?} had an entry outside kids");
+                            kids |= 1u64 << slot;
+                        }
+                        record
+                    }
+                };
+                batch.write_node(index, record);
+            }
+            self.add_kids(key, kids);
+            return Ok(());
+        }
         for (k, (slot, child)) in view.children().enumerate() {
             let ck = key.child(slot);
             let index = group.first + k as u32;
