@@ -181,7 +181,6 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
 
     /// Whether both use the same directory allocation: nothing was written
     /// or added between them.
-    #[cfg(test)]
     pub fn shares_list(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.dir, &other.dir)
     }

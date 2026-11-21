@@ -370,6 +370,10 @@ impl TreeRead for VoxelTree {
     fn get(&self, pos: VoxelPos) -> MaterialId {
         VoxelTree::get(self, pos)
     }
+
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        self.chunk_data(min)
+    }
 }
 
 impl fmt::Debug for VoxelTree {
@@ -419,6 +423,12 @@ impl TreeSnapshot {
         TreeCursor::new(self.view())
     }
 
+    /// The content of the chunk-level region at `min`, shared, as
+    /// [`VoxelTree::chunk_data`]. `None` if it is not resident.
+    pub fn chunk_data(&self, min: VoxelPos) -> Option<ChunkData> {
+        chunks::shared_chunk(self.view(), node_origin(CHUNK_LEVEL, min).ok()?)
+    }
+
     fn view(&self) -> TreeView<'_> {
         TreeView {
             top: &self.top,
@@ -436,6 +446,10 @@ impl TreeRead for TreeSnapshot {
 
     fn get(&self, pos: VoxelPos) -> MaterialId {
         TreeSnapshot::get(self, pos)
+    }
+
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        self.chunk_data(min)
     }
 }
 

@@ -15,6 +15,7 @@
 use std::fmt;
 
 use super::alloc::{Storage, StorageReader};
+use super::chunks::ChunkData;
 use super::forest::{ChunkKeys, Chunks, chunk_key, chunk_root};
 use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
@@ -54,6 +55,15 @@ pub trait VoxelSource {
     /// with a direct lookup.
     fn get(&self, pos: VoxelPos) -> MaterialId {
         descend(self.root(), self.levels(), self.origin(), pos)
+    }
+
+    /// The content of the chunk-level region at `min`, shared, for sources
+    /// that store chunks as detachable arenas (trees and snapshots), so a
+    /// reader can tell with [`ChunkData::same_arenas`] whether it is content
+    /// it has seen. `None` for other sources and where it is not resident.
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        let _ = min;
+        None
     }
 }
 
@@ -245,6 +255,12 @@ pub trait TreeRead {
     fn get(&self, pos: VoxelPos) -> MaterialId {
         descend(self.root(), TREE_DEPTH, WORLD_ORIGIN, pos)
     }
+
+    /// As [`VoxelSource::shared_chunk`].
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        let _ = min;
+        None
+    }
 }
 
 impl<T: TreeRead + ?Sized> VoxelSource for T {
@@ -267,6 +283,10 @@ impl<T: TreeRead + ?Sized> VoxelSource for T {
 
     fn get(&self, pos: VoxelPos) -> MaterialId {
         TreeRead::get(self, pos)
+    }
+
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        TreeRead::shared_chunk(self, min)
     }
 }
 

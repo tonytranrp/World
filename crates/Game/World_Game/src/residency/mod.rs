@@ -143,14 +143,16 @@ fn update_world(
     }
 }
 
-/// Hands the renderer this frame's render tree and the bricks that changed.
-/// A newly opened world replaces whatever the renderer showed.
+/// Hands the renderer this frame's render tree and the bricks that changed,
+/// with the summaries the workers computed for the chunks it replaced. A
+/// newly opened world replaces whatever the renderer showed.
 fn feed_renderer(world: Option<ResMut<World>>, feed: Option<ResMut<VoxelWorldFeed>>) {
     let (Some(mut world), Some(mut feed)) = (world, feed) else {
         return;
     };
     let snapshot = Arc::new(world.0.render_snapshot());
     let changes = world.0.take_changes();
+    let summaries = world.0.take_render_summaries();
     if world.is_added() {
         feed.replace(snapshot);
     } else {
@@ -159,6 +161,7 @@ fn feed_renderer(world: Option<ResMut<World>>, feed: Option<ResMut<VoxelWorldFee
             &DirtyBricks::from_unsorted(changes.render_bricks),
             &changes.render_chunks,
         );
+        feed.offer_summaries(summaries);
     }
 }
 
