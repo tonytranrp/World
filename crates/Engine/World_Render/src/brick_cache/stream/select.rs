@@ -459,6 +459,10 @@ pub fn select_split(
         }
     }
     let mut visits = 0u32;
+    // Whether the pass left expansion candidates out of the queue. Any
+    // expansion schedules a new pass already; this covers a frame whose
+    // carried candidates all fail.
+    let mut left_out = false;
     while visits < max_visits {
         let Some(Pending { key, .. }) = growth.frontier.pop() else {
             growth.active = false;
@@ -511,6 +515,30 @@ pub fn select_split(
                     if wanted(child, d2) {
                         // Pushes count too: a node can queue 64 children.
                         visits += 1;
+                        // A level-2 child is judged here, next to its
+                        // siblings in the table, instead of queued, when
+                        // it has nothing to do (expanded, and every brick
+                        // resident or too far to want: a brick is no
+                        // nearer than its level-2 node) or would only be
+                        // an expansion candidate past those this frame
+                        // keeps: a pass reaches far more than a frame
+                        // expands.
+                        if key.level == 3 {
+                            match res.node_state(child) {
+                                None => continue,
+                                Some(n)
+                                    if n.expanded
+                                        && (n.kids & !n.bricks == 0 || !reach.wants(1, d2)) =>
+                                {
+                                    continue;
+                                }
+                                Some(n) if !n.expanded && expand.len() >= budgets.keep_expand => {
+                                    left_out = true;
+                                    continue;
+                                }
+                                Some(_) => {}
+                            }
+                        }
                         growth.frontier.push(Pending {
                             pixels: pixels(child, d2),
                             key: child,
@@ -608,7 +636,7 @@ pub fn select_split(
     // Candidates left out are found again by the next pass. Expansions
     // schedule one, loads do not, so a finished pass that left some out
     // schedules it here.
-    if (cut_expand || cut_load) && !growth.active {
+    if (cut_expand || cut_load || left_out) && !growth.active {
         growth.changed = true;
     }
     out
