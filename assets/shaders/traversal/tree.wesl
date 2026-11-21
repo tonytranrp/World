@@ -16,6 +16,10 @@
 //   counting the boundaries each other axis crossed by then, with the same
 //   tie rule. Distances are computed directly from integer boundaries,
 //   never accumulated.
+// - Whole-node skips: in an empty cell, if the box of cells between it and
+//   the node's exit holds no set bit, the ray jumps to the node's exit at
+//   once instead of crossing up to ten empty cells one by one (decision
+//   0015: steps per ray fell from about 55 to 21 on the floor walk).
 // - Ancestor stack: after a jump, descent restarts at the deepest node that
 //   still contains the new voxel instead of at the root.
 //
@@ -198,6 +202,49 @@ fn step_voxel(v: vec3<i32>, k: u32, bk: i32, od: vec3<f32>, dd: vec3<f32>, t: f3
     return vec3<i32>(x, y, z);
 }
 
+// Bits `a` to `b` (0 to 3, a <= b) of a 4-bit group.
+fn bit_range4(a: u32, b: u32) -> u32 {
+    return (2u << b) - (1u << a);
+}
+
+// Whether the ray leaves the node holding cell `ml >> 2 level` (mirrored
+// local voxel coordinates) without entering a cell its mask marks solid.
+// From here to the node's exit the mirrored coordinates only grow, so the
+// cells it passes lie in the box from its current cell to the cell of its
+// exit point; if no set bit falls in that box, every cell it would step
+// through is empty and it may jump straight to the node's exit, which the
+// caller computes exactly as for any empty cell. The box's upper corner is
+// widened against rounding (half a voxel plus about eight ulps of the
+// coordinate), so it is never smaller than the true one: skipping is exact,
+// only sometimes not taken. Skipped cells have no side effects (requests and
+// brick stamps come only from cells with set bits).
+fn rest_of_node_empty(
+    mask_lo: u32, mask_hi: u32, ml: vec3<u32>, level: u32, m: vec3<bool>,
+    mo: vec3<i32>, od: vec3<f32>, dd: vec3<f32>,
+) -> bool {
+    let shift = 2u * level;
+    let node_span = 1u << (shift + 2u);
+    let node_end = vec3<f32>(vec3<i32>((ml | vec3<u32>(node_span - 1u)) + vec3<u32>(1u)) + mo);
+    let tn = select(vec3<f32>(T_FAR), (node_end - od) / dd, dd > vec3<f32>(0.0));
+    let te = min(tn.x, min(tn.y, tn.z));
+    // Exit point relative to the node's lowest corner, in cells.
+    let corner = vec3<f32>(vec3<i32>(ml & ~vec3<u32>(node_span - 1u)) + mo);
+    let exit = od + dd * te;
+    let slack = vec3<f32>(0.5) + abs(exit) * 1.0e-6;
+    let rel = (exit - corner + slack) / f32(1u << shift);
+    let c0 = (ml >> vec3<u32>(shift)) & vec3<u32>(3u);
+    let c1 = max(min(vec3<u32>(max(floor(rel), vec3<f32>(0.0))), vec3<u32>(3u)), c0);
+    // Back to the unmirrored cell order of the mask.
+    let lo = select(c0, vec3<u32>(3u) - c1, m);
+    let hi = select(c1, vec3<u32>(3u) - c0, m);
+    let rx = bit_range4(lo.x, hi.x) * 0x11111111u;
+    let ry = ((1u << (4u * hi.y + 4u)) - (1u << (4u * lo.y))) * 0x00010001u;
+    let z_lo = select(0u, 0xFFFFu, lo.z == 0u) | select(0u, 0xFFFF0000u, lo.z <= 1u && hi.z >= 1u);
+    let z_hi = select(0u, 0xFFFFu, lo.z <= 2u && hi.z >= 2u) | select(0u, 0xFFFF0000u, hi.z == 3u);
+    let box_xy = rx & ry;
+    return ((mask_lo & box_xy & z_lo) | (mask_hi & box_xy & z_hi)) == 0u;
+}
+
 // Levels of the ancestor stack: enough for the world tree (TREE_DEPTH).
 const STACK_LEVELS: u32 = 10u;
 // Threads per tracing workgroup (8x8).
@@ -291,6 +338,10 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
             let slot = child_slot(local, level);
             if !mask_bit(node.mask_lo, node.mask_hi, slot) {
                 cell_level = level;
+                if level < s.root_level
+                    && rest_of_node_empty(node.mask_lo, node.mask_hi, ml, level, m, mo, od, dd) {
+                    cell_level = level + 1u;
+                }
                 break;
             }
             let cell = f32(1u << (2u * level));
@@ -322,6 +373,9 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
                 let vslot = child_slot(local, 0u);
                 if !mask_bit(leaf_lo, leaf_hi, vslot) {
                     cell_level = 0u;
+                    if rest_of_node_empty(leaf_lo, leaf_hi, ml, 0u, m, mo, od, dd) {
+                        cell_level = 1u;
+                    }
                     break;
                 }
                 let material = leaf_material(seg, base, n, k, leaf_lo, leaf_hi, vslot);
