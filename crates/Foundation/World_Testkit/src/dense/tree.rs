@@ -153,25 +153,41 @@ impl Walk {
         }
         self.counts.branches += 1;
         if level == 1 {
-            // A header, one word per full leaf of another material and a
-            // three-word record per partial leaf; the full leaves of the
-            // default material (the most common material among full leaves,
-            // ties to the lower id) have no words. The header is three
-            // words, five with the other full leaves' mask (decision 0021).
-            let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
-            for (_, n) in &listed {
-                if let NodeKind::Uniform(m) = n.kind() {
-                    *counts.entry(m.0).or_default() += 1;
+            // The default material is the most common among the full
+            // leaves (ties to the lower id). Its full leaves have no words, its
+            // partial leaves two (the leaf mask), every other full leaf one
+            // word and every other partial leaf a three-word record. The
+            // header is three words, or five with the full mask, which a
+            // brick has when it has other full leaves or default partial
+            // ones (decisions 0021 and 0025).
+            let most_common = |of: &dyn Fn(&N) -> Option<u16>| {
+                let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+                for (_, n) in &listed {
+                    if let Some(m) = of(n) {
+                        *counts.entry(m).or_default() += 1;
+                    }
                 }
-            }
-            let full: usize = counts.values().sum();
-            let defaults = counts
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-                .map_or(0, |(_, &n)| n);
-            let others = full - defaults;
-            let header = if others == 0 { 3 } else { 5 };
-            self.counts.words += header + others + 3 * (listed.len() - full);
+                counts
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+                    .map(|(m, _)| m)
+            };
+            let uniform = |n: &N| match n.kind() {
+                NodeKind::Uniform(m) => Some(m.0),
+                _ => None,
+            };
+            let single = |n: &N| match (n.kind(), n.palette().as_slice()) {
+                (NodeKind::Leaf, [m]) => Some(m.0),
+                _ => None,
+            };
+            let default = most_common(&uniform);
+            let count = |of: &dyn Fn(&N) -> bool| listed.iter().filter(|(_, n)| of(n)).count();
+            let full = count(&|n| uniform(n).is_some());
+            let default_full = count(&|n| default.is_some() && uniform(n) == default);
+            let masks = count(&|n| default.is_some() && single(n) == default);
+            let others = full - default_full;
+            let header = if others + masks > 0 { 5 } else { 3 };
+            self.counts.words += header + others + 2 * masks + 3 * (listed.len() - full - masks);
         } else {
             self.counts.words += listed.len();
         }
@@ -222,10 +238,12 @@ impl Walk {
         let solids = mask.count_ones() as usize;
         self.counts.leaves += 1;
         // One material fits in the record; more need a palette block: a
-        // header, two ids per word, then the packed indices.
+        // header from three materials on (decision 0025), two ids per word,
+        // then the packed indices.
         if palette.len() > 1 {
-            self.counts.words +=
-                1 + palette.len().div_ceil(2) + (solids * index_bits(palette.len())).div_ceil(32);
+            self.counts.words += usize::from(palette.len() > 2)
+                + palette.len().div_ceil(2)
+                + (solids * index_bits(palette.len())).div_ceil(32);
         }
         Ok(())
     }

@@ -11,9 +11,9 @@ use world_core::MaterialId;
 use world_core::coords::path::child_slot;
 
 use super::{
-    BLOCK_COUNT_MASK, BLOCK_DEFAULT_MASK_WORD, BLOCK_DEFAULT_WORD, BLOCK_FULL_MASK_WORD,
-    BLOCK_HEADER_WORDS, BrickRef, GpuNode, Kind, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT,
-    PALETTE_LEN_MASK, PAYLOAD_UNIFORM_BIT, ROOT_NODE, rank,
+    BLOCK_COUNT_MASK, BLOCK_DEFAULT_MASK_WORD, BLOCK_DEFAULT_SHIFT, BLOCK_DEFAULT_WORD,
+    BLOCK_FULL_MASK_WORD, BLOCK_HEADER_WORDS, BrickRef, GpuNode, Kind, LEAF_MASK_WORDS,
+    PALETTE_BITS_SHIFT, PALETTE_LEN_MASK, PALETTE_PAIR_SHIFT, PAYLOAD_UNIFORM_BIT, ROOT_NODE, rank,
 };
 
 /// The pools as the GPU holds them.
@@ -142,23 +142,22 @@ pub fn block_voxel(
 ) -> Result<Sample, DecodeError> {
     let default_mask = header_mask(words, BLOCK_DEFAULT_MASK_WORD);
     let full_mask = header_mask(words, BLOCK_FULL_MASK_WORD);
-    let stored = mask & !default_mask;
-    let partial = stored & !full_mask;
+    let partial = mask & !full_mask;
+    let paid = mask & !default_mask;
     let p = words[1] & BLOCK_COUNT_MASK;
-    if default_mask & !mask != 0
-        || full_mask & !stored != 0
+    if (default_mask | full_mask) & !mask != 0
         || p != partial.count_ones()
         || mask & (1u64 << slot) == 0
     {
         return Err(DecodeError::BlockCountMismatch { block });
     }
-    if default_mask & (1u64 << slot) != 0 {
-        return Ok(Sample::Exact(MaterialId(
-            words[BLOCK_DEFAULT_WORD as usize] as u16,
-        )));
+    let bit = 1u64 << slot;
+    let default = MaterialId((words[BLOCK_DEFAULT_WORD as usize] >> BLOCK_DEFAULT_SHIFT) as u16);
+    if default_mask & full_mask & bit != 0 {
+        return Ok(Sample::Exact(default));
     }
     let out = DecodeError::BlockOutOfRange { block };
-    let leaf_mask = if full_mask & (1u64 << slot) != 0 {
+    let leaf_mask = if full_mask & bit != 0 {
         u64::MAX
     } else {
         let at = (BLOCK_HEADER_WORDS + rank(partial, slot) * LEAF_MASK_WORDS) as usize;
@@ -169,29 +168,40 @@ pub fn block_voxel(
     if leaf_mask & (1u64 << voxel_slot) == 0 {
         return Ok(Sample::Air);
     }
+    if default_mask & bit != 0 {
+        return Ok(Sample::Exact(default));
+    }
     let payload = *words
-        .get((BLOCK_HEADER_WORDS + p * LEAF_MASK_WORDS + rank(stored, slot)) as usize)
+        .get((BLOCK_HEADER_WORDS + p * LEAF_MASK_WORDS + rank(paid, slot)) as usize)
         .ok_or(out)?;
     if payload & PAYLOAD_UNIFORM_BIT != 0 {
         return Ok(Sample::Exact(MaterialId(payload as u16)));
     }
     let bad = DecodeError::PaletteOutOfRange { block };
     let p = payload as usize;
-    let header = *words.get(p).ok_or(bad)?;
-    let len = header & PALETTE_LEN_MASK;
-    let bits = header >> PALETTE_BITS_SHIFT & 0xFF;
+    let first = *words.get(p).ok_or(bad)?;
+    // Two materials have no header: the first word is the palette.
+    let (len, bits, palette_at) = if first >> PALETTE_PAIR_SHIFT != 0 {
+        (2, 1, p)
+    } else {
+        (
+            first & PALETTE_LEN_MASK,
+            first >> PALETTE_BITS_SHIFT & 0xFF,
+            p + 1,
+        )
+    };
     if !matches!(bits, 1 | 2 | 4 | 8) {
         return Err(bad);
     }
     let r = rank(leaf_mask, voxel_slot);
     let bit = r * bits;
-    let indices_at = p + 1 + len.div_ceil(2) as usize;
+    let indices_at = palette_at + len.div_ceil(2) as usize;
     let word = *words.get(indices_at + (bit / 32) as usize).ok_or(bad)?;
     let index = (word >> (bit % 32)) & ((1u32 << bits) - 1);
     if index >= len {
         return Err(bad);
     }
-    let entry = *words.get(p + 1 + (index / 2) as usize).ok_or(bad)?;
+    let entry = *words.get(palette_at + (index / 2) as usize).ok_or(bad)?;
     Ok(Sample::Exact(MaterialId(
         (entry >> (16 * (index & 1))) as u16,
     )))
