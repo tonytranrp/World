@@ -86,6 +86,10 @@ pub struct LodTuning {
     /// Nodes the shrink walk collapses per frame at most (each releases its
     /// subtree); it resumes where it stopped. `1..=1048576`.
     pub max_collapses_per_frame: u32,
+    /// Steps the primary pass's beam prepass takes per 8x8 tile of camera
+    /// rays to find where they may start (decision 0023); `0` turns the
+    /// prepass off and rays start at the camera. `0..=1024`.
+    pub beam_iterations: u32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -167,6 +171,7 @@ impl Default for BrickCacheConfig {
                 max_expansion_summaries_per_frame: 2048,
                 max_shrink_visits_per_frame: 4096,
                 max_collapses_per_frame: 256,
+                beam_iterations: 64,
             },
             max_summaries_per_frame: 8192,
             summary_threads: 0,
@@ -288,6 +293,12 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.max_shrink_visits_per_frame.into(),
             256.0,
             16777216.0,
+        );
+        range(
+            "lod.beam_iterations",
+            self.lod.beam_iterations.into(),
+            0.0,
+            1024.0,
         );
         range(
             "lod.max_collapses_per_frame",

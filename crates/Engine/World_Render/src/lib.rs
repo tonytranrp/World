@@ -42,7 +42,7 @@ pub mod internals {
     /// Every Rust constant the shaders use, grouped by the module that
     /// defines it, in the order `cargo xtask codegen` writes them to
     /// `assets/shaders/common/constants.wesl` (decision 0013).
-    pub fn shader_constants() -> [(&'static str, &'static [(&'static str, u32)]); 4] {
+    pub fn shader_constants() -> [(&'static str, &'static [(&'static str, u32)]); 5] {
         [
             (
                 "brick_cache::format",
@@ -57,6 +57,10 @@ pub mod internals {
                 crate::brick_cache::stream::batch::SHADER_CONSTANTS,
             ),
             ("gbuffer", crate::gbuffer::SHADER_CONSTANTS),
+            (
+                "passes::primary::trace",
+                crate::passes::primary::trace::SHADER_CONSTANTS,
+            ),
         ]
     }
 }
