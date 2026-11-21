@@ -4,7 +4,7 @@
 // compacts those bricks' ids and block refs into the victim block. Free ids
 // (last-used frame 0) are skipped. Data never moves here.
 
-import package::shaders::common::format::{
+import package::shaders::common::constants::{
     BRICK_TABLE_WORDS, INVALID_REF, FEEDBACK_HEADER_WORDS, VICTIM_WORDS,
 };
 

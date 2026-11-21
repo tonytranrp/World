@@ -5,10 +5,11 @@
 // same node or id, so no entry is written twice. Upload layout: world_render
 // `brick_cache::stream::batch`.
 
-import package::shaders::common::format::{
-    Node, BLOCK_ALIGN_WORDS, BRICK_REF_OFFSET_MASK, BRICK_REF_SEGMENT_SHIFT,
+import package::shaders::common::constants::{
+    BLOCK_ALIGN_WORDS, BRICK_REF_OFFSET_MASK, BRICK_REF_SEGMENT_SHIFT,
     BRICK_TABLE_WORDS, UPLOAD_NODE_WRITE_WORDS, UPLOAD_SCATTER_WORDS, UPLOAD_TABLE_WRITE_WORDS,
 };
+import package::shaders::common::format::Node;
 
 @group(0) @binding(0) var<storage, read_write> nodes: array<Node>;
 @group(0) @binding(1) var<storage, read_write> seg0: array<u32>;

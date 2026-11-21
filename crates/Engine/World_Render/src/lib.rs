@@ -33,14 +33,24 @@ pub mod internals {
     }
     pub use crate::passes::primary::trace;
 
-    /// Every Rust constant the WESL format module must mirror.
-    pub fn shader_constants() -> Vec<(&'static str, u32)> {
+    /// Every Rust constant the shaders use, grouped by the module that
+    /// defines it, in the order `cargo xtask codegen` writes them to
+    /// `assets/shaders/common/constants.wesl` (decision 0013).
+    pub fn shader_constants() -> [(&'static str, &'static [(&'static str, u32)]); 4] {
         [
-            crate::brick_cache::format::SHADER_CONSTANTS,
-            crate::brick_cache::feedback::SHADER_CONSTANTS,
-            crate::brick_cache::stream::batch::SHADER_CONSTANTS,
-            crate::gbuffer::SHADER_CONSTANTS,
+            (
+                "brick_cache::format",
+                crate::brick_cache::format::SHADER_CONSTANTS,
+            ),
+            (
+                "brick_cache::feedback",
+                crate::brick_cache::feedback::SHADER_CONSTANTS,
+            ),
+            (
+                "brick_cache::stream::batch",
+                crate::brick_cache::stream::batch::SHADER_CONSTANTS,
+            ),
+            ("gbuffer", crate::gbuffer::SHADER_CONSTANTS),
         ]
-        .concat()
     }
 }

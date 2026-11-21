@@ -31,7 +31,8 @@ pub const NODE_WRITE_WORDS: u32 = 1 + NODE_WORDS;
 pub const SCATTER_WORDS: u32 = 4;
 pub const TABLE_WRITE_WORDS: u32 = 4;
 
-/// Header word indices, shared with `apply.wesl`.
+/// The upload layout constants `apply.wesl` reads, generated into the shaders
+/// by `cargo xtask codegen`.
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("UPLOAD_HEADER_WORDS", HEADER_WORDS),
     ("UPLOAD_NODE_WRITE_WORDS", NODE_WRITE_WORDS),

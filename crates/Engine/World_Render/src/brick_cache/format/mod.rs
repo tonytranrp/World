@@ -243,7 +243,8 @@ pub const fn rank(mask: u64, slot: u32) -> u32 {
     (mask & ((1u64 << slot) - 1)).count_ones()
 }
 
-/// Every format constant with its name, as the WESL mirror must declare it.
+/// Every format constant with its name, as `cargo xtask codegen` writes it
+/// to `assets/shaders/common/constants.wesl`.
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("NODE_WORDS", NODE_WORDS),
     ("ROOT_NODE", ROOT_NODE),

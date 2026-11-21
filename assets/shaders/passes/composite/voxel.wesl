@@ -7,7 +7,7 @@
 // composite to leave them alone. Misses are discarded.
 
 import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
-import package::shaders::common::format::{HIT_WORDS, HIT_FLAG_HIT};
+import package::shaders::common::constants::{HIT_WORDS, HIT_FLAG_HIT};
 
 struct CompositeParams {
     // Traced width, height, material count, unused.
