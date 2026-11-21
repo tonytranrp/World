@@ -85,6 +85,13 @@ fn tree_scene() -> (VoxelTree, Bounds) {
     // words), 8 its other full leaves (one payload each, decision 0021).
     fill(&mut t, [16, -16, 16], [32, -8, 28], 7);
     fill(&mut t, [16, -8, 16], [24, 0, 28], 8);
+    // A brick of 9 whose top ends halfway up a row of leaves: its partial
+    // leaves of the default are leaf masks without payloads (decision
+    // 0025). Where 10 meets 9 off the leaf grid, leaves of two materials
+    // (palette blocks without a header); where 11 joins, one of three.
+    fill(&mut t, [-32, -16, -32], [-16, -6, -16], 9);
+    fill(&mut t, [-32, -10, -24], [-26, -6, -16], 10);
+    t.set(VoxelPos::new(-27, -7, -18), MaterialId(11)).unwrap();
     for i in 0..20 {
         fill(&mut t, [20 + i, -16, -30], [21 + i, -16 + i, -10], 4);
         t.set(
@@ -216,6 +223,12 @@ fn compare_scene<S: VoxelSource>(source: &S, bounds: Bounds, label: &str) {
 #[test]
 fn gpu_trace_matches_the_brute_force_dda_on_a_world_tree() {
     let (tree, bounds) = tree_scene();
+    // The scene covers every brick and palette layout (decisions 0021 and
+    // 0025): long headers, other full leaves, default partial leaves, and
+    // palette blocks of two materials (one bit) and of three (two bits).
+    let b = tree.memory_breakdown();
+    assert!(b.long_headers > 0 && b.full_records > 0 && b.default_partial_leaves > 0);
+    assert!(b.palette_words[0] > 0 && b.palette_words[1] > 0, "{b:?}");
     compare_scene(&tree.snapshot(), bounds, "world tree");
 }
 

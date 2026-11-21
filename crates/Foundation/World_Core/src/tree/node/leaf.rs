@@ -96,19 +96,45 @@ impl Record {
     }
 }
 
-/// The header word of a palette block.
+/// The header word of a palette block of three or more materials.
 pub(crate) const fn header(palette_len: usize, index_bits: u32) -> u32 {
     palette_len as u32 | (index_bits << 8)
 }
 
-/// Palette length stored in a header.
-pub(crate) const fn palette_len(header: u32) -> usize {
-    (header & 0xFF) as usize
+/// Whether `first`, a palette block's first word, is the palette of a
+/// two-material block, which has no header (decision 0025): its high half
+/// is the larger id, at least 2, where a header's high half is zero.
+#[inline(always)]
+pub(crate) const fn is_pair(first: u32) -> bool {
+    first >> 16 != 0
 }
 
-/// Index bit width stored in a header.
-pub(crate) const fn index_bits(header: u32) -> u32 {
-    (header >> 8) & 0xFF
+/// Palette length of the block whose first word is `first`.
+pub(crate) const fn palette_len(first: u32) -> usize {
+    if is_pair(first) {
+        2
+    } else {
+        (first & 0xFF) as usize
+    }
+}
+
+/// Index bit width of the block whose first word is `first`.
+pub(crate) const fn index_bits(first: u32) -> u32 {
+    if is_pair(first) {
+        1
+    } else {
+        (first >> 8) & 0xFF
+    }
+}
+
+/// Where the palette of the block whose first word is `first` starts.
+const fn palette_start(first: u32) -> usize {
+    if is_pair(first) { 0 } else { 1 }
+}
+
+/// Where the indices of the block whose first word is `first` start.
+pub(crate) const fn index_start(first: u32) -> usize {
+    palette_start(first) + palette_words(palette_len(first))
 }
 
 /// The smallest supported width (0, 1, 2, 4 or 8 bits) that indexes a
@@ -133,27 +159,53 @@ pub(crate) const fn index_words(count: usize, bits: u32) -> usize {
     (count * bits as usize).div_ceil(32)
 }
 
-/// Words in the palette block with this header, for a leaf with this mask.
-pub(crate) const fn block_len(mask: u64, header: u32) -> usize {
-    1 + palette_words(palette_len(header))
-        + index_words(mask.count_ones() as usize, index_bits(header))
+/// Words in the palette block whose first word is `first`, for a leaf with
+/// this mask.
+pub(crate) const fn block_len(mask: u64, first: u32) -> usize {
+    index_start(first) + index_words(mask.count_ones() as usize, index_bits(first))
+}
+
+/// Words in a palette block of `palette_len` (2 to 64) materials for `solid`
+/// voxels.
+#[cfg(test)]
+pub(crate) const fn block_len_for(palette_len: usize, solid: usize) -> usize {
+    let header = if palette_len == 2 { 0 } else { 1 };
+    header + palette_words(palette_len) + index_words(solid, width_for(palette_len))
 }
 
 /// Palette entry `i` of a palette block.
 #[inline]
 pub(crate) fn palette_entry(block: &[u32], i: usize) -> MaterialId {
-    MaterialId((block[1 + i / 2] >> (16 * (i % 2))) as u16)
+    MaterialId((block[palette_start(block[0]) + i / 2] >> (16 * (i % 2))) as u16)
 }
 
 /// The material of the `k`-th solid voxel of a palette block.
 #[inline]
 pub(crate) fn solid_voxel(block: &[u32], k: usize) -> MaterialId {
+    if is_pair(block[0]) {
+        pair_voxel(block, k)
+    } else {
+        headed_voxel(block, k)
+    }
+}
+
+/// [`solid_voxel`] of a two-material block: one bit each, the palette in
+/// the first word.
+#[inline]
+pub(crate) fn pair_voxel(block: &[u32], k: usize) -> MaterialId {
+    let index = (block[1 + k / 32] >> (k % 32)) & 1;
+    MaterialId((block[0] >> (16 * index)) as u16)
+}
+
+/// [`solid_voxel`] of a block with a header (three or more materials).
+#[inline]
+pub(crate) fn headed_voxel(block: &[u32], k: usize) -> MaterialId {
     let header = block[0];
-    let bits = index_bits(header) as usize;
+    let bits = ((header >> 8) & 0xFF) as usize;
     let at = k * bits;
-    let word = block[1 + palette_words(palette_len(header)) + at / 32];
+    let word = block[1 + palette_words((header & 0xFF) as usize) + at / 32];
     let index = (word >> (at % 32)) & ((1 << bits) - 1);
-    palette_entry(block, index as usize)
+    MaterialId((block[1 + index as usize / 2] >> (16 * (index % 2))) as u16)
 }
 
 /// Passes the solid voxels of a packed leaf to `each`: every palette entry
@@ -207,9 +259,18 @@ pub(crate) fn decode(record: Record, block: &[u32]) -> Voxels {
     let mut voxels: Voxels = [MaterialId::AIR; TREE_FANOUT as usize];
     match record.material() {
         Some(m) => slots(record.mask).for_each(|slot| voxels[slot as usize] = m),
+        // An air record has no material and no block.
+        None if record.mask == 0 => {}
         None => {
+            // The layout once, then one index per solid voxel.
+            let first = block[0];
+            let bits = index_bits(first) as usize;
+            let (palette, indices) = (palette_start(first), index_start(first));
             for (k, slot) in slots(record.mask).enumerate() {
-                voxels[slot as usize] = solid_voxel(block, k);
+                let at = k * bits;
+                let index = (block[indices + at / 32] >> (at % 32)) as usize & ((1 << bits) - 1);
+                voxels[slot as usize] =
+                    MaterialId((block[palette + index / 2] >> (16 * (index % 2))) as u16);
             }
         }
     }
@@ -326,12 +387,12 @@ fn two_materials(mask: u64, lo: MaterialId, hi: MaterialId, high: u64) -> Packed
     for (k, slot) in slots(mask).enumerate() {
         indices |= (high >> slot & 1) << k;
     }
+    // No header: the palette word says it is a two-material block.
     let mut words = [0u32; MAX_PALETTE_BLOCK];
-    words[0] = header(2, 1);
-    words[1] = u32::from(lo.0) | u32::from(hi.0) << 16;
-    words[2] = indices as u32;
-    words[3] = (indices >> 32) as u32;
-    let len = 2 + index_words(mask.count_ones() as usize, 1);
+    words[0] = u32::from(lo.0) | u32::from(hi.0) << 16;
+    words[1] = indices as u32;
+    words[2] = (indices >> 32) as u32;
+    let len = 1 + index_words(mask.count_ones() as usize, 1);
     PackedLeaf::Palette {
         mask,
         block: PaletteBlock { words, len },
@@ -447,6 +508,9 @@ mod tests {
                 assert_eq!(index_bits(h), bits, "palette of {n}");
                 assert_eq!(palette_len(h), n as usize);
                 assert_eq!(block_len(mask, h), block.words().len());
+                let solid = mask.count_ones() as usize;
+                assert_eq!(block_len_for(n as usize, solid), block.words().len());
+                assert_eq!(is_pair(h), n == 2, "only two materials go headerless");
                 assert_eq!(round_trip(&voxels), voxels, "palette of {n}");
             }
         }
@@ -496,14 +560,26 @@ mod tests {
     #[test]
     fn layout_is_header_then_low_half_first_then_lsb_first() {
         // Slots 0, 1, 2 hold materials 7, 3, 7: palette [3, 7], width 1,
-        // indices 1, 0, 1 packed LSB-first: 0b101.
+        // indices 1, 0, 1 packed LSB-first: 0b101. Two materials have no
+        // header.
         let mut voxels = [MaterialId::AIR; 64];
         voxels[0] = MaterialId(7);
         voxels[1] = MaterialId(3);
         voxels[2] = MaterialId(7);
         let (mask, block) = palette_leaf(&voxels);
         assert_eq!(mask, 0b111);
-        assert_eq!(block.words(), [2 | (1 << 8), 3 | (7 << 16), 0b101]);
+        assert_eq!(block.words(), [3 | (7 << 16), 0b101]);
+        assert_eq!(solid_voxel(block.words(), 1), MaterialId(3));
+        assert_eq!(solid_voxel(block.words(), 2), MaterialId(7));
+        // Three: header `3 | 2 << 8`, palette [3, 7], [9], indices 2, 0, 1, 2.
+        voxels[3] = MaterialId(9);
+        voxels[0] = MaterialId(9);
+        let (_, block) = palette_leaf(&voxels);
+        assert_eq!(
+            block.words(),
+            [3 | (2 << 8), 3 | (7 << 16), 9, 2 | 1 << 4 | 2 << 6]
+        );
+        assert_eq!(index_start(block.words()[0]), 3);
         let r = Record { mask, payload: 40 };
         assert_eq!(r.palette_base(), Some(40));
         assert_eq!(r.material(), None);
@@ -523,11 +599,14 @@ mod tests {
         }
         let len = palette.len();
         let bits = width_for(len);
-        let index_start = 1 + palette_words(len);
+        let palette_start = usize::from(len > 2);
+        let index_start = palette_start + palette_words(len);
         let mut words = [0u32; MAX_PALETTE_BLOCK];
-        words[0] = header(len, bits);
+        if len > 2 {
+            words[0] = header(len, bits);
+        }
         for (i, m) in palette.iter().enumerate() {
-            words[1 + i / 2] |= u32::from(m.0) << (16 * (i % 2));
+            words[palette_start + i / 2] |= u32::from(m.0) << (16 * (i % 2));
         }
         for (k, slot) in slots(mask).enumerate() {
             let index = palette.binary_search(&voxels[slot as usize]).unwrap() as u32;

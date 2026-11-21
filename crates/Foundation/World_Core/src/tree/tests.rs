@@ -51,36 +51,58 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                 );
                 found.0 += 1;
                 if let Some((header, len)) = b.brick_layout() {
-                    // A header, one word for every other full leaf and a
-                    // record for every leaf but the full ones of the default
-                    // material: the most common full material.
-                    let mut counts = std::collections::BTreeMap::new();
-                    for (_, c) in &children {
-                        if let NodeRef::Uniform(m) = c {
-                            *counts.entry(*m).or_insert(0usize) += 1;
+                    // A header, one word for every other full leaf, a leaf
+                    // mask for every partial leaf of the default material and
+                    // a record for every other leaf but the full ones of the
+                    // default: the most common full material (decisions
+                    // 0021, 0025).
+                    let most_common = |of: &dyn Fn(&NodeRef<'_>) -> Option<MaterialId>| {
+                        let mut counts = std::collections::BTreeMap::new();
+                        for (_, c) in &children {
+                            if let Some(m) = of(c) {
+                                *counts.entry(m).or_insert(0usize) += 1;
+                            }
                         }
-                    }
-                    let best = counts
-                        .iter()
-                        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-                        .map(|(&m, &n)| (m, n));
+                        counts
+                            .into_iter()
+                            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+                            .map(|(m, _)| m)
+                    };
+                    let single = |c: &NodeRef<'_>| match (c, c.palette().as_slice()) {
+                        (NodeRef::Leaf(_), [m]) => Some(*m),
+                        _ => None,
+                    };
+                    let best = most_common(&|c| match c {
+                        NodeRef::Uniform(m) => Some(*m),
+                        _ => None,
+                    });
+                    let mask_of = |test: &dyn Fn(&NodeRef<'_>) -> bool| {
+                        children
+                            .iter()
+                            .filter(|(_, c)| test(c))
+                            .fold(0u64, |m, (slot, _)| m | 1 << slot)
+                    };
+                    let full = mask_of(&|c| matches!(c, NodeRef::Uniform(_)));
+                    let defaults = mask_of(&|c| {
+                        best.is_some_and(|m| {
+                            matches!(c, NodeRef::Uniform(x) if *x == m) || single(c) == Some(m)
+                        })
+                    });
                     match best {
-                        Some((m, n)) => {
-                            assert_eq!(header.default, m, "the most common full leaf");
-                            assert_eq!(header.full.count_ones() as usize, n);
-                        }
+                        Some(m) => assert_eq!(header.default, m, "the most common full leaf"),
                         None => assert_eq!(header, Default::default()),
                     }
-                    let full = children
-                        .iter()
-                        .filter(|(_, c)| matches!(c, NodeRef::Uniform(_)))
-                        .fold(0u64, |m, (slot, _)| m | 1 << slot);
-                    assert_eq!(header.full | header.other, full, "every full leaf");
-                    assert_eq!(header.full & header.other, 0);
-                    let others = header.other.count_ones() as usize;
-                    let records = children.len() - full.count_ones() as usize;
-                    let header_len = if others == 0 { 3 } else { 5 };
-                    assert_eq!(len, header_len + others + RECORD_WORDS * records);
+                    assert_eq!(header.full, full, "every full leaf");
+                    assert_eq!(header.defaults, defaults, "every leaf of the default");
+                    let others = (full & !defaults).count_ones() as usize;
+                    let masks = (defaults & !full).count_ones() as usize;
+                    let records = children.len() - (full | defaults).count_ones() as usize;
+                    let header_len = if full == defaults { 3 } else { 5 };
+                    assert_eq!(header.len(), header_len);
+                    assert_eq!(
+                        len,
+                        header_len + others + 2 * masks + RECORD_WORDS * records
+                    );
                     found.2 += len;
                 } else {
                     found.2 += children.len();
@@ -110,9 +132,15 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                 let indices = index_words(solid, l.index_bits());
                 assert_eq!(l.index_words().len(), indices);
                 found.1 += 1;
-                // One material lives in the record; more need a palette block.
+                // One material lives in the record; more need a palette
+                // block, with a header from three materials on.
                 if palette.len() > 1 {
-                    found.2 += 1 + palette_words(palette.len()) + indices;
+                    let header = usize::from(palette.len() > 2);
+                    found.2 += header + palette_words(palette.len()) + indices;
+                    assert_eq!(
+                        NodeRef::Leaf(l).palette_block().map(<[u32]>::len),
+                        Some(header + palette_words(palette.len()) + indices)
+                    );
                 }
             }
         }
@@ -464,13 +492,13 @@ fn a_two_material_leaf_adds_a_palette_block() {
     let mut tree = VoxelTree::new();
     tree.set(pos(0, 0, 0), STONE).unwrap();
     let one = live_bytes(&tree);
-    // 32 solid voxels of two materials: a record plus a header, one palette
-    // word and one word of 1-bit indices.
+    // 32 solid voxels of two materials: a record plus one palette word and
+    // one word of 1-bit indices; two materials have no palette header.
     for i in 0..32 {
         let m = if i % 3 == 0 { DIRT } else { STONE };
         tree.set(pos(4 + i % 4, i / 4 % 4, i / 16), m).unwrap();
     }
-    assert_eq!(live_bytes(&tree) - one, 4 * (RECORD_WORDS + 3));
+    assert_eq!(live_bytes(&tree) - one, 4 * (RECORD_WORDS + 2));
     let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
         panic!("a mixed leaf");
     };
@@ -483,6 +511,53 @@ fn a_two_material_leaf_adds_a_palette_block() {
         tree.set(pos(4 + i % 4, i / 4 % 4, i / 16), STONE).unwrap();
     }
     assert_eq!(live_bytes(&tree) - one, 4 * RECORD_WORDS);
+    assert_sound(&tree);
+}
+
+#[test]
+fn default_partial_leaves_store_their_leaf_mask_alone() {
+    let mut tree = VoxelTree::new();
+    tree.fill_box(cube([0, 0, 0], 16), STONE).unwrap();
+    tree.set(pos(0, 15, 0), MaterialId::AIR).unwrap();
+    // The brick's header has the full mask, then the leaf mask alone: no
+    // payload word.
+    assert_eq!(live(&tree), (9, 1, 8 + 5 + 2));
+    let one = live_bytes(&tree);
+    tree.set(pos(4, 15, 0), MaterialId::AIR).unwrap();
+    tree.set(pos(8, 15, 0), MaterialId::AIR).unwrap();
+    assert_eq!(live_bytes(&tree) - one, 4 * 2 * 2);
+    assert_sound(&tree);
+    let three = live_bytes(&tree);
+    // Digging more of a default partial leaf rewrites its mask in place.
+    let stats = tree.stats();
+    tree.set(pos(9, 15, 1), MaterialId::AIR).unwrap();
+    assert_eq!(tree.stats(), stats);
+    // Dirt in one makes it a record with a palette block (no header: a
+    // palette word and two words of indices for 63 voxels).
+    tree.set(pos(4, 14, 0), DIRT).unwrap();
+    assert_eq!(live_bytes(&tree) - three, 4 * (3 + 3 - 2));
+    assert_sound(&tree);
+    let mut cursor = tree.cursor();
+    for z in 0..16 {
+        for y in 0..16 {
+            for x in 0..16 {
+                let p = pos(x, y, z);
+                let want = match (x, y, z) {
+                    (0 | 4 | 8, 15, 0) | (9, 15, 1) => MaterialId::AIR,
+                    (4, 14, 0) => DIRT,
+                    _ => STONE,
+                };
+                assert_eq!(tree.get(p), want, "{p:?}");
+                assert_eq!(cursor.get(p), want, "{p:?} through a cursor");
+            }
+        }
+    }
+    // Filling them back collapses the brick to one uniform child.
+    tree.fill_box(cube([0, 0, 0], 16), STONE).unwrap();
+    assert!(matches!(
+        brick_child(&tree, pos(0, 0, 0)),
+        NodeRef::Uniform(STONE)
+    ));
     assert_sound(&tree);
 }
 
