@@ -9,9 +9,9 @@
 //! | `ExtractSchedule` | take the feed, copy config and material colours |
 //! | `Render` / `Prepare` | create the pools once, advance the frame number, the camera's view point |
 //! | `Render` / `PrepareResources` | per-view hit buffers and trace parameters, material colours |
-//! | `Render` / `PrepareBindGroups` | composite pipelines and bind groups |
+//! | `Render` / `PrepareBindGroups` | lit targets and shading bind groups, then composite pipelines and bind groups |
 //! | `RenderGraph` / `Begin` | streaming, upload, apply and eviction passes |
-//! | `Core3d` / `MainPass`, after the opaque pass | trace, then composite (colour and depth) |
+//! | `Core3d` / `MainPass`, after the opaque pass | trace, shade (internal resolution), then composite (colour and depth) |
 //! | `RenderGraph` / `Render`, after `camera_driver` | copy requests and victims to a read-back slot, resolve the frame's GPU timestamps |
 //! | `RenderGraph` / `Finish` | map the read-back slots and the timing slot |
 //!
@@ -38,8 +38,11 @@ use crate::gpu_timing::{
     begin_gpu_timing, extract_gpu_timing, init_gpu_timer, map_gpu_timing, resolve_gpu_timing,
 };
 use crate::passes::composite::voxel::{
-    MaterialColors, extract_material_colors, init_composite_pipeline, prepare_composite,
-    prepare_material_colors, voxel_composite,
+    init_composite_pipeline, prepare_composite, voxel_composite,
+};
+use crate::passes::lighting::shade::{
+    MaterialColors, extract_material_colors, init_shade_pipeline, prepare_material_colors,
+    prepare_shade, voxel_shade,
 };
 use crate::passes::primary::{init_trace_pipeline, prepare_view_targets, voxel_trace};
 use crate::tier::RenderTier;
@@ -68,6 +71,7 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
             (
                 init_cache_pipelines,
                 init_trace_pipeline,
+                init_shade_pipeline,
                 init_composite_pipeline,
                 init_gpu_timer,
             ),
@@ -81,7 +85,9 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
                 begin_gpu_timing.in_set(RenderSystems::Prepare),
                 (prepare_view_targets, prepare_material_colors)
                     .in_set(RenderSystems::PrepareResources),
-                prepare_composite.in_set(RenderSystems::PrepareBindGroups),
+                (prepare_shade, prepare_composite)
+                    .chain()
+                    .in_set(RenderSystems::PrepareBindGroups),
                 log_cache_stats.in_set(RenderSystems::Cleanup),
             ),
         )
@@ -100,7 +106,7 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
         )
         .add_systems(
             Core3d,
-            (voxel_trace, voxel_composite)
+            (voxel_trace, voxel_shade, voxel_composite)
                 .chain()
                 .in_set(Core3dSystems::MainPass)
                 .after(main_opaque_pass_3d)

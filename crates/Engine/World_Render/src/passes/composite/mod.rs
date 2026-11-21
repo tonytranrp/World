@@ -1,7 +1,8 @@
 //! Composite: voxels, then the sky.
 //!
-//! `voxel` draws the primary hits into the view's colour and depth right
-//! after Bevy's opaque pass, marking covered pixels with alpha 0. The sky is
+//! `voxel` stretches the lit voxel image (written by `lighting` at the
+//! trace's size) into the view's colour and depth right after Bevy's opaque
+//! pass, marking covered pixels with alpha 0. The sky is
 //! a post-process blended by `strength` times the pixel's alpha, so it fills
 //! only what no voxel covered. Both shaders are WESL assets; editing them
 //! (or the shared modules they import) hot-reloads the passes.

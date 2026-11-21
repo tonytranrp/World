@@ -39,7 +39,9 @@ use world_reload::Config;
 pub enum TimedPass {
     /// Primary rays (once per frame: the first 3D view that traces).
     Trace,
-    /// Voxel hits to colour and depth.
+    /// Hits to the lit target, at the trace's size.
+    Shade,
+    /// The lit target stretched to the view's colour and depth.
     Composite,
     /// The brick cache's apply pass (frames with an upload).
     Apply,
@@ -48,14 +50,21 @@ pub enum TimedPass {
 }
 
 /// Number of [`TimedPass`] variants.
-pub const TIMED_PASSES: usize = 4;
+pub const TIMED_PASSES: usize = 5;
 
 impl TimedPass {
-    pub const ALL: [Self; TIMED_PASSES] = [Self::Trace, Self::Composite, Self::Apply, Self::Evict];
+    pub const ALL: [Self; TIMED_PASSES] = [
+        Self::Trace,
+        Self::Shade,
+        Self::Composite,
+        Self::Apply,
+        Self::Evict,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Trace => "trace",
+            Self::Shade => "shade",
             Self::Composite => "composite",
             Self::Apply => "apply",
             Self::Evict => "evict",
@@ -711,8 +720,8 @@ mod tests {
     fn frames_add_up_per_pass_and_in_sum() {
         let mut t = GpuTimes::default();
         assert!(t.is_empty());
-        t.add_frame([Some(4.0), Some(0.5), None, None]);
-        t.add_frame([Some(6.0), Some(0.5), Some(1.0), None]);
+        t.add_frame([Some(4.0), None, Some(0.5), None, None]);
+        t.add_frame([Some(6.0), None, Some(0.5), Some(1.0), None]);
         t.add_frame([None; TIMED_PASSES]);
         assert_eq!(t.sum.frames, 2);
         assert_eq!(t.sum.mean_ms(), 6.0);
@@ -727,7 +736,7 @@ mod tests {
         assert_eq!(
             t.to_string(),
             "2 frames timed, ms mean / min / max (frames): trace 5.00 / 4.00 / 6.00 (2), \
-             composite 0.50 / 0.50 / 0.50 (2), apply 1.00 / 1.00 / 1.00 (1), \
+             shade 0.00 / 0.00 / 0.00 (0), composite 0.50 / 0.50 / 0.50 (2), apply 1.00 / 1.00 / 1.00 (1), \
              evict 0.00 / 0.00 / 0.00 (0), sum 6.00 / 4.50 / 7.50"
         );
     }
