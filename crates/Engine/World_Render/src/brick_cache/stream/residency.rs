@@ -124,11 +124,10 @@ pub struct ResidencyStats {
 pub struct Residency {
     shape: Shape,
     entries: Table<Entry>,
-    /// Cached summaries of nodes at and above the chunk level.
-    summaries: HashMap<NodeKey, Summary>,
-    /// Cached summaries below the chunk level, by chunk, so a replaced
-    /// chunk forgets its own at once.
-    chunk_summaries: HashMap<NodeKey, HashMap<NodeKey, Summary>>,
+    /// Cached summaries, those below the chunk level kept by chunk (split
+    /// at [`chunk_level`](Self::chunk_level)), so a replaced chunk forgets
+    /// its own at once.
+    summaries: Table<Summary>,
     edited: HashSet<NodeKey>,
     /// Changes not applied yet, in arrival order without repeats.
     pending: Vec<Change>,
@@ -229,11 +228,9 @@ impl Residency {
     pub fn new(shape: Shape, layout: &PoolLayout) -> Option<Self> {
         Some(Self {
             shape,
-            // Levels 1 and 2 grouped by their level-3 ancestor: at most 4160
-            // entries per small map.
+            // Levels 1 and 2 kept by their level-3 ancestor.
             entries: Table::new(3),
-            summaries: HashMap::default(),
-            chunk_summaries: HashMap::default(),
+            summaries: Table::new(world_core::tree::CHUNK_LEVEL.min(shape.root_level()).max(1)),
             edited: HashSet::default(),
             pending: Vec::new(),
             pending_chunks: HashSet::default(),
@@ -403,7 +400,7 @@ impl Residency {
             .entries
             .iter()
             .filter(|(_, e)| e.brick.is_some())
-            .map(|(&k, _)| k)
+            .map(|(k, _)| k)
             .collect();
         v.sort_unstable();
         v
@@ -411,7 +408,7 @@ impl Residency {
 
     /// Every node with a record, sorted.
     pub fn keys(&self) -> Vec<NodeKey> {
-        let mut v: Vec<_> = self.entries.keys().copied().collect();
+        let mut v: Vec<_> = self.entries.keys().collect();
         v.sort_unstable();
         v
     }
@@ -468,39 +465,16 @@ impl Residency {
     }
 
     fn cached_summary(&self, key: NodeKey) -> Option<Summary> {
-        let split = self.chunk_level();
-        if key.level() >= split {
-            self.summaries.get(&key).copied()
-        } else {
-            self.chunk_summaries
-                .get(&key.ancestor(split))?
-                .get(&key)
-                .copied()
-        }
+        self.summaries.get(&key).copied()
     }
 
     fn cache_summary(&mut self, key: NodeKey, s: Summary) {
-        let split = self.chunk_level();
-        if key.level() >= split {
-            self.summaries.insert(key, s);
-        } else {
-            self.chunk_summaries
-                .entry(key.ancestor(split))
-                .or_default()
-                .insert(key, s);
-        }
+        self.summaries.insert(key, s);
     }
 
     /// Forgets the cached summary of `key`; whether there was one.
     fn forget_summary(&mut self, key: NodeKey) -> bool {
-        let split = self.chunk_level();
-        if key.level() >= split {
-            self.summaries.remove(&key).is_some()
-        } else if let Some(m) = self.chunk_summaries.get_mut(&key.ancestor(split)) {
-            m.remove(&key).is_some()
-        } else {
-            false
-        }
+        self.summaries.remove(&key).is_some()
     }
 
     /// Node summaries computed since the table was made: a count of work,
@@ -902,7 +876,6 @@ impl Residency {
         }
         self.entries.clear();
         self.summaries.clear();
-        self.chunk_summaries.clear();
         self.pending.clear();
         self.pending_chunks.clear();
         self.warming.clear();
@@ -1463,7 +1436,7 @@ impl Residency {
         let next = match self.warming.get(&c) {
             Some(&n) => n,
             None => {
-                self.chunk_summaries.remove(&c);
+                self.summaries.remove_below(&c);
                 0
             }
         };
