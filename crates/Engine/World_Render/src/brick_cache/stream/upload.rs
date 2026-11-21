@@ -141,17 +141,40 @@ pub fn record_apply(
     bind_group: &BindGroup,
     pipelines: &ApplyPipelines<'_>,
 ) {
+    if stage_upload(encoder, belt, upload, words) {
+        record_apply_pass(encoder, counts, bind_group, pipelines, None);
+    }
+}
+
+/// Copies the serialized batch into the upload buffer through the belt.
+/// Returns false, recording nothing, for an empty batch.
+pub fn stage_upload(
+    encoder: &mut CommandEncoder,
+    belt: &mut StagingBelt,
+    upload: &UploadBuffer,
+    words: &[u32],
+) -> bool {
     let bytes: &[u8] = bytemuck::cast_slice(words);
     let Some(size) = NonZeroU64::new(bytes.len() as u64) else {
-        return;
+        return false;
     };
-    {
-        let mut view = belt.write_buffer(encoder, &upload.buffer, 0, size);
-        view.copy_from_slice(bytes);
-    }
+    let mut view = belt.write_buffer(encoder, &upload.buffer, 0, size);
+    view.copy_from_slice(bytes);
+    true
+}
+
+/// Records the apply pass (unlink, scatter, table, link) over an upload
+/// staged by [`stage_upload`], with optional timestamps.
+pub fn record_apply_pass(
+    encoder: &mut CommandEncoder,
+    counts: BatchCounts,
+    bind_group: &BindGroup,
+    pipelines: &ApplyPipelines<'_>,
+    timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
+) {
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("brick_cache.apply"),
-        timestamp_writes: None,
+        timestamp_writes: timestamps,
     });
     pass.set_bind_group(0, bind_group, &[]);
     let per_thread = |n: u32| n.div_ceil(APPLY_WORKGROUP);

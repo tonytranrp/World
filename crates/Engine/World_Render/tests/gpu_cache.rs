@@ -234,6 +234,7 @@ fn gpu_eviction_chooses_the_oldest_bricks_and_the_cpu_frees_them() {
         &cache.pools,
         &pipelines.evict,
         &params,
+        None,
     );
     gpu.queue.submit([encoder.finish()]);
     let words = read_words(&gpu, &cache.pools.victims);

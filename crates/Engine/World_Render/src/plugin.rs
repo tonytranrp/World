@@ -4,6 +4,7 @@ use bevy::render::renderer::RenderAdapterInfo;
 use world_core::material::MaterialTable;
 use world_reload::AppConfigExt;
 
+use crate::gpu_timing::GpuTimingConfig;
 use crate::tier::RenderTier;
 use crate::{graph, passes};
 
@@ -27,6 +28,7 @@ impl Plugin for WorldRenderPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.tier.clone())
             .add_config::<MaterialTable>()
+            .add_config::<GpuTimingConfig>()
             .add_systems(Startup, log_active_adapter);
         passes::build(app);
         graph::build(app, &self.tier);

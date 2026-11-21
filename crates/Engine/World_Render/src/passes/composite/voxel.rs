@@ -17,13 +17,14 @@ use bevy::render::render_resource::{
     CompareFunction, DepthStencilState, FragmentState, MultisampleState, PipelineCache,
     RenderPipelineDescriptor, TextureFormat, VertexState,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::renderer::{FlushCommands, RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
 use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages, StoreOp};
 use world_core::MaterialTable;
 use world_reload::Config;
 
 use crate::brick_cache::stream::upload::storage_entry;
+use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::passes::primary::VoxelViewTargets;
 
 /// Asset path of the voxel composite shader.
@@ -277,29 +278,59 @@ pub fn prepare_composite(
     }
 }
 
-/// Draws the voxels into the view's colour and depth (Core3d, after the trace).
+/// Draws the voxels into the view's colour and depth (Core3d, after the
+/// trace). The first view of a frame is timed (see `gpu_timing`).
 pub fn voxel_composite(
     view: ViewQuery<(&ViewTarget, &ViewDepthStencilTexture, &VoxelCompositeView)>,
     cache: Res<PipelineCache>,
+    timer: Option<ResMut<GpuPassTimer>>,
+    sampled: Option<ResMut<SampledPassTimer>>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut flush: FlushCommands,
     mut ctx: RenderContext,
 ) {
     let (target, depth, composite) = view.into_inner();
     let Some(pipeline) = cache.get_render_pipeline(composite.pipeline) else {
         return;
     };
-    let color = target.get_color_attachment();
-    let depth = depth.get_attachment(StoreOp::Store);
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&wgpu::RenderPassDescriptor {
+    let record = |encoder: &mut wgpu::CommandEncoder,
+                  timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>| {
+        let color = target.get_color_attachment();
+        let depth = depth.get_attachment(StoreOp::Store);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("composite.voxel"),
             color_attachments: &[Some(color)],
             depth_stencil_attachment: Some(depth),
-            timestamp_writes: None,
+            timestamp_writes: timestamps,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &composite.bind_group, &[]);
-    pass.draw(0..3, 0..1);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &composite.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    };
+    match sampled {
+        Some(mut sampled) if sampled.wants(TimedPass::Composite) => {
+            let device = device.wgpu_device();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composite.voxel"),
+            });
+            record(&mut encoder, None);
+            sampled.time_alone(
+                TimedPass::Composite,
+                device,
+                &queue,
+                || flush.flush(),
+                encoder,
+            );
+        }
+        _ => {
+            let mut timer = timer;
+            let writes = timer
+                .as_deref_mut()
+                .and_then(|t| t.render_writes(TimedPass::Composite));
+            record(ctx.command_encoder(), writes);
+        }
+    }
 }

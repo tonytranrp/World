@@ -15,6 +15,7 @@ use world_render::internals::batch::UploadBatch;
 use world_render::internals::gbuffer::{GpuHit, HIT_FLAG_FOOTPRINT, HIT_FLAG_RESIDENCY};
 use world_render::internals::key::{NodeKey, Shape};
 use world_render::internals::residency::Residency;
+use world_render::internals::trace;
 use world_testkit::dense::{Bounds, DenseWorld, VoxelModel};
 use world_testkit::hits::{Camera, Face, Hit, HitRecord, compare_hits, trace_rays};
 
@@ -386,4 +387,136 @@ fn gpu_footprint_stops_at_coarse_cells_that_hold_voxels() {
         }
     }
     assert!(coarse > 0, "the bias never stopped a ray");
+}
+
+/// A 256 x 144 trace over the tree scene, every ray from the origin down -z
+/// (camera mode with identity matrices): GPU work to time.
+fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buffer; 2]) {
+    use wgpu::util::DeviceExt;
+    use world_render::internals::trace::MODE_CAMERA;
+    let pipelines = Pipelines::new(&gpu.device);
+    let (tree, _) = tree_scene();
+    let snap = tree.snapshot();
+    let (_res, cache) = resident_cache(gpu, &pipelines, &snap);
+    let shape = Shape::of(&snap);
+    let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("timing hits"),
+        size: u64::from(256 * 144 * world_render::internals::gbuffer::HIT_WORDS) * 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let layout = &cache.pools.layout;
+    let o = shape.origin;
+    let params = trace::TraceParams {
+        clip_from_world: identity(),
+        world_from_clip: identity(),
+        eye: [0.0; 4],
+        origin: [o.x, o.y, o.z, shape.root_level() as i32],
+        size: [256, 144, 1, MODE_CAMERA],
+        lod: [0.01, 0.0, 64.0, 0.0],
+        limits: [
+            layout.request_capacity,
+            layout.stamps_offset(),
+            trace::DEFAULT_MAX_ITERATIONS,
+            0,
+        ],
+    };
+    let params = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("timing params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind_group = trace::trace_bind_group(
+        &gpu.device,
+        &pipelines.trace_layout,
+        &cache.pools,
+        &hits,
+        &params,
+    );
+    (pipelines, cache, bind_group, [hits, params])
+}
+
+/// The timestamp timer resolves and reads back a pass's time a few frames
+/// late, never waiting; each pass is timed once per frame.
+#[test]
+fn gpu_pass_timer_reads_back_trace_times_without_waiting() {
+    use world_render::internals::gpu_timing::{GpuPassTimer, TIMING_SLOTS, TimedPass};
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let Some(mut timer) = GpuPassTimer::new(&gpu.device, &gpu.queue) else {
+        println!(
+            "{} has no TIMESTAMP_QUERY: no timestamp timer (the sampled timer is used)",
+            gpu.info.name
+        );
+        return;
+    };
+    let (pipelines, _cache, bind_group, _buffers) = timing_trace(&gpu);
+    let frames = 2 * TIMING_SLOTS as u64;
+    for _ in 0..frames {
+        timer.begin_frame(&gpu.device);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let writes = timer.compute_writes(TimedPass::Trace);
+        let timed = writes.is_some();
+        trace::record_trace(
+            &mut encoder,
+            &pipelines.trace,
+            &bind_group,
+            256,
+            144,
+            writes,
+        );
+        if timed {
+            assert!(
+                timer.compute_writes(TimedPass::Trace).is_none(),
+                "a pass is timed once per frame"
+            );
+        }
+        timer.resolve(&mut encoder);
+        gpu.queue.submit([encoder.finish()]);
+        timer.after_submit();
+    }
+    wait(&gpu);
+    timer.collect(&gpu.device);
+    let times = timer.take().expect("no frame was read back");
+    let trace = times.pass(TimedPass::Trace);
+    assert_eq!(u64::from(trace.frames) + timer.skipped, frames);
+    assert!(trace.frames >= 1 && trace.mean_ms() > 0.0, "{times}");
+    assert!(trace.max_ms < 1000.0, "{times}");
+    assert_eq!(times.pass(TimedPass::Apply).frames, 0);
+    assert_eq!(timer.failed, 0);
+}
+
+/// The sampled timer, for devices without timestamps, times a pass
+/// submitted alone.
+#[test]
+fn gpu_sampled_timer_times_a_pass_submitted_alone() {
+    use world_render::internals::gpu_timing::{SampledPassTimer, TimedPass};
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let (pipelines, _cache, bind_group, _buffers) = timing_trace(&gpu);
+    let mut sampled = SampledPassTimer::default();
+    sampled.every = 1;
+    sampled.begin_frame();
+    assert!(sampled.wants(TimedPass::Trace));
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    trace::record_trace(&mut encoder, &pipelines.trace, &bind_group, 256, 144, None);
+    let mut flushed = false;
+    sampled.time_alone(
+        TimedPass::Trace,
+        &gpu.device,
+        &gpu.queue,
+        || flushed = true,
+        encoder,
+    );
+    assert!(flushed);
+    assert!(!sampled.wants(TimedPass::Trace));
+    sampled.begin_frame();
+    let times = sampled.take().expect("the sampled frame was not added");
+    let trace = times.pass(TimedPass::Trace);
+    assert_eq!(trace.frames, 1);
+    assert!((0.0..1000.0).contains(&trace.max_ms), "{times}");
 }

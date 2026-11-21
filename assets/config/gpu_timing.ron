@@ -1,0 +1,11 @@
+// GPU time per render pass (decision 0015), logged with the brick cache's
+// stats every 1000 frames. Devices with timestamp queries are always timed
+// at pass boundaries and ignore this file.
+(
+    // Devices without timestamp queries (Intel and AMD Macs, the floor
+    // machine's Radeon Pro 5300M among them): time the passes of one frame
+    // in this many by submitting each alone and waiting for it, minus an
+    // empty submission. That frame stalls, so turn it on for measurement
+    // runs only. 0 is off. 0..=1000000
+    sample_every_frames: 0,
+)

@@ -10,6 +10,7 @@
 mod brick_cache;
 mod debug;
 mod gbuffer;
+mod gpu_timing;
 mod graph;
 mod passes;
 mod plugin;
@@ -28,6 +29,9 @@ pub mod internals {
     pub use crate::brick_cache::pool::{alloc, gpu::GpuPools, layout};
     pub use crate::brick_cache::stream::{batch, feed, frame, key, residency, select, upload};
     pub use crate::debug::scene;
+    pub mod gpu_timing {
+        pub use crate::gpu_timing::*;
+    }
     pub mod gbuffer {
         pub use crate::gbuffer::*;
     }

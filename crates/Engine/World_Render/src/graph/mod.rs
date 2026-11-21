@@ -12,8 +12,8 @@
 //! | `Render` / `PrepareBindGroups` | composite pipelines and bind groups |
 //! | `RenderGraph` / `Begin` | streaming, upload, apply and eviction passes |
 //! | `Core3d` / `MainPass`, after the opaque pass | trace, then composite (colour and depth) |
-//! | `RenderGraph` / `Render`, after `camera_driver` | copy requests and victims to a read-back slot |
-//! | `RenderGraph` / `Finish` | map the read-back slots |
+//! | `RenderGraph` / `Render`, after `camera_driver` | copy requests and victims to a read-back slot, resolve the frame's GPU timestamps |
+//! | `RenderGraph` / `Finish` | map the read-back slots and the timing slot |
 //!
 //! The voxel passes finish and write depth before Bevy's transparent pass,
 //! gizmos and UI.
@@ -34,6 +34,9 @@ use crate::brick_cache::render::{
 };
 use crate::brick_cache::stream::feed::VoxelWorldFeed;
 use crate::debug::{start_debug_scene, update_debug_scene};
+use crate::gpu_timing::{
+    begin_gpu_timing, extract_gpu_timing, init_gpu_timer, map_gpu_timing, resolve_gpu_timing,
+};
 use crate::passes::composite::voxel::{
     MaterialColors, extract_material_colors, init_composite_pipeline, prepare_composite,
     prepare_material_colors, voxel_composite,
@@ -56,13 +59,17 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
         .init_resource::<CacheConfigReady>()
         .init_resource::<CacheViewPoint>()
         .init_resource::<MaterialColors>()
-        .add_systems(ExtractSchedule, (extract_feed, extract_material_colors))
+        .add_systems(
+            ExtractSchedule,
+            (extract_feed, extract_material_colors, extract_gpu_timing),
+        )
         .add_systems(
             RenderStartup,
             (
                 init_cache_pipelines,
                 init_trace_pipeline,
                 init_composite_pipeline,
+                init_gpu_timer,
             ),
         )
         .add_systems(
@@ -71,6 +78,7 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
                 (init_brick_cache, advance_frame, update_view_point)
                     .chain()
                     .in_set(RenderSystems::Prepare),
+                begin_gpu_timing.in_set(RenderSystems::Prepare),
                 (prepare_view_targets, prepare_material_colors)
                     .in_set(RenderSystems::PrepareResources),
                 prepare_composite.in_set(RenderSystems::PrepareBindGroups),
@@ -84,7 +92,10 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
                 copy_feedback
                     .in_set(RenderGraphSystems::Render)
                     .after(camera_driver),
-                map_feedback.in_set(RenderGraphSystems::Finish),
+                resolve_gpu_timing
+                    .in_set(RenderGraphSystems::Render)
+                    .after(camera_driver),
+                (map_feedback, map_gpu_timing).in_set(RenderGraphSystems::Finish),
             ),
         )
         .add_systems(
