@@ -1058,12 +1058,13 @@ impl StreamedWorld {
     }
 
     /// Compressions kept in flight even while loads fill the in-flight cap:
-    /// one per worker. A waiting chunk holds its whole pages, about 1 MiB,
-    /// and compressing it takes a small part of a load's time, so waiting
+    /// one. A waiting chunk holds its whole pages, about 1 MiB, so waiting
     /// for idle workers kept up to 64 of them in RAM for nothing whenever
-    /// generation fell behind (decision 0020).
+    /// generation fell behind (decision 0020). Compressing one (encoding
+    /// and LZ4) takes a few milliseconds against a load's tens, so a single
+    /// slot keeps up with eviction without taking workers from generation.
     fn compress_reserve(&self) -> usize {
-        self.config.workers.max(1) as usize
+        1
     }
 
     /// Hands waiting compressions to the workers, the most recently evicted

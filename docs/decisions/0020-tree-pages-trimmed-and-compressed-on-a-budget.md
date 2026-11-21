@@ -81,10 +81,14 @@ averages 11 to 15, CPU speed limit 100:
   full page. Reads index the page slice as before. Every chunk the builder
   makes is trimmed: generated, decoded, coarse, compacted, extracted and
   overlays. `stats().bytes` counts what the pages hold.
-- **A few compressions are always in flight**: as many as there are
-  workers, whatever the loads; more while fewer loads than the in-flight
-  cap are outstanding, as before. Compressing a chunk (encoding and LZ4)
-  costs a small part of generating one, and it frees about 1 MiB of pages.
+- **A compression is always in flight**: one, whatever the loads; more
+  while fewer loads than the in-flight cap are outstanding, as before.
+  Compressing a chunk (encoding and LZ4) takes a few milliseconds against
+  tens for generating one, and it frees about 1 MiB of pages. The measured
+  runs below reserved one per worker (four); review cut it to one so
+  compressions never hold every worker while loads wait, since one slot
+  drains far faster than walking evicts. The figures were not re-measured
+  with one.
 - The residency log also prints the bytes held for writes, and the chunks
   waiting to join and to be compressed with their bytes
   (`ResidencyStats::ready`, `ready_bytes`).
