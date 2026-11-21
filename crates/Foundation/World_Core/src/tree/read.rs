@@ -484,23 +484,31 @@ impl<'a> BranchRef<'a> {
     }
 
     /// [`NodeView::brick_counts`] for a level-1 node, from its header and
-    /// stored leaves (decision 0021) without a view per leaf: the default
-    /// leaves are one count, an other full leaf one word, a leaf of one
-    /// material and air its mask's population, a packed leaf its palette
-    /// indices. False above level 1.
+    /// stored leaves (decisions 0021 and 0025) without a view per leaf: the
+    /// full default leaves are one count, an other full leaf one word, a
+    /// default surface leaf or a record of one material its mask's
+    /// population, a packed leaf its palette indices. False above level 1.
     pub fn brick_counts(&self, each: &mut impl FnMut(MaterialId, u32)) -> bool {
         if self.level != 1 {
             return false;
         }
         let header = BrickHeader::read(self.block, self.info);
-        if header.full != 0 {
-            each(header.default, TREE_FANOUT * header.full.count_ones());
+        let default_full = header.default_full();
+        if default_full != 0 {
+            each(header.default, TREE_FANOUT * default_full.count_ones());
         }
         let mut at = header.len();
-        for slot in slots(self.mask & !header.full) {
-            if header.other & bit(slot) != 0 {
+        for slot in slots(self.mask & !default_full) {
+            let b = bit(slot);
+            if header.full & b != 0 {
                 each(MaterialId(self.block[at] as u16), TREE_FANOUT);
                 at += 1;
+                continue;
+            }
+            if header.defaults & b != 0 {
+                let mask = u64::from(self.block[at]) | u64::from(self.block[at + 1]) << 32;
+                each(header.default, mask.count_ones());
+                at += 2;
                 continue;
             }
             let record = Record::read(&self.block[at..at + RECORD_WORDS]);

@@ -217,7 +217,7 @@ pub(crate) fn count_solid(block: &[u32], solid: u32, each: &mut impl FnMut(Mater
     let header = block[0];
     let len = palette_len(header);
     let bits = index_bits(header);
-    let indices = &block[1 + palette_words(len)..];
+    let indices = &block[index_start(header)..];
     let mut emit = |i: usize, n: u32| {
         if n > 0 && i < len {
             each(palette_entry(block, i), n);
