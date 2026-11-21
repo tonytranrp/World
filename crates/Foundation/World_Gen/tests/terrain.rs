@@ -83,7 +83,7 @@ fn different_seeds_versions_and_configs_are_different_identities() {
     assert_ne!(a.id(), c.id());
     assert_eq!(a.id().version, GeneratorVersion::V1);
     let k = chunk(512, 512);
-    assert_ne!(a.columns(k).columns(), b.columns(k).columns());
+    assert_ne!(a.columns(k).to_vec(), b.columns(k).to_vec());
 }
 
 #[test]
@@ -130,13 +130,13 @@ fn neighbouring_chunks_meet_without_a_seam() {
     let mut worst_border = 0;
     for i in 0..n {
         // Border columns equal the point query of the same column.
-        let edge = *here.column(n - 1, i).unwrap();
+        let edge = here.column(n - 1, i).unwrap();
         assert_eq!(
             edge,
             g.column(min.x + n as i32 - 1, min.z + i as i32).unwrap()
         );
         assert_eq!(
-            *east.column(0, i).unwrap(),
+            east.column(0, i).unwrap(),
             g.column(min.x + n as i32, min.z + i as i32).unwrap()
         );
         let step = |a: i32, b: i32| (a - b).abs();
@@ -175,7 +175,7 @@ fn coarse_samples_are_the_full_resolution_columns() {
         for j in 0..n {
             for i in 0..n {
                 assert_eq!(
-                    coarse.column(i, j),
+                    coarse.column(i, j).copied(),
                     cols.column(i * s, j * s),
                     "level {level}, sample ({i}, {j})"
                 );
@@ -255,7 +255,7 @@ proptest! {
         let cols = &site()[0];
         let min = cols.chunk().min_voxel();
         let column = generator().column(min.x + x as i32, min.z + z as i32).unwrap();
-        prop_assert_eq!(Some(&column), cols.column(x, z));
+        prop_assert_eq!(Some(column), cols.column(x, z));
         let y = column.height - 3;
         prop_assert_eq!(
             generator().material(VoxelPos::new(min.x + x as i32, y, min.z + z as i32)).unwrap(),

@@ -50,7 +50,7 @@ pub struct ResidencyConfig {
     /// every chunk within the full-detail radius is requested, and only out
     /// to the evict radius.
     pub prefetch_radius_m: f32,
-    /// Column footprints (the heightfield under a chunk, 8 MiB each) shared
+    /// Column footprints (the heightfield under a chunk, 4 MiB each) shared
     /// by the workers, so chunks stacked in a column compute it once, in
     /// MiB. 0 turns the cache off.
     pub column_cache_mib: u32,
@@ -78,7 +78,7 @@ impl Default for ResidencyConfig {
             velocity_smoothing_secs: 0.5,
             prefetch_lookahead_secs: 2.0,
             prefetch_radius_m: 64.0,
-            column_cache_mib: 256,
+            column_cache_mib: 128,
             buried_delay_m: 32.0,
         }
     }
@@ -146,9 +146,9 @@ impl ConfigAsset for ResidencyConfig {
             16384.0,
         );
         range("buried_delay_m", self.buried_delay_m.into(), 0.0, 1024.0);
-        if (1..8).contains(&self.column_cache_mib) {
-            // Less than one footprint (8 MiB) holds none.
-            problems.push("column_cache_mib must be 0 (off) or at least 8".into());
+        if (1..4).contains(&self.column_cache_mib) {
+            // Less than one footprint (4 MiB) holds none.
+            problems.push("column_cache_mib must be 0 (off) or at least 4".into());
         }
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());

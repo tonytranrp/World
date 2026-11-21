@@ -49,7 +49,7 @@ fn chunk_hash(seed: u64, coord: ChunkCoord) -> u64 {
     let cols = g.columns(coord);
     let mut h = StateHasher::new();
     hash_id(&mut h, cols.generator(), coord);
-    hash_columns(&mut h, cols.columns());
+    hash_columns(&mut h, &cols.to_vec());
     h.finish()
 }
 

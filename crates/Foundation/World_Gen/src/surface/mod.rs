@@ -157,7 +157,8 @@ pub struct Layers {
     pub bedrock: MaterialId,
 }
 
-/// One generated column. Eight bytes, so a chunk's columns are 8 MiB.
+/// One generated column. Eight bytes as a value; a chunk footprint
+/// ([`ChunkColumns`](crate::ChunkColumns)) stores its columns packed in four.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Column {
     /// Voxels with `y < height` are solid; the top solid voxel is
@@ -239,17 +240,43 @@ impl Surface {
         self.layers
     }
 
+    /// Every surface material a column can have: bedrock (bare stone), soil
+    /// (bare dirt) and grass, in that order.
+    pub(crate) fn surfaces(&self) -> [MaterialId; 3] {
+        [self.layers.bedrock, self.layers.soil, self.grass]
+    }
+
     /// The column at `(x, z)` from its inputs. The height is
     /// `floor(inputs.height)` (saturating), the soil depth
     /// `floor(inputs.soil_depth)` clamped to `0..=255`, and the grass depth
     /// `thinnest + hash(x, z) mod (thickest - thinnest + 1)`.
+    #[inline]
     pub fn column(&self, x: i32, z: i32, inputs: &ColumnInputs) -> Column {
+        let parts = self.parts(x, z, inputs);
+        Column {
+            height: parts.height,
+            surface: self.surfaces()[usize::from(parts.surface)],
+            surface_depth: parts.surface_depth,
+            soil_depth: parts.soil_depth,
+        }
+    }
+
+    /// The thickest surface cover any column has, in voxels.
+    pub(crate) fn max_cover(&self) -> u8 {
+        let most = u64::from(self.grass_thin) + self.grass_choices - 1;
+        u8::try_from(most).unwrap_or(u8::MAX)
+    }
+
+    /// [`column`](Self::column) with the surface material as its index in
+    /// [`surfaces`](Self::surfaces), as a footprint stores it.
+    #[inline]
+    pub(crate) fn parts(&self, x: i32, z: i32, inputs: &ColumnInputs) -> Parts {
         let height = inputs.height.floor() as i32;
         let soil_depth = inputs.soil_depth.floor().clamp(0.0, 255.0) as u8;
         if inputs.slope >= self.cliff_slope || inputs.height >= self.rock_line {
-            return Column {
+            return Parts {
                 height,
-                surface: self.layers.bedrock,
+                surface: Parts::BEDROCK,
                 surface_depth: 0,
                 soil_depth: 0,
             };
@@ -258,21 +285,36 @@ impl Surface {
             || inputs.moisture < self.dry_moisture
             || inputs.slope >= self.grass_max_slope
         {
-            return Column {
+            return Parts {
                 height,
-                surface: self.layers.soil,
+                surface: Parts::SOIL,
                 surface_depth: 0,
                 soil_depth,
             };
         }
         let pick = hash_column(self.seed, x, z) % self.grass_choices;
-        Column {
+        Parts {
             height,
-            surface: self.grass,
+            surface: Parts::GRASS,
             surface_depth: self.grass_thin + pick as u8,
             soil_depth,
         }
     }
+}
+
+/// A [`Column`] whose surface is an index into [`Surface::surfaces`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Parts {
+    pub height: i32,
+    pub surface: u8,
+    pub surface_depth: u8,
+    pub soil_depth: u8,
+}
+
+impl Parts {
+    pub const BEDROCK: u8 = 0;
+    pub const SOIL: u8 = 1;
+    pub const GRASS: u8 = 2;
 }
 
 #[cfg(test)]
