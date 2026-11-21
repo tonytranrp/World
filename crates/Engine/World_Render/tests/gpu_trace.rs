@@ -395,7 +395,7 @@ fn gpu_footprint_stops_at_coarse_cells_that_hold_voxels() {
 
 /// A 256 x 144 trace over the tree scene, every ray from the origin down -z
 /// (camera mode with identity matrices): GPU work to time.
-fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buffer; 2]) {
+fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buffer; 3]) {
     use wgpu::util::DeviceExt;
     use world_render::internals::trace::MODE_CAMERA;
     let pipelines = Pipelines::new(&gpu.device);
@@ -422,7 +422,7 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
             layout.request_capacity,
             layout.stamps_offset(),
             trace::DEFAULT_MAX_ITERATIONS,
-            0,
+            trace::BEAM_OFF,
         ],
     };
     let params = gpu
@@ -432,14 +432,16 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+    let beam = trace::beam_buffer(&gpu.device, 256, 144);
     let bind_group = trace::trace_bind_group(
         &gpu.device,
         &pipelines.trace_layout,
         &cache.pools,
         &hits,
         &params,
+        &beam,
     );
-    (pipelines, cache, bind_group, [hits, params])
+    (pipelines, cache, bind_group, [hits, params, beam])
 }
 
 /// The timestamp timer resolves and reads back a pass's time a few frames

@@ -259,6 +259,14 @@ var<workgroup> trace_stack: array<u32, 640>;
 // `lane` is the caller's local invocation index (below 64): it picks the
 // thread's row of the ancestor stack.
 fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
+    return cast_ray_from(o, d, s, lane, 0.0);
+}
+
+// `cast_ray`, starting the walk at distance `t_start` instead of at the
+// origin. The hit is the same only if nothing before `t_start` would have
+// stopped the ray: every cell it passes there must be empty at a level no
+// finer than its footprint allows (what `traversal/beam.wesl` guarantees).
+fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_start: f32) -> Hit {
     if all(d == vec3<f32>(0.0)) || s.root_level >= STACK_LEVELS || lane >= STACK_LANES {
         return trace_miss(0u, 0u);
     }
@@ -310,6 +318,38 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
         v = step_voxel(v, enter_axis, pick_i(mo, enter_axis), od, dd, t_enter);
         t = t_enter;
         face_axis = enter_axis;
+    }
+    if t_start > t {
+        // The reference's state once every boundary below `t_start` is
+        // crossed: the voxel there, entered at the largest of those
+        // boundaries, through the highest axis on ties (the reference steps
+        // tied axes lowest first). Nothing before it can stop the ray, so
+        // only the voxel matters; the distance and face it would have
+        // reported are kept for consistency.
+        let g = vec3<i32>(
+            axis_voxel(v.x, od.x, dd.x, t_start, false),
+            axis_voxel(v.y, od.y, dd.y, t_start, false),
+            axis_voxel(v.z, od.z, dd.z, t_start, false),
+        );
+        let crossed = g != v;
+        if any(crossed) {
+            let tb = select(
+                vec3<f32>(-1.0),
+                (vec3<f32>(g) - od) / max(dd, vec3<f32>(1.0e-30)),
+                crossed,
+            );
+            let tl = max(tb.x, max(tb.y, tb.z));
+            var k = 0u;
+            if tb.y == tl {
+                k = 1u;
+            }
+            if tb.z == tl {
+                k = 2u;
+            }
+            v = g;
+            t = tl;
+            face_axis = k;
+        }
     }
 
     trace_stack[row + s.root_level] = ROOT_NODE;
