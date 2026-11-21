@@ -40,10 +40,10 @@
     // The lookahead sphere's radius, metres; it loads only once the full-detail
     // sphere is requested, and only out to evict_radius_m. 16.0..=1024.0
     prefetch_radius_m: 64.0,
-    // RAM for column footprints (the heightfield under a chunk, 8 MiB each) shared
+    // RAM for column footprints (the heightfield under a chunk, 4 MiB each) shared
     // by the workers, so chunks stacked in a column compute it once, MiB. 0 turns
-    // the cache off. 0, or 8..=16384
-    column_cache_mib: 256,
+    // the cache off. 0, or 4..=16384
+    column_cache_mib: 128,
     // Chunks entirely below the terrain surface load as if this much farther away,
     // metres, so the visible ones come first. 0.0..=1024.0
     buried_delay_m: 32.0,

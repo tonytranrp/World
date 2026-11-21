@@ -24,6 +24,8 @@ use crate::continental::Continental;
 use crate::regional::field::{ColumnInputs, RowInputs, column_inputs};
 use crate::regional::{ColumnRect, DetailGrid, MacroGrid, Regional};
 use crate::surface::{Column, Surface};
+use columns::{Packing, Store};
+use std::sync::Arc;
 
 /// The prepared stages of one generator.
 #[derive(Clone)]
@@ -60,32 +62,71 @@ impl Stages {
             .column(x, z, &column_inputs(macros, &detail, x, z))
     }
 
-    /// Every column of a chunk's footprint.
+    /// Every column of a chunk's footprint, packed straight into the shared
+    /// storage (decision 0016). A footprint with a column that does not pack
+    /// is computed again, eight bytes a column; no shipped terrain has one.
     pub fn columns(&self, generator: GeneratorId, chunk: ChunkCoord) -> ChunkColumns {
         let rect = Self::chunk_rect(chunk);
         let macros = MacroGrid::covering(&self.continental, &rect);
         let detail = DetailGrid::covering(&self.regional, &macros, &rect);
-        let n = CHUNK_SIZE as i32;
-        let mut columns = Vec::with_capacity((CHUNK_SIZE * CHUNK_SIZE) as usize);
+        let n = CHUNK_SIZE as usize;
+        let surfaces = self.surface.surfaces();
         let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-        // A row of columns at a time: equal to `column_inputs` per column.
         let mut rows = RowInputs::new(&macros, &detail, rect.x0, CHUNK_SIZE);
-        let mut inputs = vec![ColumnInputs::default(); CHUNK_SIZE as usize];
-        for z in rect.z0..rect.z0 + n {
-            rows.row(z, &mut inputs);
-            for (x, inputs) in (rect.x0..).zip(&inputs) {
-                let column = self.surface.column(x, z, inputs);
-                lo = lo.min(column.height);
-                hi = hi.max(column.height);
-                columns.push(column);
-            }
-        }
+        let mut inputs = vec![ColumnInputs::default(); n];
+        rows.row(rect.z0, &mut inputs);
+        let first = self.surface.parts(rect.x0, rect.z0, &inputs[0]);
+        let packing = Packing::new(first.height, surfaces);
+        // Collected straight into the shared allocation, a row of inputs at
+        // a time: equal to `column_inputs` per column.
+        let (x0, z0) = (rect.x0, rect.z0);
+        let words: Arc<[u32]> = (0..n * n)
+            .map(|i| {
+                let (dx, dz) = ((i % n) as i32, (i / n) as i32);
+                if dx == 0 {
+                    rows.row(z0 + dz, &mut inputs);
+                }
+                let parts = self.surface.parts(x0 + dx, z0 + dz, &inputs[dx as usize]);
+                lo = lo.min(parts.height);
+                hi = hi.max(parts.height);
+                packing.pack(&parts)
+            })
+            .collect();
+        let store = if packing.holds((lo, hi), self.surface.max_cover()) {
+            Store::Packed(packing, words)
+        } else {
+            drop(words);
+            let mut columns = Vec::with_capacity(n * n);
+            self.each_row(&rect, &macros, &detail, |z, inputs| {
+                for (x, inputs) in (rect.x0..).zip(inputs) {
+                    columns.push(self.surface.column(x, z, inputs));
+                }
+            });
+            Store::Wide(columns.into())
+        };
         ChunkColumns {
             generator,
             chunk,
             layers: self.surface.layers(),
-            columns,
+            store,
             height_range: (lo, hi),
+        }
+    }
+
+    /// Calls `f(z, inputs)` for every row of columns of `rect` in order,
+    /// `inputs` holding one per column: equal to `column_inputs` per column.
+    fn each_row(
+        &self,
+        rect: &ColumnRect,
+        macros: &MacroGrid,
+        detail: &DetailGrid,
+        mut f: impl FnMut(i32, &[ColumnInputs]),
+    ) {
+        let mut rows = RowInputs::new(macros, detail, rect.x0, rect.nx);
+        let mut inputs = vec![ColumnInputs::default(); rect.nx as usize];
+        for z in rect.z0..rect.z0 + rect.nz as i32 {
+            rows.row(z, &mut inputs);
+            f(z, &inputs);
         }
     }
 

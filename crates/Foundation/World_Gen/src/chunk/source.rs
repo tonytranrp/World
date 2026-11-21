@@ -26,7 +26,7 @@
 //! never spans two cells), sharing the interpolation work between voxels
 //! ([`block_field`]).
 
-use super::columns::ChunkColumns;
+use super::columns::{ChunkColumns, ColumnRead, Store, WideRead};
 use super::coord::CHUNK_SIZE;
 use crate::regional::caves::{
     CAVE_CELL, CaveGrid, Caves, CubeCaves, block_field, range, trilinear,
@@ -201,6 +201,24 @@ impl ChunkSource {
             return brick_by_leaves(self, min, each);
         }
         let (lx, lz) = (lx as usize, lz as usize);
+        match &self.columns.store {
+            Store::Packed(packing, words) => self.brick_inside(min, lx, lz, words, *packing, each),
+            Store::Wide(columns) => self.brick_inside(min, lx, lz, columns, WideRead, each),
+        }
+    }
+
+    /// [`brick`](Self::brick) for a node inside the chunk at chunk-local
+    /// `(lx, lz)`, reading the footprint's columns as stored with `read`.
+    #[inline(never)]
+    fn brick_inside<R: ColumnRead>(
+        &self,
+        min: VoxelPos,
+        lx: usize,
+        lz: usize,
+        columns: &[R::Stored],
+        read: R,
+        each: &mut dyn FnMut(u32, LeafFill<'_>),
+    ) {
         let level1 = &self.pyramid()[0];
         let row = CHUNK_SIZE as usize / 4;
         // The node is one cave cell; `None` when nothing in it is carved.
@@ -258,14 +276,17 @@ impl ChunkSource {
                 each(slot, LeafFill::Uniform(material));
                 continue;
             }
-            let (ix, iz) = (lx + 4 * ox, lz + 4 * oz);
+            let first = (lz + 4 * oz) * CHUNK_SIZE as usize + lx + 4 * ox;
             match &cell {
                 Some((caves, corners)) => {
                     let f =
                         field.get_or_insert_with(|| block_field(corners, leaf_min, [0, 1, 2, 3]));
-                    self.fill_leaf(leaf_min, ix, iz, Carving::Field(caves, f), &mut voxels);
+                    let carving = Carving::Field(caves, f);
+                    self.fill_carved(leaf_min, columns, first, read, carving, &mut voxels);
                 }
-                None => self.fill_leaf(leaf_min, ix, iz, Carving::None, &mut voxels),
+                None => {
+                    self.fill_carved(leaf_min, columns, first, read, Carving::None, &mut voxels)
+                }
             }
             each(slot, LeafFill::Voxels(&voxels));
         }
@@ -311,11 +332,34 @@ impl ChunkSource {
         carving: Carving<'_>,
         voxels: &mut [MaterialId; 64],
     ) {
+        let first = local_z * CHUNK_SIZE as usize + local_x;
+        match &self.columns.store {
+            Store::Packed(packing, words) => {
+                self.fill_carved(min, words, first, *packing, carving, voxels)
+            }
+            Store::Wide(columns) => {
+                self.fill_carved(min, columns, first, WideRead, carving, voxels)
+            }
+        }
+    }
+
+    /// [`fill_leaf`](Self::fill_leaf) from the footprint's columns as
+    /// stored, the leaf's first at index `first`, read with `read`.
+    #[inline(always)]
+    fn fill_carved<R: ColumnRead>(
+        &self,
+        min: VoxelPos,
+        columns: &[R::Stored],
+        first: usize,
+        read: R,
+        carving: Carving<'_>,
+        voxels: &mut [MaterialId; 64],
+    ) {
         match carving {
-            Carving::None => self.fill_with(min, local_x, local_z, None, voxels, |_, _| false),
+            Carving::None => self.fill_plain(min, columns, first, read, voxels),
             Carving::Field(caves, f) => {
                 let carved = |[x, y, z]: [usize; 3], _: &Column| f[z][y][x] < 0.0;
-                self.fill_with(min, local_x, local_z, Some(caves), voxels, carved)
+                self.fill_with(min, columns, first, read, caves, voxels, carved)
             }
             Carving::PerVoxel(caves) => {
                 let carved = |[x, y, z]: [usize; 3], column: &Column| {
@@ -325,7 +369,44 @@ impl ChunkSource {
                         column,
                     )
                 };
-                self.fill_with(min, local_x, local_z, Some(caves), voxels, carved)
+                self.fill_with(min, columns, first, read, caves, voxels, carved)
+            }
+        }
+    }
+
+    /// [`fill_leaf`](Self::fill_leaf) where no cave reaches the leaf:
+    /// `Column::material_at` becomes three thresholds on `y`, compared from
+    /// the reader's origin, so a packed column is read without adding its
+    /// base.
+    #[inline(always)]
+    fn fill_plain<R: ColumnRead>(
+        &self,
+        min: VoxelPos,
+        columns: &[R::Stored],
+        first: usize,
+        read: R,
+        voxels: &mut [MaterialId; 64],
+    ) {
+        let layers = self.columns.layers();
+        let origin = read.origin();
+        let ys: [i64; 4] =
+            std::array::from_fn(|y| i64::from(min.y.wrapping_add(y as i32)) - origin);
+        let n = CHUNK_SIZE as usize;
+        for z in 0..4 {
+            let row = &columns[first + z * n..][..4];
+            for (x, &stored) in row.iter().enumerate() {
+                let (top, cover_from, soil_from, surface) = read.boundaries(stored);
+                for (y, &at) in ys.iter().enumerate() {
+                    voxels[x + 4 * y + 16 * z] = if at >= top {
+                        MaterialId::AIR
+                    } else if at >= cover_from {
+                        surface
+                    } else if at >= soil_from {
+                        layers.soil
+                    } else {
+                        layers.bedrock
+                    };
+                }
             }
         }
     }
@@ -336,27 +417,29 @@ impl ChunkSource {
     /// carving is applied without branches, since which voxels a cave wall
     /// takes is unpredictable.
     #[inline(always)]
-    fn fill_with(
+    #[allow(clippy::too_many_arguments)]
+    fn fill_with<R: ColumnRead>(
         &self,
         min: VoxelPos,
-        local_x: usize,
-        local_z: usize,
-        caves: Option<&Caves>,
+        columns: &[R::Stored],
+        first: usize,
+        read: R,
+        caves: &Caves,
         voxels: &mut [MaterialId; 64],
         carved: impl Fn([usize; 3], &Column) -> bool,
     ) {
         let layers = self.columns.layers();
         let ys: [i64; 4] = std::array::from_fn(|y| i64::from(min.y.wrapping_add(y as i32)));
         let n = CHUNK_SIZE as usize;
-        let first = local_z * n + local_x;
         for z in 0..4 {
-            let row = &self.columns.columns()[first + z * n..][..4];
-            for (x, column) in row.iter().enumerate() {
+            let row = &columns[first + z * n..][..4];
+            for (x, &stored) in row.iter().enumerate() {
+                let column = read.column(stored);
                 let height = i64::from(column.height);
                 let cover_from = height - i64::from(column.surface_depth);
                 let soil_from = height - i64::from(column.soil_depth);
-                // Heights that may be carved; empty without caves.
-                let (lo, hi) = caves.map_or((0, 0), |caves| caves.carvable_range(column));
+                // Heights that may be carved.
+                let (lo, hi) = caves.carvable_range(&column);
                 for (y, &at) in ys.iter().enumerate() {
                     let material = if at >= height {
                         MaterialId::AIR
@@ -368,7 +451,7 @@ impl ChunkSource {
                         layers.bedrock
                     };
                     // Carving an air voxel leaves it air.
-                    let carve = (lo <= at) & (at < hi) & carved([x, y, z], column);
+                    let carve = (lo <= at) & (at < hi) & carved([x, y, z], &column);
                     voxels[x + 4 * y + 16 * z] = if carve { MaterialId::AIR } else { material };
                 }
             }
@@ -391,12 +474,12 @@ impl ChunkSource {
                     .and_then(|(cx, cz)| self.columns.column(cx, cz));
                 for y in 0..4 {
                     let slot = (x + 4 * y + 16 * z) as usize;
-                    voxels[slot] = match column {
+                    voxels[slot] = match &column {
                         Some(column) => column.material_at(min.y.wrapping_add(y), &layers),
                         None => MaterialId::AIR,
                     };
                 }
-                if let (Some(column), Some(carving)) = (column, &carving) {
+                if let (Some(column), Some(carving)) = (&column, &carving) {
                     carving.carve_column(column, min, x, z, voxels);
                 }
             }
@@ -461,7 +544,7 @@ impl ChunkSource {
         {
             let k = size.trailing_zeros() as usize / 2;
             if k == 0 {
-                return Span::of(&self.columns.columns()[dz * CHUNK_SIZE as usize + dx]);
+                return Span::of(&self.columns.get(dz * CHUNK_SIZE as usize + dx));
             }
             let m = CHUNK_SIZE as usize >> (2 * k);
             return self.pyramid()[k - 1][(dz / s) * m + dx / s];
@@ -469,8 +552,7 @@ impl ChunkSource {
         let mut span = Span::EMPTY;
         for z in dz..dz + s {
             for x in dx..dx + s {
-                let column = self.columns.columns()[z * CHUNK_SIZE as usize + x];
-                span = span.merge(Span::of(&column));
+                span = span.merge(Span::of(&self.columns.get(z * CHUNK_SIZE as usize + x)));
             }
         }
         span
@@ -478,32 +560,20 @@ impl ChunkSource {
 
     /// The footprint pyramid, built on first use.
     fn pyramid(&self) -> &[Vec<Span>] {
-        self.pyramid
-            .get_or_init(|| build_pyramid(self.columns.columns()))
+        self.pyramid.get_or_init(|| build_pyramid(&self.columns))
     }
 }
 
 /// The min/max pyramid over a chunk's columns (`x` fastest): level 1 straight
 /// from the columns, each further level from the one below, a 4x4 block of
 /// entries at a time.
-fn build_pyramid(columns: &[Column]) -> Vec<Vec<Span>> {
-    let mut n = CHUNK_SIZE as usize;
-    let m = n / 4;
-    let mut level = Vec::with_capacity(m * m);
-    for bz in 0..m {
-        let rows: [&[Column]; 4] = std::array::from_fn(|z| &columns[(4 * bz + z) * n..][..n]);
-        for bx in 0..m {
-            let mut span = Span::EMPTY;
-            for row in rows {
-                for column in &row[4 * bx..4 * bx + 4] {
-                    span = span.merge(Span::of(column));
-                }
-            }
-            level.push(span);
-        }
-    }
+fn build_pyramid(columns: &ChunkColumns) -> Vec<Vec<Span>> {
+    let level = match &columns.store {
+        Store::Packed(packing, words) => level_one(words, |word| packing.unpack(word)),
+        Store::Wide(columns) => level_one(columns, |column| column),
+    };
+    let mut n = CHUNK_SIZE as usize / 4;
     let mut pyramid = vec![level];
-    n = m;
     while n > 1 {
         let m = n / 4;
         let below = &pyramid[pyramid.len() - 1];
@@ -523,6 +593,28 @@ fn build_pyramid(columns: &[Column]) -> Vec<Vec<Span>> {
         n = m;
     }
     pyramid
+}
+
+/// Level 1 of the pyramid from a footprint's columns, `x` fastest, as
+/// `unpack` reads them from their storage.
+#[inline(always)]
+fn level_one<T: Copy>(columns: &[T], unpack: impl Fn(T) -> Column) -> Vec<Span> {
+    let n = CHUNK_SIZE as usize;
+    let m = n / 4;
+    let mut level = Vec::with_capacity(m * m);
+    for bz in 0..m {
+        let rows: [&[T]; 4] = std::array::from_fn(|z| &columns[(4 * bz + z) * n..][..n]);
+        for bx in 0..m {
+            let mut span = Span::EMPTY;
+            for row in rows {
+                for &column in &row[4 * bx..4 * bx + 4] {
+                    span = span.merge(Span::of(&unpack(column)));
+                }
+            }
+            level.push(span);
+        }
+    }
+    level
 }
 
 /// How the voxels of one leaf are carved.
@@ -651,7 +743,7 @@ mod tests {
         let mut span = Span::EMPTY;
         for z in dz..dz + size as usize {
             for x in dx..dx + size as usize {
-                span = span.merge(Span::of(&source.columns.columns()[z * n + x]));
+                span = span.merge(Span::of(&source.columns.get(z * n + x)));
             }
         }
         span

@@ -153,6 +153,8 @@ pub struct ResidencyStats {
     /// Column footprints served by the shared cache, and computed.
     pub column_hits: u64,
     pub column_misses: u64,
+    /// Bytes of the computed footprints the cache holds.
+    pub column_bytes: usize,
 }
 
 const MIB: usize = 1 << 20;
@@ -470,6 +472,7 @@ impl StreamedWorld {
             uniform_loads: self.counters.uniform_loads,
             column_hits: self.columns.counts().hits,
             column_misses: self.columns.counts().misses,
+            column_bytes: self.columns.held_bytes(),
         }
     }
 

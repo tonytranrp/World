@@ -221,7 +221,7 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
          {} warm ({} edited, {:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
          interval: holes {:.1} mean ({:.1} ahead), {} now, loads {} generated / {} warm / \
          {} disk, generation {:.1} ms mean per chunk (longest {:.0} ms so far, {} uniform), columns {} hits / {} \
-         computed, speed {:.1} m/s",
+         computed ({:.0} MiB held), speed {:.1} m/s",
         s.loaded,
         s.edited,
         s.loading,
@@ -248,6 +248,7 @@ fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, R
         s.uniform_loads - p.uniform_loads.min(s.uniform_loads),
         s.column_hits - p.column_hits.min(s.column_hits),
         s.column_misses - p.column_misses.min(s.column_misses),
+        s.column_bytes as f64 / 1048576.0,
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
     );
 }

@@ -125,7 +125,7 @@ fn check_cave_chunk(g: &Generator, coord: ChunkCoord) -> (VoxelTree, usize) {
     let mut carved = 0;
     for z in (0..size).step_by(53) {
         for x in (0..size).step_by(47) {
-            let column = *source.columns().column(x as u32, z as u32).unwrap();
+            let column = source.columns().column(x as u32, z as u32).unwrap();
             for y in 0..size {
                 let p = VoxelPos::new(min.x + x, min.y + y, min.z + z);
                 let want = g.material(p).unwrap();

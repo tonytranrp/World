@@ -374,6 +374,7 @@ mod tests {
                 let fresh = g.chunk_source(chunk);
                 let from = g.chunk_source_from(&shared, chunk).unwrap();
                 assert_eq!(from.columns(), fresh.columns(), "{chunk:?}");
+                assert!(from.columns().shares_columns(&shared), "{chunk:?}");
                 let (want, content) = built(chunk, &fresh);
                 assert_eq!(built(chunk, &from).0, want, "{version:?} {chunk:?}");
                 if let Some(m) = g.uniform_chunk(&bounds, chunk) {
