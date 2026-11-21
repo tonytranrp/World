@@ -1,7 +1,7 @@
 //! CPU-only checks of the GPU format, the residency table and streaming:
 //! the encoder round trip through the CPU decoder, consistency of the table
 //! and the pools under random edits, requests and evictions, budget order,
-//! stage-1 hysteresis, the shader constant mirror and the shipped config.
+//! stage-1 hysteresis and the shipped config.
 
 mod common;
 
@@ -633,42 +633,6 @@ fn coarse_samples_carry_the_level_and_representative_material() {
         .with_view(|v| v.sample(shape.root_level(), [8, 8, 8]))
         .unwrap();
     assert_eq!(s, Sample::Air);
-}
-
-#[test]
-fn shader_constants_match_rust() {
-    let text = std::fs::read_to_string(common::assets_dir().join("shaders/common/format.wesl"))
-        .expect("format.wesl");
-    let mut found = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("const ") else {
-            continue;
-        };
-        let Some((name, value)) = rest.split_once('=') else {
-            continue;
-        };
-        let name = name.split(':').next().unwrap().trim().to_string();
-        let v = value
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .trim_end_matches('u');
-        let parsed = if let Some(hex) = v.strip_prefix("0x") {
-            u32::from_str_radix(hex, 16)
-        } else {
-            v.parse::<u32>()
-        };
-        if let Ok(n) = parsed {
-            found.insert(name, n);
-        }
-    }
-    for (name, value) in world_render::internals::shader_constants() {
-        assert_eq!(
-            found.get(name),
-            Some(&value),
-            "format.wesl: {name} should be {value:#x}"
-        );
-    }
 }
 
 #[test]

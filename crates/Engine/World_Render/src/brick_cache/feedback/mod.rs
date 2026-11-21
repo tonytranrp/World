@@ -28,7 +28,8 @@ pub const REQUEST_LEVEL_SHIFT: u32 = 16;
 pub const REQUEST_PRIORITY_SHIFT: u32 = 20;
 pub const REQUEST_PRIORITY_MAX: u32 = 0xFFF;
 
-/// The request and victim layout constants the shaders mirror.
+/// The request and victim layout constants, generated into the shaders by
+/// `cargo xtask codegen`.
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("FEEDBACK_HEADER_WORDS", FEEDBACK_HEADER_WORDS),
     ("REQUEST_WORDS", REQUEST_WORDS),

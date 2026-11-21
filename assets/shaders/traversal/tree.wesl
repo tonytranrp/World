@@ -28,6 +28,8 @@
 
 import package::shaders::common::format::{
     Node, node_kind, node_material, mask_bit, mask_rank, child_slot,
+};
+import package::shaders::common::constants::{
     KIND_UNIFORM, KIND_NOT_RESIDENT, KIND_BRICK, ROOT_NODE,
     BLOCK_HEADER_WORDS, BLOCK_COUNT_MASK, LEAF_MASK_WORDS, PAYLOAD_UNIFORM_BIT,
     PALETTE_LEN_MASK, PALETTE_BITS_SHIFT, BRICK_TABLE_WORDS,
