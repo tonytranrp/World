@@ -44,6 +44,11 @@ impl NodeSlots {
         self.free.push(index);
     }
 
+    /// One past the highest slot ever handed out.
+    pub fn end(&self) -> usize {
+        self.end as usize
+    }
+
     pub fn live(&self) -> usize {
         self.live
     }

@@ -74,6 +74,11 @@ impl WordBlocks {
         Arc::make_mut(self.free[len - 1].get_or_insert_with(Default::default)).push(base);
     }
 
+    /// One past the highest word ever handed out.
+    pub fn end(&self) -> usize {
+        self.end as usize
+    }
+
     pub fn live_words(&self) -> usize {
         self.live_words
     }

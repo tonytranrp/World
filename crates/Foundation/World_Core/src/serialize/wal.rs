@@ -21,7 +21,7 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -185,6 +185,7 @@ pub fn read_log(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize), WalError> {
 /// Appends records to a log file.
 pub struct WalWriter {
     file: File,
+    path: PathBuf,
 }
 
 impl WalWriter {
@@ -214,7 +215,13 @@ impl WalWriter {
         }
         use std::io::Seek;
         file.seek(io::SeekFrom::End(0))?;
-        Ok((Self { file }, records))
+        Ok((
+            Self {
+                file,
+                path: path.to_path_buf(),
+            },
+            records,
+        ))
     }
 
     /// Appends one record. Call [`sync`](Self::sync) to make it durable.
@@ -233,6 +240,71 @@ impl WalWriter {
         use std::io::Seek;
         self.file.seek(io::SeekFrom::End(0))?;
         self.file.sync_data()
+    }
+
+    /// Replaces the whole log with `records`, atomically: they are written
+    /// to a temporary file beside it and synced, which is then renamed over
+    /// the log (and the directory synced on Unix). Later appends go to the
+    /// new log. If anything fails before the rename, the old log is left as
+    /// it was and appends keep going to it.
+    pub fn replace(&mut self, records: &[WalRecord]) -> io::Result<()> {
+        let mut tmp_name = self.path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        let written = (|| {
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut bytes = header().to_vec();
+            for record in records {
+                bytes.extend_from_slice(&encode_record(record));
+            }
+            tmp.write_all(&bytes)?;
+            tmp.sync_all()?;
+            Ok(tmp)
+        })();
+        let tmp = match written {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
+        // The old handle is closed before the rename (Windows refuses to
+        // replace a file that is open without delete sharing); the new
+        // handle, positioned at its end, follows the file through it.
+        let old = std::mem::replace(&mut self.file, tmp);
+        drop(old);
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            let reopened = OpenOptions::new().write(true).open(&self.path);
+            match reopened {
+                Ok(mut file) => {
+                    use std::io::Seek;
+                    file.seek(io::SeekFrom::End(0))?;
+                    self.file = file;
+                }
+                Err(reopen) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("{e}; reopening the old log: {reopen}"),
+                    ));
+                }
+            }
+            return Err(e);
+        }
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -320,6 +392,51 @@ mod tests {
         drop(w);
         let (records, _) = read_log(&std::fs::read(&path).unwrap()).unwrap();
         assert!(records.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_swaps_the_whole_log_and_appends_follow_it() {
+        let dir = std::env::temp_dir().join(format!("world_wal_replace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edits.wvl");
+        let (mut w, _) = WalWriter::open(&path).unwrap();
+        for r in &sample() {
+            w.append(r).unwrap();
+        }
+        w.sync().unwrap();
+        let kept = vec![WalRecord::Checkpoint(3), sample()[1].clone()];
+        w.replace(&kept).unwrap();
+        w.append(&sample()[0]).unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let (records, good) = read_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(records, [kept, vec![sample()[0].clone()]].concat());
+        assert_eq!(good, std::fs::metadata(&path).unwrap().len() as usize);
+        assert!(!dir.join("edits.wvl.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_the_old_log_and_keeps_appending_to_it() {
+        let dir = std::env::temp_dir().join(format!("world_wal_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edits.wvl");
+        let (mut w, _) = WalWriter::open(&path).unwrap();
+        for r in &sample() {
+            w.append(r).unwrap();
+        }
+        w.sync().unwrap();
+        // A directory where the temporary file goes makes the write fail.
+        std::fs::create_dir_all(dir.join("edits.wvl.tmp")).unwrap();
+        assert!(w.replace(&[WalRecord::Checkpoint(1)]).is_err());
+        w.append(&WalRecord::Checkpoint(9)).unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let (records, _) = read_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(records, [sample(), vec![WalRecord::Checkpoint(9)]].concat());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

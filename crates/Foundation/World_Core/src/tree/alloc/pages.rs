@@ -11,11 +11,12 @@ use std::sync::Arc;
 /// instead of the 65,536 a flat page list would.
 pub(super) const CHUNK_PAGES: usize = 256;
 
-/// One fixed-size page of items.
-type Page<T, const N: usize> = Arc<[T; N]>;
+/// One page of items: `N` of them, or fewer for a last page that was
+/// trimmed to what it holds (see [`Pages::trim`]).
+type Page<T> = Arc<[T]>;
 
 /// Up to [`CHUNK_PAGES`] consecutive pages.
-type Chunk<T, const N: usize> = Arc<[Page<T, N>]>;
+type Chunk<T> = Arc<[Page<T>]>;
 
 /// A growable array of `T` in fixed pages of `N` items.
 ///
@@ -24,8 +25,12 @@ type Chunk<T, const N: usize> = Arc<[Page<T, N>]>;
 /// clone is O(1) and shares everything. Writes go through `Arc::make_mut`:
 /// the first write to a page that a clone still shares copies the directory,
 /// the page's chunk and the page itself, and the clone never changes.
+///
+/// Only the last page may be shorter than `N`: [`trim`](Self::trim) cuts it
+/// to the items in use once a chunk is built, and the first write past its
+/// end grows it back to `N` items.
 pub(super) struct Pages<T, const N: usize> {
-    dir: Arc<[Chunk<T, N>]>,
+    dir: Arc<[Chunk<T>]>,
 }
 
 // Derived `Clone` and `Default` would demand `T: Clone` and `T: Default` for
@@ -61,22 +66,67 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
     }
 
     /// Mutable `len` items from `start`, which must lie in one page. Copies
-    /// the directory, the chunk and the page first if a clone shares them.
+    /// the directory, the chunk and the page first if a clone shares them,
+    /// and grows a trimmed page back to `N` items if the range passes its
+    /// end.
     pub fn slice_mut(&mut self, start: u32, len: usize) -> &mut [T] {
         let start = start as usize;
         let (page, offset) = (start / N, start % N);
         let dir = Arc::make_mut(&mut self.dir);
         let chunk = Arc::make_mut(&mut dir[page / CHUNK_PAGES]);
-        &mut Arc::make_mut(&mut chunk[page % CHUNK_PAGES])[offset..offset + len]
+        let page = &mut chunk[page % CHUNK_PAGES];
+        if page.len() < offset + len {
+            *page = full_page::<T, N>(page);
+        }
+        &mut Arc::make_mut(page)[offset..offset + len]
+    }
+
+    /// Cuts the last page to its first items, so that the pages hold exactly
+    /// `len` items, rounded up to [`TRIM_STEP`]. Items past `len` must be
+    /// unused: they read as default again if the page grows back. Does
+    /// nothing when no page would get shorter.
+    pub fn trim(&mut self, len: usize) {
+        let Some(last) = self.page_count().checked_sub(1) else {
+            return;
+        };
+        let keep = len
+            .saturating_sub(last * N)
+            .next_multiple_of(TRIM_STEP)
+            .clamp(TRIM_STEP, N);
+        let page = &self.dir[last / CHUNK_PAGES][last % CHUNK_PAGES];
+        if keep >= page.len() {
+            return;
+        }
+        let short: Page<T> = Arc::from(&page[..keep]);
+        let dir = Arc::make_mut(&mut self.dir);
+        let chunk = Arc::make_mut(&mut dir[last / CHUNK_PAGES]);
+        chunk[last % CHUNK_PAGES] = short;
+    }
+
+    /// Items the pages hold, live or free: `N` a page but a trimmed last.
+    pub fn held_len(&self) -> usize {
+        self.dir.last().map_or(0, |last| {
+            let pages = (self.dir.len() - 1) * CHUNK_PAGES + last.len();
+            (pages - 1) * N + last.last().map_or(0, |page| page.len())
+        })
     }
 
     /// Appends a page of default items. Rebuilds only the last chunk (or the
     /// directory when a chunk is full), so growing costs O(`CHUNK_PAGES`) per
-    /// page, about once per 16 KiB written.
+    /// page, about once per 16 KiB written. A trimmed last page grows back
+    /// to `N` items first: only the last page may be short.
     pub fn push_page(&mut self) {
-        let page: Page<T, N> = Arc::new([T::default(); N]);
+        if let Some(last) = self.page_count().checked_sub(1)
+            && self.page(last).len() < N
+        {
+            let dir = Arc::make_mut(&mut self.dir);
+            let chunk = Arc::make_mut(&mut dir[last / CHUNK_PAGES]);
+            let page = &mut chunk[last % CHUNK_PAGES];
+            *page = full_page::<T, N>(page);
+        }
+        let page: Page<T> = full_page::<T, N>(&[]);
         if self.dir.last().is_none_or(|last| last.len() == CHUNK_PAGES) {
-            let chunk: Chunk<T, N> = Arc::from([page]);
+            let chunk: Chunk<T> = Arc::from([page]);
             self.dir = self.dir.iter().cloned().chain([chunk]).collect();
         } else {
             let dir = Arc::make_mut(&mut self.dir);
@@ -96,11 +146,11 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
     pub fn pages(&self) -> impl Iterator<Item = &[T]> {
         self.dir
             .iter()
-            .flat_map(|chunk| chunk.iter().map(|page| page.as_slice()))
+            .flat_map(|chunk| chunk.iter().map(|page| &page[..]))
     }
 
-    #[inline]
-    fn page(&self, page: usize) -> &[T; N] {
+    #[inline(always)]
+    fn page(&self, page: usize) -> &[T] {
         &self.dir[page / CHUNK_PAGES][page % CHUNK_PAGES]
     }
 
@@ -117,8 +167,10 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
     /// checking what copy-on-write copied.
     #[cfg(test)]
     pub fn shares_page(&self, other: &Self, page: usize) -> bool {
-        let at = |p: &Self| Arc::as_ptr(&p.dir[page / CHUNK_PAGES][page % CHUNK_PAGES]);
-        at(self) == at(other)
+        Arc::ptr_eq(
+            &self.dir[page / CHUNK_PAGES][page % CHUNK_PAGES],
+            &other.dir[page / CHUNK_PAGES][page % CHUNK_PAGES],
+        )
     }
 
     /// Whether chunk `chunk` is the same allocation in both.
@@ -129,10 +181,23 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
 
     /// Whether both use the same directory allocation: nothing was written
     /// or added between them.
-    #[cfg(test)]
     pub fn shares_list(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.dir, &other.dir)
     }
+}
+
+/// A trimmed page keeps a multiple of this many items, so that a chunk's
+/// last pages land in a few allocation sizes.
+pub(super) const TRIM_STEP: usize = 64;
+
+/// A page of `N` items starting with `items`, the rest default. Built as an
+/// array, like every page before trimming, so a new page costs one fill.
+fn full_page<T: Copy + Default, const N: usize>(items: &[T]) -> Page<T> {
+    let mut page = Arc::new([T::default(); N]);
+    if let Some(page) = Arc::get_mut(&mut page) {
+        page[..items.len()].copy_from_slice(items);
+    }
+    page
 }
 
 /// Reads from a [`Pages`] that remember the last page touched, so a run of
@@ -149,14 +214,14 @@ pub(super) struct PageReader<'a, T, const N: usize> {
 
 impl<'a, T: Copy + Default, const N: usize> PageReader<'a, T, N> {
     /// Item `index`. Panics past the last page.
-    #[inline]
+    #[inline(always)]
     pub fn get(&mut self, index: u32) -> T {
         let index = index as usize;
         self.page(index / N)[index % N]
     }
 
     /// `len` items from `start`, which must lie in one page.
-    #[inline]
+    #[inline(always)]
     pub fn slice(&mut self, start: u32, len: usize) -> &'a [T] {
         let start = start as usize;
         let offset = start % N;
@@ -164,13 +229,13 @@ impl<'a, T: Copy + Default, const N: usize> PageReader<'a, T, N> {
     }
 
     /// The items from `start` to the end of its page.
-    #[inline]
+    #[inline(always)]
     pub fn tail(&mut self, start: u32) -> &'a [T] {
         let start = start as usize;
         &self.page(start / N)[start % N..]
     }
 
-    #[inline]
+    #[inline(always)]
     fn page(&mut self, page: usize) -> &'a [T] {
         if page != self.index {
             self.page = self.pages.page(page);
@@ -208,6 +273,51 @@ mod tests {
             p.push_page();
         }
         p
+    }
+
+    #[test]
+    fn trimming_keeps_the_items_in_use_and_a_write_past_them_grows_the_page() {
+        let mut p = Pages::<u32, 256>::default();
+        p.push_page();
+        p.push_page();
+        p.slice_mut(256 + 10, 2).copy_from_slice(&[5, 6]);
+        assert_eq!(p.held_len(), 512);
+        p.trim(256 + 12);
+        assert_eq!(p.held_len(), 256 + TRIM_STEP, "rounded up to a step");
+        assert_eq!(p.page_count(), 2);
+        assert_eq!(p.slice(256 + 10, 2), [5, 6]);
+        let snapshot = p.clone();
+
+        // A write inside the kept items stays short; one past them grows it.
+        p.slice_mut(256 + 20, 1)[0] = 7;
+        assert_eq!(p.held_len(), 256 + TRIM_STEP);
+        p.slice_mut(256 + 200, 1)[0] = 8;
+        assert_eq!(p.held_len(), 512);
+        assert_eq!(p.slice(256 + 10, 2), [5, 6]);
+        assert_eq!(
+            (p.get(256 + 20), p.get(256 + 200), p.get(256 + 201)),
+            (7, 8, 0)
+        );
+        assert_eq!(snapshot.held_len(), 256 + TRIM_STEP);
+        assert_eq!(snapshot.get(256 + 20), 0, "the snapshot never changes");
+
+        // A new page first grows a trimmed last page back.
+        p.trim(256 + 1);
+        p.push_page();
+        assert_eq!(p.held_len(), 3 * 256);
+        assert!(p.pages().all(|page| page.len() == 256));
+    }
+
+    #[test]
+    fn trimming_an_empty_or_full_page_does_nothing() {
+        let mut p = Pages::<u32, 256>::default();
+        p.trim(0);
+        assert_eq!(p.held_len(), 0);
+        p.push_page();
+        p.trim(256);
+        assert_eq!(p.held_len(), 256);
+        p.trim(0);
+        assert_eq!(p.held_len(), TRIM_STEP, "a page keeps at least one step");
     }
 
     #[test]
@@ -265,9 +375,9 @@ mod tests {
     #[test]
     fn an_unshared_page_is_written_in_place() {
         let mut live = pages(1);
-        let before = Arc::as_ptr(&live.dir[0][0]);
+        let before = Arc::as_ptr(&live.dir[0][0]).cast::<u32>();
         live.slice_mut(1, 1)[0] = 7;
-        assert_eq!(Arc::as_ptr(&live.dir[0][0]), before);
+        assert_eq!(Arc::as_ptr(&live.dir[0][0]).cast::<u32>(), before);
     }
 
     #[test]

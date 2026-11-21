@@ -36,6 +36,16 @@ pub struct Cli {
     /// before `--exit-after-frames` ends the run.
     #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
     pub screenshot: Option<std::path::PathBuf>,
+
+    /// Developer: write every frame's time in milliseconds, one per line, to
+    /// this path when `--exit-after-frames` ends the run.
+    #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
+    pub frame_times: Option<std::path::PathBuf>,
+
+    /// Developer: walk the camera forward at this speed in metres per
+    /// second, over the terrain, to measure streaming under motion.
+    #[arg(long, value_name = "M_PER_S", requires = "exit_after_frames")]
+    pub walk: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -81,6 +91,31 @@ mod tests {
     fn rejects_unknown_backend_naming_the_flag() {
         let err = Cli::try_parse_from(["world", "--backend", "banana"]).unwrap_err();
         assert!(err.to_string().contains("--backend"));
+    }
+
+    #[test]
+    fn frame_times_need_a_fixed_length_run() {
+        assert!(Cli::try_parse_from(["world", "--frame-times", "t.txt"]).is_err());
+        let cli = Cli::try_parse_from([
+            "world",
+            "--exit-after-frames",
+            "60",
+            "--frame-times",
+            "t.txt",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.frame_times.as_deref(),
+            Some(std::path::Path::new("t.txt"))
+        );
+    }
+
+    #[test]
+    fn walking_needs_a_fixed_length_run() {
+        assert!(Cli::try_parse_from(["world", "--walk", "4"]).is_err());
+        let cli =
+            Cli::try_parse_from(["world", "--exit-after-frames", "60", "--walk", "4.5"]).unwrap();
+        assert_eq!(cli.walk, Some(4.5));
     }
 
     #[test]

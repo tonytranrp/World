@@ -92,7 +92,9 @@ impl<'a> Builder<'a> {
         }
         match root {
             Child::Node(index) => {
-                self.writer.forest.chunk_mut(id).root = index;
+                let chunk = self.writer.forest.chunk_mut(id);
+                chunk.root = index;
+                chunk.store.trim();
                 self.writer.forest.touch(id);
                 Child::Node(id)
             }

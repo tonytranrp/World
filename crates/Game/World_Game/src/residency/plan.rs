@@ -1,5 +1,8 @@
 //! Which chunks the player needs: full-detail chunks in a sphere, coarse
-//! chunk columns in a disc, both nearest first.
+//! chunk columns in a disc, both nearest first, and while the player moves,
+//! the chunks ahead first and a lookahead sphere around where they will be.
+//! Chunks buried under the terrain, which show only once dug into, wait as
+//! if they were farther away.
 
 use world_core::VoxelPos;
 use world_core::consts::VOXELS_PER_METER;
@@ -91,9 +94,378 @@ pub fn disc(eye: VoxelPos, radius_m: f32) -> Vec<(u32, u32)> {
     out.into_iter().map(|(_, c)| c).collect()
 }
 
+/// The full-detail `sphere` around `eye` in the order to load it: the
+/// chunks within one chunk of the eye first (the ground underfoot), nearest
+/// first, then the rest by distance to `predicted` (where the player heads,
+/// so chunks ahead come before chunks behind, which the player leaves and
+/// which are evicted soonest) or, standing still, to the eye, each pushed
+/// back by `delay(chunk)` voxels. Ties in coordinate order.
+pub fn load_priority(
+    eye: VoxelPos,
+    predicted: Option<VoxelPos>,
+    sphere: &[ChunkCoord],
+    delay: impl Fn(ChunkCoord) -> f32,
+) -> Vec<ChunkCoord> {
+    let near = CHUNK_SIZE as f32;
+    let target = predicted.unwrap_or(eye);
+    let mut keyed: Vec<(bool, u32, ChunkCoord)> = sphere
+        .iter()
+        .map(|&c| {
+            let d = chunk_distance(eye, c);
+            if d <= near {
+                (false, d.to_bits(), c)
+            } else {
+                // Both terms are non-negative, so the bits sort like the
+                // floats.
+                let key = chunk_distance(target, c) + delay(c).max(0.0);
+                (true, key.to_bits(), c)
+            }
+        })
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// `chunks` by distance to `target` pushed back by `delay(chunk)` voxels,
+/// ties in coordinate order.
+pub fn delayed(
+    target: VoxelPos,
+    chunks: &[ChunkCoord],
+    delay: impl Fn(ChunkCoord) -> f32,
+) -> Vec<ChunkCoord> {
+    let mut keyed: Vec<(u32, ChunkCoord)> = chunks
+        .iter()
+        .map(|&c| ((chunk_distance(target, c) + delay(c).max(0.0)).to_bits(), c))
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, c)| c).collect()
+}
+
+/// What the residency knows of a chunk column's terrain: the lowest and
+/// highest column of its footprint, exact (from a full-detail load) or from
+/// coarse samples, which may miss the true extremes a little.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heights {
+    pub lo: i32,
+    pub hi: i32,
+    pub exact: bool,
+}
+
+/// How far coarse samples are trusted to bound the true lowest column, in
+/// voxels: a quarter chunk (4 m).
+const SAMPLE_MARGIN: i64 = CHUNK_SIZE as i64 / 4;
+
+/// Whether `chunk` lies entirely below the lowest column of its footprint,
+/// so nothing of it shows until the player digs in. Unknown columns are not
+/// buried.
+pub fn is_buried(chunk: ChunkCoord, heights: Option<Heights>) -> bool {
+    let Some(h) = heights else {
+        return false;
+    };
+    let margin = if h.exact { 0 } else { SAMPLE_MARGIN };
+    let top = i64::from(chunk.min_voxel().y) + i64::from(CHUNK_SIZE);
+    top <= i64::from(h.lo) - margin
+}
+
+/// The chunks within `radius_m` of `predicted` that lie outside the
+/// full-detail radius `full_m` of `eye` but within `keep_m` of it (beyond
+/// that they would be evicted at once), nearest to `predicted` first.
+pub fn lookahead(
+    eye: VoxelPos,
+    predicted: VoxelPos,
+    radius_m: f32,
+    full_m: f32,
+    keep_m: f32,
+) -> Vec<ChunkCoord> {
+    let (full, keep) = (voxels(full_m), voxels(keep_m));
+    sphere(predicted, radius_m)
+        .into_iter()
+        .filter(|&c| {
+            let d = chunk_distance(eye, c);
+            d > full && d <= keep
+        })
+        .collect()
+}
+
+/// The player's velocity, estimated from successive eye positions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Motion {
+    last: Option<VoxelPos>,
+    /// Voxels per second, smoothed.
+    velocity: [f32; 3],
+}
+
+impl Motion {
+    /// Takes the eye position `dt_secs` after the previous one. The estimate
+    /// follows the measured velocity with a time constant of about
+    /// `smoothing_secs` (0 follows it at once), in a rational form with no
+    /// platform math functions, so every machine computes the same values.
+    /// A step longer than `jump` voxels is a teleport, not motion, and
+    /// resets the estimate.
+    pub fn observe(&mut self, eye: VoxelPos, dt_secs: f32, smoothing_secs: f32, jump: f32) {
+        let Some(last) = self.last.replace(eye) else {
+            return;
+        };
+        if dt_secs.is_nan() || dt_secs <= 0.0 {
+            return;
+        }
+        let step = [eye.x - last.x, eye.y - last.y, eye.z - last.z].map(|d| d as f32);
+        if length(step) > jump {
+            self.velocity = [0.0; 3];
+            return;
+        }
+        let alpha = dt_secs / (smoothing_secs.max(0.0) + dt_secs);
+        for (v, s) in self.velocity.iter_mut().zip(step) {
+            *v += alpha * (s / dt_secs - *v);
+        }
+    }
+
+    /// The smoothed velocity, in voxels per second.
+    pub fn velocity(&self) -> [f32; 3] {
+        self.velocity
+    }
+
+    /// Where the player will be after `secs` at the current velocity, the
+    /// offset shortened to at most `max_offset` voxels. `None` when the
+    /// offset is under half a chunk (standing still or nearly) or the point
+    /// is outside the world.
+    pub fn predicted(&self, eye: VoxelPos, secs: f32, max_offset: f32) -> Option<VoxelPos> {
+        let mut offset = self.velocity.map(|v| v * secs);
+        let len = length(offset);
+        if len.is_nan() || len < (CHUNK_SIZE / 2) as f32 {
+            return None;
+        }
+        if len > max_offset {
+            offset = offset.map(|o| o * (max_offset / len));
+        }
+        let at = |e: i32, o: f32| (e as f32 + o).round() as i32;
+        let p = VoxelPos::new(
+            at(eye.x, offset[0]),
+            at(eye.y, offset[1]),
+            at(eye.z, offset[2]),
+        );
+        p.in_world().then_some(p)
+    }
+
+    /// Whether `chunk`'s centre lies ahead of `eye` along the motion. Nothing
+    /// is ahead while standing still.
+    pub fn is_ahead(&self, eye: VoxelPos, chunk: ChunkCoord) -> bool {
+        let min = chunk.min_voxel();
+        let half = (CHUNK_SIZE / 2) as f32;
+        let d = [
+            min.x as f32 + half - eye.x as f32,
+            min.y as f32 + half - eye.y as f32,
+            min.z as f32 + half - eye.z as f32,
+        ];
+        let v = self.velocity;
+        d[0] * v[0] + d[1] * v[1] + d[2] * v[2] > 0.0
+    }
+}
+
+fn length(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_follows_steady_walking_and_resets_on_a_teleport() {
+        let mut motion = Motion::default();
+        let dt = 1.0 / 60.0;
+        // 4 m/s along +x is 256 voxels per second; steps alternate 4 and 5
+        // voxels as a real eye's integer position does.
+        let mut x = 0;
+        for i in 0..600 {
+            x += if i % 2 == 0 { 4 } else { 5 };
+            motion.observe(VoxelPos::new(x, 100, 0), dt, 0.25, 1000.0);
+        }
+        let v = motion.velocity();
+        assert!((v[0] - 270.0).abs() < 10.0, "{v:?}");
+        assert!(v[1].abs() < 1e-3 && v[2].abs() < 1e-3, "{v:?}");
+        let eye = VoxelPos::new(x, 100, 0);
+        let ahead = ChunkCoord::containing(VoxelPos::new(x + 2048, 100, 0)).unwrap();
+        let behind = ChunkCoord::containing(VoxelPos::new(x - 2048, 100, 0)).unwrap();
+        assert!(motion.is_ahead(eye, ahead));
+        assert!(!motion.is_ahead(eye, behind));
+
+        motion.observe(VoxelPos::new(x + 5000, 100, 0), dt, 0.25, 1000.0);
+        assert_eq!(motion.velocity(), [0.0; 3], "a jump is not motion");
+        assert!(!motion.is_ahead(eye, ahead));
+    }
+
+    /// A motion estimate of `v` voxels per second.
+    fn moving(v: [f32; 3]) -> Motion {
+        let mut m = Motion::default();
+        m.observe(VoxelPos::new(0, 0, 0), 1.0, 0.0, 1e9);
+        m.observe(
+            VoxelPos::new(v[0] as i32, v[1] as i32, v[2] as i32),
+            1.0,
+            0.0,
+            1e9,
+        );
+        m
+    }
+
+    #[test]
+    fn the_prediction_follows_the_velocity_within_limits() {
+        let eye = VoxelPos::new(1000, 200, -3000);
+        let m = moving([768.0, 0.0, 0.0]);
+        assert_eq!(
+            m.predicted(eye, 2.0, 1e9),
+            Some(VoxelPos::new(2536, 200, -3000))
+        );
+        assert_eq!(
+            m.predicted(eye, 2.0, 1000.0),
+            Some(VoxelPos::new(2000, 200, -3000)),
+            "shortened"
+        );
+        assert_eq!(m.predicted(eye, 0.0, 1e9), None, "no lookahead");
+        assert_eq!(
+            moving([100.0, 0.0, 0.0]).predicted(eye, 1.0, 1e9),
+            None,
+            "slow"
+        );
+    }
+
+    #[test]
+    fn chunks_ahead_load_first_and_the_sphere_comes_before_the_lookahead() {
+        let eye = VoxelPos::new(512, 300, 512);
+        // 12 m/s along +x for 2 s.
+        let predicted = moving([768.0, 0.0, 0.0])
+            .predicted(eye, 2.0, voxels(96.0))
+            .unwrap();
+        let full = sphere(eye, 64.0);
+        let order = load_priority(eye, Some(predicted), &full, |_| 0.0);
+        // The same chunks, each once.
+        let mut a = order.clone();
+        let mut b = full.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+        // Most of the first quarter lies ahead (the few right around the
+        // player come first wherever they are); nearest first alone would
+        // put as many behind as ahead.
+        let quarter = &order[..order.len() / 4];
+        let eye_chunk = ChunkCoord::containing(eye).unwrap();
+        let ahead = quarter.iter().filter(|c| c.x() > eye_chunk.x()).count();
+        let behind = quarter.iter().filter(|c| c.x() < eye_chunk.x()).count();
+        assert!(ahead > 2 * behind, "{ahead} ahead, {behind} behind");
+        let plain_behind = full[..full.len() / 4]
+            .iter()
+            .filter(|c| c.x() < eye_chunk.x())
+            .count();
+        assert!(plain_behind > behind);
+        // The player's own chunk and its neighbours still come early.
+        let own = order.iter().position(|&c| c == eye_chunk).unwrap();
+        assert!(own < order.len() / 8, "{own}");
+
+        // The lookahead adds only chunks outside the sphere, kept by the
+        // evict radius, all ahead.
+        let extra = lookahead(eye, predicted, 64.0, 64.0, 96.0);
+        assert!(!extra.is_empty());
+        for c in &extra {
+            assert!(!full.contains(c));
+            let d = chunk_distance(eye, *c);
+            assert!(d > voxels(64.0) && d <= voxels(96.0));
+            assert!(c.x() > eye_chunk.x(), "{c:?}");
+        }
+        // Deterministic: the same inputs give the same order.
+        assert_eq!(order, load_priority(eye, Some(predicted), &full, |_| 0.0));
+        assert_eq!(extra, lookahead(eye, predicted, 64.0, 64.0, 96.0));
+    }
+
+    #[test]
+    fn buried_chunks_wait_but_never_pass_the_lookahead_or_the_ground_underfoot() {
+        let eye = VoxelPos::new(512, 300, 512);
+        let full = sphere(eye, 64.0);
+        let eye_chunk = ChunkCoord::containing(eye).unwrap();
+        // Flat terrain at the eye's chunk floor: every chunk below the eye's
+        // is buried.
+        let floor = eye_chunk.min_voxel().y;
+        let heights = Some(Heights {
+            lo: floor,
+            hi: floor + 1,
+            exact: true,
+        });
+        let buried = |c: ChunkCoord| is_buried(c, heights);
+        let delay = voxels(32.0);
+        let plain = load_priority(eye, None, &full, |_| 0.0);
+        assert_eq!(plain, full, "standing still with no delay is nearest first");
+        let order = load_priority(eye, None, &full, |c| if buried(c) { delay } else { 0.0 });
+        let mut a = order.clone();
+        a.sort_unstable();
+        let mut b = full.clone();
+        b.sort_unstable();
+        assert_eq!(a, b, "the same chunks, each once");
+        // The ground underfoot still comes first, buried or not.
+        let below = ChunkCoord::new(eye_chunk.x(), eye_chunk.y() - 1, eye_chunk.z()).unwrap();
+        assert!(buried(below));
+        let near = order
+            .iter()
+            .take_while(|&&c| chunk_distance(eye, c) <= CHUNK_SIZE as f32)
+            .count();
+        assert!(order[..near].contains(&below));
+        // Beyond it, a buried chunk comes after every surface chunk up to
+        // `delay` farther.
+        for (i, &c) in order.iter().enumerate().skip(near) {
+            if !buried(c) {
+                continue;
+            }
+            let d = chunk_distance(eye, c);
+            for &later in &order[i + 1..] {
+                if !buried(later) {
+                    assert!(
+                        chunk_distance(eye, later) >= d + delay - 1.0,
+                        "{c:?} {later:?}"
+                    );
+                }
+            }
+        }
+        // Moving, the lookahead still follows the whole sphere: it is
+        // appended after it whatever the delay.
+        let predicted = VoxelPos::new(512 + 3000, 300, 512);
+        let ahead = load_priority(eye, Some(predicted), &full, |c| {
+            if buried(c) { delay } else { 0.0 }
+        });
+        assert_eq!(ahead.len(), full.len());
+        let extra = lookahead(eye, predicted, 64.0, 64.0, 96.0);
+        let extra = delayed(predicted, &extra, |c| if buried(c) { delay } else { 0.0 });
+        assert!(extra.iter().all(|c| !ahead.contains(c)));
+        // Deterministic.
+        assert_eq!(
+            ahead,
+            load_priority(eye, Some(predicted), &full, |c| {
+                if buried(c) { delay } else { 0.0 }
+            })
+        );
+        // Coarse samples are trusted only with a margin.
+        let sampled = Some(Heights {
+            lo: floor,
+            hi: floor + 1,
+            exact: false,
+        });
+        assert!(!is_buried(below, sampled));
+        assert!(is_buried(
+            ChunkCoord::new(eye_chunk.x(), eye_chunk.y() - 2, eye_chunk.z()).unwrap(),
+            sampled
+        ));
+        assert!(!is_buried(below, None));
+    }
+
+    #[test]
+    fn standing_still_decays_the_estimate() {
+        let mut motion = Motion::default();
+        let dt = 0.1;
+        motion.observe(VoxelPos::new(0, 0, 0), dt, 0.0, 1e9);
+        motion.observe(VoxelPos::new(100, 0, 0), dt, 0.0, 1e9);
+        assert_eq!(motion.velocity(), [1000.0, 0.0, 0.0], "no smoothing");
+        for _ in 0..100 {
+            motion.observe(VoxelPos::new(100, 0, 0), dt, 0.5, 1e9);
+        }
+        assert!(motion.velocity()[0].abs() < 1e-3, "{:?}", motion.velocity());
+    }
 
     #[test]
     fn a_64_metre_sphere_holds_the_chunks_whose_centre_is_inside() {

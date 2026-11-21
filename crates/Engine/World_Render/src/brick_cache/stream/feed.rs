@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use bevy::prelude::Resource;
-use world_core::{BrickPos, DirtyBricks, TreeSnapshot};
+use world_core::{BrickPos, DirtyBricks, TreeSnapshot, VoxelPos};
+
+use super::summaries::ChunkSummaries;
 
 /// The world the renderer mirrors. Whoever owns the `VoxelTree` updates it
 /// once per frame after applying that frame's edits:
@@ -21,7 +23,12 @@ use world_core::{BrickPos, DirtyBricks, TreeSnapshot};
 pub struct VoxelWorldFeed {
     snapshot: Option<Arc<TreeSnapshot>>,
     dirty: Vec<BrickPos>,
+    chunks: Vec<VoxelPos>,
+    summaries: Vec<ChunkSummaries>,
     refresh: bool,
+    /// Counts [`replace`](Self::replace) and [`clear`](Self::clear) calls:
+    /// a publisher that remembers it can tell when another one took over.
+    generation: u64,
 }
 
 /// What the render world takes from the feed in one extraction.
@@ -29,6 +36,11 @@ pub struct VoxelWorldFeed {
 pub struct FeedFrame {
     pub snapshot: Option<Arc<TreeSnapshot>>,
     pub dirty: Vec<BrickPos>,
+    /// Chunks replaced wholesale, by any voxel inside.
+    pub chunks: Vec<VoxelPos>,
+    /// Summaries of replaced chunks computed where they were built, oldest
+    /// first (see [`VoxelWorldFeed::offer_summaries`]).
+    pub summaries: Vec<ChunkSummaries>,
     pub refresh: bool,
 }
 
@@ -36,22 +48,58 @@ impl VoxelWorldFeed {
     /// The next state of the same world, and the bricks that changed since
     /// the previous publish.
     pub fn publish(&mut self, snapshot: Arc<TreeSnapshot>, dirty: &DirtyBricks) {
+        self.publish_with_chunks(snapshot, dirty, &[]);
+    }
+
+    /// [`publish`](Self::publish), with the chunks (level
+    /// `world_core::tree::CHUNK_LEVEL` subtrees, by any voxel inside) whose
+    /// content was replaced wholesale since: loaded, unloaded or swapped for
+    /// other detail. The cache rebuilds what it holds of them.
+    pub fn publish_with_chunks(
+        &mut self,
+        snapshot: Arc<TreeSnapshot>,
+        dirty: &DirtyBricks,
+        chunks: &[VoxelPos],
+    ) {
         self.snapshot = Some(snapshot);
         self.dirty.extend_from_slice(dirty.as_slice());
+        self.chunks.extend_from_slice(chunks);
+    }
+
+    /// Summaries of chunks published as replaced, computed off the frame
+    /// where they were built (decision 0022), so the renderer need not
+    /// compute them. Optional: the renderer uses one only while its
+    /// snapshot holds exactly the content it was computed from, and
+    /// computes the summaries itself otherwise.
+    pub fn offer_summaries(&mut self, summaries: impl IntoIterator<Item = ChunkSummaries>) {
+        self.summaries.extend(summaries);
     }
 
     /// A different world: everything resident is dropped and rebuilt.
     pub fn replace(&mut self, snapshot: Arc<TreeSnapshot>) {
         self.snapshot = Some(snapshot);
         self.dirty.clear();
+        self.chunks.clear();
+        self.summaries.clear();
         self.refresh = true;
+        self.generation += 1;
     }
 
     /// Stops rendering any world.
     pub fn clear(&mut self) {
         self.snapshot = None;
         self.dirty.clear();
+        self.chunks.clear();
+        self.summaries.clear();
         self.refresh = true;
+        self.generation += 1;
+    }
+
+    /// Which world the feed holds: it changes on every
+    /// [`replace`](Self::replace) and [`clear`](Self::clear), never on a
+    /// [`publish`](Self::publish).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn snapshot(&self) -> Option<&Arc<TreeSnapshot>> {
@@ -63,6 +111,8 @@ impl VoxelWorldFeed {
         FeedFrame {
             snapshot: self.snapshot.clone(),
             dirty: std::mem::take(&mut self.dirty),
+            chunks: std::mem::take(&mut self.chunks),
+            summaries: std::mem::take(&mut self.summaries),
             refresh: std::mem::take(&mut self.refresh),
         }
     }
@@ -78,6 +128,8 @@ impl FeedFrame {
         }
         self.snapshot = later.snapshot;
         self.dirty.extend(later.dirty);
+        self.chunks.extend(later.chunks);
+        self.summaries.extend(later.summaries);
     }
 }
 
@@ -85,6 +137,21 @@ impl FeedFrame {
 mod tests {
     use super::*;
     use world_core::{Edit, MaterialId, VoxelPos, VoxelTree};
+
+    #[test]
+    fn generation_changes_on_replace_and_clear_only() {
+        let tree = VoxelTree::new();
+        let mut feed = VoxelWorldFeed::default();
+        let g0 = feed.generation();
+        feed.replace(Arc::new(tree.snapshot()));
+        let g1 = feed.generation();
+        assert_ne!(g0, g1);
+        feed.publish(Arc::new(tree.snapshot()), &DirtyBricks::default());
+        let _ = feed.take();
+        assert_eq!(feed.generation(), g1, "publish and take keep the world");
+        feed.clear();
+        assert_ne!(feed.generation(), g1);
+    }
 
     #[test]
     fn changes_are_taken_exactly_once() {

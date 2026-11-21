@@ -1,7 +1,7 @@
 //! CPU-only checks of the GPU format, the residency table and streaming:
 //! the encoder round trip through the CPU decoder, consistency of the table
 //! and the pools under random edits, requests and evictions, budget order,
-//! stage-1 hysteresis, the shader constant mirror and the shipped config.
+//! stage-1 hysteresis and the shipped config.
 
 mod common;
 
@@ -15,7 +15,8 @@ use world_render::internals::format::decode::Sample;
 use world_render::internals::frame::{FrameInput, run_frame};
 use world_render::internals::key::{NodeKey, Shape, view_at};
 use world_render::internals::select::{
-    Selection, ViewPoint, projected_pixels, select, select_budgeted,
+    ALWAYS_EXPANDED_LEVEL, GrowthState, Selection, ViewPoint, projected_pixels, select,
+    select_budgeted,
 };
 use world_render::internals::{BrickCacheConfig, LodTuning, Stage};
 use world_testkit::dense::{Bounds, EditOp, VoxelModel};
@@ -238,9 +239,25 @@ fn slab() -> VoxelTree {
     tree
 }
 
+/// [`slab`] with every other plane of voxels across x of a second material,
+/// so every leaf is a two-material palette leaf and a brick's block is large
+/// next to the fixed cost of a node or table write (since decision 0021 a
+/// brick of full leaves is a few words).
+fn striped_slab() -> VoxelTree {
+    let mut tree = slab();
+    for x in (-64..64).step_by(2) {
+        tree.fill_box(
+            VoxelBox::new(VoxelPos::new(x, -16, -64), VoxelPos::new(x + 1, -1, 64)),
+            MaterialId(3),
+        )
+        .unwrap();
+    }
+    tree
+}
+
 #[test]
 fn edited_bricks_go_first_and_get_at_least_a_quarter_of_the_budget() {
-    let mut tree = slab();
+    let mut tree = striped_slab();
     let snap = tree.snapshot();
     let shape = Shape::of(&snap);
     let (mut res, mut pools) = cpu_cache(shape);
@@ -296,6 +313,7 @@ fn edited_bricks_go_first_and_get_at_least_a_quarter_of_the_budget() {
         frame: 10,
         refresh: false,
         dirty: dirty.as_slice(),
+        chunks: &[],
         view: None,
         requests: &requests,
         victims: &[],
@@ -344,6 +362,11 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         footprint_bias: 1.0,
         max_visits_per_frame: 65536,
         regrow_voxels: 16.0,
+        restart_voxels: 128.0,
+        max_expansions_per_frame: 128,
+        max_expansion_summaries_per_frame: 2048,
+        max_shrink_visits_per_frame: 4096,
+        max_collapses_per_frame: 256,
     };
     let brick = res.resident_bricks()[0];
     let pixel_angle = 0.002;
@@ -408,6 +431,11 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         footprint_bias: 1.0,
         max_visits_per_frame: 65536,
         regrow_voxels: 16.0,
+        restart_voxels: 128.0,
+        max_expansions_per_frame: 128,
+        max_expansion_summaries_per_frame: 2048,
+        max_shrink_visits_per_frame: 4096,
+        max_collapses_per_frame: 256,
     };
     let view = ViewPoint {
         eye: [3.0, 900.0, -5.0],
@@ -419,24 +447,25 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
     // A handful of records per frame: the passes add up to the whole walk.
     lod.max_visits_per_frame = 7;
     let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
     let mut union = Selection::default();
     let mut frames = 0;
     loop {
         let s = select_budgeted(
             &res,
             &mut walk,
+            &mut growth,
             &view,
             &lod,
             1.0,
             lod.max_visits_per_frame,
-            true,
         );
         union.collapse.extend(s.collapse);
         union.evict.extend(s.evict);
         union.expand.extend(s.expand);
         union.load.extend(s.load);
         frames += 1;
-        if walk.is_empty() {
+        if walk.is_empty() && !growth.is_active() {
             break;
         }
     }
@@ -447,7 +476,7 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         &mut union.expand,
         &mut union.load,
     ] {
-        // Growth runs whole every frame, so it repeats.
+        // A shrink pass that ends before growth's starts over.
         v.sort_unstable();
         v.dedup();
     }
@@ -461,6 +490,238 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         v.sort_unstable();
     }
     assert_eq!(union, want);
+}
+
+/// A growth pass the budget splits is best-first: candidates come out in
+/// order of the pixels they cover, so every frame's are worth at least as
+/// much as the next frame's, and together they are the whole walk's.
+#[test]
+fn a_split_growth_pass_finds_the_most_important_work_first() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, _pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    // A few frames on a small budget: partly refined, much left to do.
+    let mut batch = UploadBatch::default();
+    for frame in 1..=8 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 256 << 10,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+    }
+    let lod = config.lod;
+    let full = select(&res, &view, &lod);
+    assert!(full.expand.len() + full.load.len() > 10, "{full:?}");
+
+    // Levels that are always expanded come first, whatever their size.
+    let forced = ALWAYS_EXPANDED_LEVEL.min(shape.root_level());
+    let priority = |k: &NodeKey| {
+        if k.level() >= forced {
+            f32::MAX
+        } else {
+            projected_pixels(shape.origin, *k, &view)
+        }
+    };
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    let (mut expand, mut load) = (Vec::new(), Vec::new());
+    let mut floor = f32::INFINITY;
+    let mut frames = 0;
+    loop {
+        let s = select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, 5);
+        let found: Vec<f32> = s.expand.iter().chain(&s.load).map(priority).collect();
+        let best = found.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(best <= floor, "frame {frames} found {best} after {floor}");
+        floor = found.iter().copied().fold(floor, f32::min);
+        expand.extend(s.expand);
+        load.extend(s.load);
+        frames += 1;
+        if !growth.is_active() {
+            break;
+        }
+    }
+    assert!(frames > 2, "the budget split the pass");
+    for v in [&mut expand, &mut load] {
+        v.sort_unstable();
+    }
+    let (mut want_expand, mut want_load) = (full.expand, full.load);
+    want_expand.sort_unstable();
+    want_load.sort_unstable();
+    assert_eq!((expand, load), (want_expand, want_load));
+}
+
+/// A growth pass whose camera moved more than `lod.restart_voxels` starts
+/// over: its next frame finds exactly what a fresh pass from the new view
+/// finds.
+#[test]
+fn a_moving_camera_restarts_the_growth_pass() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, _pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let mut batch = UploadBatch::default();
+    for frame in 1..=8 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 256 << 10,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+    }
+    let lod = config.lod;
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, 5);
+    assert!(growth.is_active());
+
+    let moved = ViewPoint {
+        eye: [0.0, 0.0, 2.0 * lod.restart_voxels.max(lod.regrow_voxels)],
+        ..view
+    };
+    let resumed = select_budgeted(&res, &mut walk, &mut growth, &moved, &lod, 1.0, 5);
+    let fresh = select_budgeted(
+        &res,
+        &mut Vec::new(),
+        &mut GrowthState::default(),
+        &moved,
+        &lod,
+        1.0,
+        5,
+    );
+    assert_eq!((resumed.expand, resumed.load), (fresh.expand, fresh.load));
+}
+
+/// Candidates a tiny upload budget turns away are carried from frame to
+/// frame: the cache reaches the same state as with a roomy budget, and with
+/// the camera still, no frame after that finds anything left to do.
+#[test]
+fn candidates_the_budget_turns_away_are_carried_until_done() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let run = |budget: u64, frames: u32| {
+        let (mut res, mut pools) = cpu_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut late_work = 0;
+        for frame in 1..=frames {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget,
+                victim_capacity: 64,
+            };
+            let report = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if frame > frames - 5 {
+                late_work += report.loaded + report.expanded;
+            }
+        }
+        let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(res.verify(&snap, &pools.nodes, &segs, &pools.table), Ok(()));
+        let stats = res.stats();
+        (stats.bricks, stats.expanded, late_work)
+    };
+    let roomy = run(24 << 20, 40);
+    let tight = run(64 << 10, 600);
+    assert_eq!(roomy.2, 0, "the roomy run settled: {roomy:?}");
+    assert_eq!(tight.2, 0, "the tight run settled: {tight:?}");
+    assert_eq!((tight.0, tight.1), (roomy.0, roomy.1));
+}
+
+/// Once the cache has settled under a still camera, stage 1 walks nothing:
+/// no growth pass and no shrink pass, until the camera moves.
+#[test]
+fn a_still_camera_over_a_settled_cache_walks_nothing() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let mut batch = UploadBatch::default();
+    let mut frame = 0;
+    let mut step = |res: &mut world_render::internals::residency::Residency, view: ViewPoint| {
+        frame += 1;
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        let report = run_frame(res, &input, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        report
+    };
+    for _ in 0..60 {
+        step(&mut res, view);
+    }
+    for _ in 0..3 {
+        let report = step(&mut res, view);
+        assert_eq!(report.loaded + report.expanded + report.collapsed, 0);
+        assert!(res.take_walk().is_empty(), "a shrink walk is running");
+        assert!(!res.growth().is_active(), "a growth pass is running");
+    }
+    // Moving far away: the passes run again and the detail follows.
+    let moved = ViewPoint {
+        eye: [0.0, 0.0, -20000.0],
+        ..view
+    };
+    let mut work = 0;
+    for _ in 0..5 {
+        let r = step(&mut res, moved);
+        work += r.loaded + r.expanded + r.collapsed + r.evicted;
+    }
+    assert!(work > 0, "nothing followed the camera");
 }
 
 /// From the default camera, stage 1 refines the debug scene down to resident
@@ -484,6 +745,7 @@ fn stage_one_refines_the_debug_scene_from_the_default_camera() {
             frame,
             refresh: frame == 1,
             dirty: &[],
+            chunks: &[],
             view: Some(view),
             requests: &[],
             victims: &[],
@@ -530,6 +792,7 @@ fn a_full_node_pool_makes_stage_one_settle_for_less_detail() {
                 frame,
                 refresh: frame == 1,
                 dirty: &[],
+                chunks: &[],
                 view: Some(view),
                 requests: &[],
                 victims: &[],
@@ -592,6 +855,7 @@ fn stage_two_loads_what_rays_request() {
         frame: 3,
         refresh: false,
         dirty: &[],
+        chunks: &[],
         view: None,
         requests: &requests,
         victims: &[],
@@ -633,42 +897,6 @@ fn coarse_samples_carry_the_level_and_representative_material() {
         .with_view(|v| v.sample(shape.root_level(), [8, 8, 8]))
         .unwrap();
     assert_eq!(s, Sample::Air);
-}
-
-#[test]
-fn shader_constants_match_rust() {
-    let text = std::fs::read_to_string(common::assets_dir().join("shaders/common/format.wesl"))
-        .expect("format.wesl");
-    let mut found = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("const ") else {
-            continue;
-        };
-        let Some((name, value)) = rest.split_once('=') else {
-            continue;
-        };
-        let name = name.split(':').next().unwrap().trim().to_string();
-        let v = value
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .trim_end_matches('u');
-        let parsed = if let Some(hex) = v.strip_prefix("0x") {
-            u32::from_str_radix(hex, 16)
-        } else {
-            v.parse::<u32>()
-        };
-        if let Ok(n) = parsed {
-            found.insert(name, n);
-        }
-    }
-    for (name, value) in world_render::internals::shader_constants() {
-        assert_eq!(
-            found.get(name),
-            Some(&value),
-            "format.wesl: {name} should be {value:#x}"
-        );
-    }
 }
 
 #[test]

@@ -2,9 +2,10 @@
 // bindings 0 to 6), and the accessors traversal uses. A pass that imports
 // the traversal adds its own bindings from 7 up.
 
-import package::shaders::common::format::{
-    Node, BLOCK_ALIGN_WORDS, BRICK_REF_OFFSET_MASK, BRICK_REF_SEGMENT_SHIFT,
+import package::shaders::common::constants::{
+    BLOCK_ALIGN_WORDS, BRICK_REF_OFFSET_MASK, BRICK_REF_SEGMENT_SHIFT,
 };
+import package::shaders::common::format::Node;
 
 @group(0) @binding(0) var<storage, read> pool_nodes: array<Node>;
 @group(0) @binding(1) var<storage, read> pool_seg0: array<u32>;

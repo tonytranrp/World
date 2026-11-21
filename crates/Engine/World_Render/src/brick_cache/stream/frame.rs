@@ -7,14 +7,24 @@
 //! brick that does not fit is made not resident (rays then request it
 //! again), never left stale. Record rewrites caused by edits and unlinks are
 //! mandatory and always go out, whatever the budget.
+//!
+//! Work that costs CPU time per item is bounded by counts, never by the
+//! clock, so frames stay deterministic (decision 0012): changes are applied
+//! nearest first until they have computed `max_summaries_per_frame`
+//! node summaries; at most `lod.max_expansions_per_frame` nodes are
+//! expanded, and only while they have computed fewer than
+//! `lod.max_expansion_summaries_per_frame` summaries; the shrink walk takes `lod.max_shrink_visits_per_frame` records;
+//! the records of collapsed or replaced subtrees are freed
+//! `max_frees_per_frame` at a time.
+//! The rest waits for later frames.
 
-use world_core::BrickPos;
 use world_core::tree::VoxelSource;
+use world_core::{BrickPos, VoxelPos};
 
 use super::batch::UploadBatch;
 use super::key::NodeKey;
-use super::residency::{Refused, Residency};
-use super::select::{ViewPoint, distance, select_budgeted};
+use super::residency::{Change, Refused, Residency};
+use super::select::{Budgets, ViewPoint, projected_pixels, select_split};
 use crate::brick_cache::config::{BrickCacheConfig, Stage};
 use crate::brick_cache::evict::eviction_target;
 use crate::brick_cache::feedback::{Request, Victim};
@@ -55,6 +65,9 @@ pub struct FrameInput<'a, S: VoxelSource> {
     /// The world changed wholesale: drop everything and start over.
     pub refresh: bool,
     pub dirty: &'a [BrickPos],
+    /// Chunks (by any voxel inside) whose content was replaced wholesale:
+    /// loaded, unloaded, or switched between full and coarse detail.
+    pub chunks: &'a [VoxelPos],
     pub view: Option<ViewPoint>,
     pub requests: &'a [Request],
     pub victims: &'a [Victim],
@@ -77,11 +90,20 @@ pub struct FrameReport {
     pub refused_full: u32,
     /// Expansions the node pool refused.
     pub refused_nodes: u32,
+    /// Changed bricks and replaced chunks applied this frame.
+    pub changes_applied: u32,
+    /// Changes left for later frames by the summary budget.
+    pub changes_pending: u32,
+    /// Records of collapsed or replaced subtrees freed this frame.
+    pub freed: u32,
     /// Bytes of the serialized upload.
     pub upload_bytes: u64,
     /// Victims to ask the eviction pass for, if it should run.
     pub evict_target: Option<u32>,
 }
+
+/// Frames of expansion and load candidates stage 1 keeps.
+const KEEP_FRAMES: usize = 4;
 
 /// Runs one frame of streaming into `batch` (cleared first).
 pub fn run_frame<S: VoxelSource + Sync>(
@@ -111,21 +133,46 @@ pub fn run_frame<S: VoxelSource + Sync>(
     // Stage work, decided before edits so their reserve is known. Under node
     // pool pressure stage 1 asks for coarser nodes.
     let lod = &input.config.lod;
+    if input.config.stage == Stage::RayGuided {
+        // Request holds expire with time, not with the view or the table.
+        res.growth().shrink_changed();
+    }
     let selection = match input.view {
         Some(view) => {
-            let grow = res.growth().due(&view, lod.regrow_voxels);
-            let visits = if res.take_full_shrink() {
-                u32::MAX
-            } else {
+            // A pressure change's shrink pass walks at the growth budget, so
+            // its collapses land within a few frames.
+            let settling = res.settling();
+            let shrink_visits = if settling {
                 lod.max_visits_per_frame
+                    .max(lod.max_shrink_visits_per_frame)
+            } else {
+                lod.max_shrink_visits_per_frame
             };
             let mut walk = res.take_walk();
+            let mut growth = res.take_growth();
             let pressure = res.pressure();
-            let s = select_budgeted(res, &mut walk, &view, lod, pressure, visits, grow);
-            res.put_walk(walk);
-            if grow {
-                res.growth().ran(view);
+            let s = select_split(
+                res,
+                &mut walk,
+                &mut growth,
+                &view,
+                lod,
+                pressure,
+                Budgets {
+                    growth_visits: lod.max_visits_per_frame,
+                    shrink_visits,
+                    collapses: lod.max_collapses_per_frame,
+                    // A few frames' worth: more are never reached before
+                    // the next pass finds them again.
+                    keep_expand: lod.max_expansions_per_frame as usize * KEEP_FRAMES,
+                    keep_load: (budget / mean.max(1) + 1) as usize * KEEP_FRAMES,
+                },
+            );
+            if settling && walk.is_empty() {
+                res.settled();
             }
+            res.put_walk(walk);
+            res.put_growth(growth);
             s
         }
         None => Default::default(),
@@ -147,28 +194,41 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     let reserve = (loads.len() as u64 * mean).min(budget / 4 * 3);
 
-    // Edits first.
-    let mut dirty: Vec<NodeKey> = input
-        .dirty
-        .iter()
-        .filter_map(|&b| shape.brick_key(b))
-        .collect();
-    dirty.sort_unstable();
-    dirty.dedup();
-    if let Some(view) = input.view {
-        dirty.sort_by(|a, b| {
-            distance(shape.origin, *a, view.eye)
-                .total_cmp(&distance(shape.origin, *b, view.eye))
-                .then(a.cmp(b))
-        });
-    }
-    if !dirty.is_empty() {
+    // Brick encoding and a replaced chunk's summaries are split into up to
+    // this many tasks on the brick cache's task pool.
+    let threads = super::residency::pool_threads();
+    let summary_tasks = match input.config.summary_threads {
+        0 => threads,
+        n => n as usize,
+    };
+
+    // Changes first: changed bricks and replaced chunks, nearest first,
+    // while their summaries fit the budget; the rest wait.
+    let split = res.chunk_level();
+    res.queue_changes(
+        input
+            .dirty
+            .iter()
+            .filter_map(|&b| shape.brick_key(b))
+            .map(Change::Brick)
+            .chain(
+                input
+                    .chunks
+                    .iter()
+                    .filter_map(|&p| shape.local(p))
+                    .map(|local| Change::Chunk(NodeKey::containing(local, split))),
+            ),
+    );
+    let had_changes = res.pending_changes() > 0;
+    if had_changes {
         let edit_budget = budget - reserve;
         let mut spent = cost(batch);
         let (mut up, mut down) = (0, 0);
-        res.apply_edits(
+        let applied = res.apply_changes(
             source,
-            &dirty,
+            input.view.map(|v| v.eye),
+            u64::from(input.config.max_summaries_per_frame),
+            summary_tasks,
             |bytes| {
                 let fits = spent + bytes <= edit_budget;
                 if fits {
@@ -183,6 +243,8 @@ pub fn run_frame<S: VoxelSource + Sync>(
         );
         report.edited_uploaded = up;
         report.edited_unlinked = down;
+        report.changes_applied = applied.applied;
+        report.changes_pending = applied.pending;
     }
 
     // Shrinking never needs budget.
@@ -202,13 +264,33 @@ pub fn run_frame<S: VoxelSource + Sync>(
         }
     }
 
-    // Growth, by priority, while the budget lasts.
-    for k in expands {
-        if cost(batch) >= budget {
+    // Growth, by priority, while the budget lasts. An expanded node rejoins
+    // the growth pass so its children are judged; candidates the budget did
+    // not reach are carried to the next frame.
+    // Each expansion rewrites a group and summarizes its children, so their
+    // number is bounded as well as their bytes.
+    let mut attempts = 0u32;
+    let summaries_before = res.summaries_computed();
+    let max_summaries = u64::from(lod.max_expansion_summaries_per_frame);
+    for &k in &expands {
+        if cost(batch) >= budget
+            || attempts >= lod.max_expansions_per_frame
+            || res.summaries_computed() - summaries_before >= max_summaries
+        {
             break;
         }
-        match res.expand(source, k, batch) {
-            Ok(_) => report.expanded += 1,
+        let result = res.expand(source, k, batch);
+        if matches!(result, Ok(_) | Err(Refused::PoolFull)) {
+            attempts += 1;
+        }
+        match result {
+            Ok(_) => {
+                report.expanded += 1;
+                if let Some(view) = input.view {
+                    let pixels = projected_pixels(shape.origin, k, &view);
+                    res.growth().rejoin(k, pixels);
+                }
+            }
             Err(Refused::PoolFull) => {
                 report.refused_full += 1;
                 report.refused_nodes += 1;
@@ -220,7 +302,6 @@ pub fn run_frame<S: VoxelSource + Sync>(
     if cost(batch) < budget && !loads.is_empty() {
         let room = (budget - cost(batch)) / mean.max(1) + 1;
         let take = loads.len().min((room as usize).saturating_mul(5) / 4 + 8);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8));
         let (loaded, full) =
             res.load_bricks(source, &loads[..take], threads, |b| cost(b) < budget, batch);
         report.loaded += loaded;
@@ -229,8 +310,18 @@ pub fn run_frame<S: VoxelSource + Sync>(
         }
     }
 
-    report.upload_bytes = cost(batch);
+    // Everything not done yet: the next frame checks each again and drops
+    // what has since been expanded or loaded (or is no longer wanted).
     if input.config.stage == Stage::Distance {
+        res.growth().carry(&expands, &loads);
+    }
+
+    // Subtrees collapsed or replaced, freed a bounded number of records at
+    // a time.
+    report.freed = res.free_buried(input.config.max_frees_per_frame, batch);
+    report.upload_bytes = cost(batch);
+    // The pressure holds while the shrink pass its last change started runs.
+    if input.config.stage == Stage::Distance && !res.settling() {
         let before = res.pressure();
         let since = input.frame.wrapping_sub(res.pressure_raised_at());
         let after = adapt_pressure(before, res.node_fill(), report.refused_nodes > 0, since);
@@ -244,10 +335,8 @@ pub fn run_frame<S: VoxelSource + Sync>(
     }
     // Anything that changed the table can change what growth finds; edits
     // rewrite records even when no brick is uploaded.
-    if !dirty.is_empty()
-        || report.loaded
-            + report.expanded
-            + report.collapsed
+    if report.changes_applied > 0
+        || report.collapsed
             + report.evicted
             + report.victims_applied
             + report.edited_uploaded

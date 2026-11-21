@@ -28,12 +28,18 @@
 //! | words | content |
 //! |-------|---------|
 //! | 0 | brick id (index into the brick table) |
-//! | 1 | `n \| palette_words << 8 \| flags << 24` |
+//! | 1 | `p \| palette_words << 8 \| flags << 24` |
 //! | 2 | representative material |
-//! | 3 | reserved (zero) |
-//! | 4 .. 4+2n | `leaf_mask[n]`: lo, hi word per non-air leaf, in slot order |
-//! | 4+2n .. 4+3n | `payload[n]`: bit 31 set: the leaf's solid voxels are all material `payload & 0xFFFF`; else the word offset from the block start to the leaf's palette block |
-//! | 4+3n .. | palette blocks (`palette_words` words), then zero padding to 16 bytes |
+//! | 3 | default material: the most common material of the brick's full one-material leaves, ties to the lower id; air when it has none |
+//! | 4, 5 | default mask `D`: the leaves that are full of the default material; they have no words |
+//! | 6, 7 | full mask `F`: every other leaf that is full of one material; it has a payload and no leaf mask |
+//! | 8 .. 8+2p | `leaf_mask[p]`: lo, hi word per partial leaf (`P = mask & !D & !F`), in slot order |
+//! | 8+2p .. 8+2p+s | `payload[s]` per stored leaf (`S = mask & !D`), in slot order: bit 31 set: the leaf's solid voxels are all material `payload & 0xFFFF`; else the word offset from the block start to the leaf's palette block |
+//! | 8+2p+s .. | palette blocks (`palette_words` words), then zero padding to 16 bytes |
+//!
+//! So leaf `i` of a brick is the default material when `D` has it; else its
+//! payload is `payload[rank(S, i)]`, and its leaf mask is all ones when `F`
+//! has it and `leaf_mask[rank(P, i)]` otherwise (decision 0021).
 //!
 //! A palette block (decision 0005): header `p | b << 8` (`p` materials, `b`
 //! bits per index, the smallest of 1, 2, 4, 8 with `2^b >= p`), then the
@@ -82,8 +88,14 @@ pub const MAX_SEGMENTS: u32 = 4;
 pub const BLOCK_ALIGN_WORDS: u32 = 4;
 
 /// Words in a brick block header.
-pub const BLOCK_HEADER_WORDS: u32 = 4;
-/// Header word 1: mask of the leaf count.
+pub const BLOCK_HEADER_WORDS: u32 = 8;
+/// Header word holding the default material.
+pub const BLOCK_DEFAULT_WORD: u32 = 3;
+/// First of the two header words of the default mask (low word first).
+pub const BLOCK_DEFAULT_MASK_WORD: u32 = 4;
+/// First of the two header words of the full mask (low word first).
+pub const BLOCK_FULL_MASK_WORD: u32 = 6;
+/// Header word 1: mask of the partial leaf count.
 pub const BLOCK_COUNT_MASK: u32 = 0xFF;
 /// Header word 1: shift of the palette word count.
 pub const BLOCK_PALETTE_WORDS_SHIFT: u32 = 8;
@@ -243,7 +255,8 @@ pub const fn rank(mask: u64, slot: u32) -> u32 {
     (mask & ((1u64 << slot) - 1)).count_ones()
 }
 
-/// Every format constant with its name, as the WESL mirror must declare it.
+/// Every format constant with its name, as `cargo xtask codegen` writes it
+/// to `assets/shaders/common/constants.wesl`.
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("NODE_WORDS", NODE_WORDS),
     ("ROOT_NODE", ROOT_NODE),
@@ -260,6 +273,9 @@ pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("MAX_SEGMENTS", MAX_SEGMENTS),
     ("BLOCK_ALIGN_WORDS", BLOCK_ALIGN_WORDS),
     ("BLOCK_HEADER_WORDS", BLOCK_HEADER_WORDS),
+    ("BLOCK_DEFAULT_WORD", BLOCK_DEFAULT_WORD),
+    ("BLOCK_DEFAULT_MASK_WORD", BLOCK_DEFAULT_MASK_WORD),
+    ("BLOCK_FULL_MASK_WORD", BLOCK_FULL_MASK_WORD),
     ("BLOCK_COUNT_MASK", BLOCK_COUNT_MASK),
     ("BLOCK_PALETTE_WORDS_SHIFT", BLOCK_PALETTE_WORDS_SHIFT),
     ("BLOCK_PALETTE_WORDS_MASK", BLOCK_PALETTE_WORDS_MASK),

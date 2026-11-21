@@ -9,11 +9,12 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroupLayoutDescriptor, CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::renderer::{FlushCommands, RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::ExtractedView;
 
 use crate::brick_cache::render::{BrickCacheState, ExtractedCacheConfig, VOXELS_PER_METER};
 use crate::gbuffer::HIT_WORDS;
+use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::tier::RenderTier;
 use trace::{
     DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, record_trace, trace_bind_group,
@@ -42,7 +43,7 @@ pub fn init_trace_pipeline(
         shader: assets.load(TRACE_SHADER_PATH),
         shader_defs: Vec::new(),
         entry_point: Some("trace".into()),
-        zero_initialize_workgroup_memory: true,
+        zero_initialize_workgroup_memory: trace::ZERO_INIT_WORKGROUP_MEMORY,
         constants: Vec::new(),
     });
     commands.insert_resource(TracePipeline { layout, id });
@@ -169,25 +170,57 @@ pub fn prepare_view_targets(
     }
 }
 
-/// Traces the view (Core3d, after the opaque pass).
+/// Traces the view (Core3d, after the opaque pass). The first view of a
+/// frame is timed (see `gpu_timing`).
 pub fn voxel_trace(
     view: ViewQuery<&VoxelViewTargets>,
     pipeline: Option<Res<TracePipeline>>,
     cache: Res<PipelineCache>,
+    timer: Option<ResMut<GpuPassTimer>>,
+    sampled: Option<ResMut<SampledPassTimer>>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut flush: FlushCommands,
     mut ctx: RenderContext,
 ) {
     let targets = view.into_inner();
     let Some(pipeline) = pipeline.and_then(|p| cache.get_compute_pipeline(p.id)) else {
         return;
     };
-    record_trace(
-        ctx.command_encoder(),
-        pipeline,
-        &targets.bind_group,
-        targets.size.x,
-        targets.size.y,
-        None,
-    );
+    let (width, height) = (targets.size.x, targets.size.y);
+    match sampled {
+        Some(mut sampled) if sampled.wants(TimedPass::Trace) => {
+            let device = device.wgpu_device();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("primary.trace"),
+            });
+            record_trace(
+                &mut encoder,
+                pipeline,
+                &targets.bind_group,
+                width,
+                height,
+                None,
+            );
+            sampled.time_alone(TimedPass::Trace, device, &queue, || flush.flush(), encoder);
+            sampled.read_rays(device, &queue, &targets.hits);
+        }
+        _ => {
+            let mut timer = timer;
+            let writes = timer
+                .as_deref_mut()
+                .and_then(|t| t.compute_writes(TimedPass::Trace));
+            let encoder = ctx.command_encoder();
+            record_trace(
+                encoder,
+                pipeline,
+                &targets.bind_group,
+                width,
+                height,
+                writes,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

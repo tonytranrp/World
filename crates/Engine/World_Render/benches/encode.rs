@@ -6,10 +6,16 @@
 //! - `alloc`: brick space allocate/free churn and node group churn, the
 //!   bookkeeping of every upload and eviction.
 //! - `residency`: making a whole scene resident (expand + load), the work
-//!   of the first frames and of a fast camera turn.
+//!   of the first frames and of a fast camera turn; and `expand_churn`,
+//!   collapsing and expanding again nodes whose summaries are cached, the
+//!   table work of the refined band a walk moves every frame.
 //!
 //! - `load_bricks`: loading every brick of the terrain into pools, with the
 //!   encoder on 1 and on 8 threads, the path a frame takes.
+//! - `changes`: applying one replaced chunk (a generated surface chunk with
+//!   caves, and a coarse one), the work the residency hands the cache each
+//!   time it swaps a chunk; bounded per frame by
+//!   `max_summaries_per_frame`.
 //!
 //! Deterministic input.
 
@@ -184,6 +190,59 @@ fn residency(c: &mut Criterion) {
             })
         });
     }
+    // Collapsing and expanding again every expanded level-2 and level-3 node
+    // of the terrain, its summaries cached: the table work of the nodes a
+    // walk refines and coarsens each frame.
+    let tree = terrain();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = PoolLayout {
+        node_count: 1 << 20,
+        segments: vec![256 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 18,
+        upload_budget: 1 << 30,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let mut res = Residency::new(shape, &layout).unwrap();
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    loop {
+        let todo: Vec<NodeKey> = res
+            .keys()
+            .into_iter()
+            .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+            .collect();
+        if todo.is_empty() {
+            break;
+        }
+        for k in todo {
+            let _ = res.expand(&snap, k, &mut batch);
+        }
+    }
+    let mut churn: Vec<NodeKey> = res
+        .keys()
+        .into_iter()
+        .filter(|k| (2..=3).contains(&k.level) && res.is_expanded(*k))
+        .collect();
+    churn.sort_unstable();
+    group.throughput(Throughput::Elements(churn.len() as u64));
+    group.bench_function("expand_churn/terrain", |b| {
+        b.iter(|| {
+            batch.clear();
+            // Level 3 first, then the level-2 children it expands again.
+            for &k in churn.iter().rev() {
+                let _ = res.collapse(k, &mut batch);
+            }
+            res.free_buried(u32::MAX, &mut batch);
+            for &k in churn.iter().rev() {
+                let _ = res.expand(&snap, k, &mut batch);
+            }
+            batch.data_bytes()
+        })
+    });
     group.finish();
 }
 
@@ -248,6 +307,85 @@ fn load_bricks(c: &mut Criterion) {
     group.finish();
 }
 
+fn changes(c: &mut Criterion) {
+    use criterion::BatchSize;
+    use world_core::tree::CHUNK_LEVEL;
+    use world_gen::{ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
+    use world_render::internals::residency::Change;
+    use world_render::internals::summaries::ChunkSummaries;
+    let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
+        .expect("the default config is valid");
+    // The chunk holding the surface in the middle of a central column.
+    let probe = ChunkCoord::new(512, 0, 512).unwrap().min_voxel();
+    let (x, z) = (probe.x + 512, probe.z + 512);
+    let height = generator.column(x, z).unwrap().height;
+    let coord = ChunkCoord::containing(VoxelPos::new(x, height, z)).unwrap();
+    let min = coord.min_voxel();
+    let full = {
+        let mut t = VoxelTree::new();
+        t.build_region(CHUNK_LEVEL, min, &generator.chunk_source(coord))
+            .unwrap();
+        t
+    };
+    let coarse = {
+        let columns = generator.coarse_columns(coord, 2).unwrap();
+        let mut t = VoxelTree::new();
+        t.build_region(CHUNK_LEVEL, min, &CoarseSource::new(columns))
+            .unwrap();
+        t
+    };
+    let layout = PoolLayout {
+        node_count: 1 << 20,
+        segments: vec![256 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 18,
+        upload_budget: 1 << 30,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let mut group = c.benchmark_group("changes");
+    group.sample_size(20);
+    for (name, tree) in [("surface_chunk", &full), ("coarse_chunk", &coarse)] {
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let mut res = Residency::new(shape, &layout).unwrap();
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        // Expand the path down to the chunk, as stage 1 keeps it.
+        let key = NodeKey::containing(shape.local(min).unwrap(), CHUNK_LEVEL);
+        for level in (CHUNK_LEVEL + 1..=shape.root_level()).rev() {
+            let _ = res.expand(&snap, key.ancestor(level), &mut batch);
+        }
+        let mut apply = |res: &mut Residency| {
+            batch.clear();
+            res.queue_changes([Change::Chunk(key)]);
+            res.apply_changes(&snap, None, u64::MAX, 8, |_| true, &mut batch)
+        };
+        let once = apply(&mut res);
+        eprintln!("changes/{name}: {} summaries per change", once.summarized);
+        group.throughput(Throughput::Elements(once.summarized));
+        group.bench_function(name, |b| b.iter(|| apply(&mut res)));
+        // The same change with the summaries computed where the chunk was
+        // built (decision 0022): the render thread only inserts them.
+        let offer = ChunkSummaries::compute(min, &tree.chunk_data(min).unwrap()).unwrap();
+        group.bench_function(format!("{name}_offered"), |b| {
+            b.iter_batched(
+                || offer.clone(),
+                |offer| {
+                    res.offer_summaries([offer]);
+                    apply(&mut res)
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        group.bench_function(format!("{name}_summaries_on_worker"), |b| {
+            b.iter(|| ChunkSummaries::compute(min, &tree.chunk_data(min).unwrap()))
+        });
+    }
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(std::time::Duration::from_millis(500))
@@ -257,6 +395,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = encode, allocators, residency, load_bricks
+    targets = encode, allocators, residency, load_bricks, changes
 }
 criterion_main!(benches);

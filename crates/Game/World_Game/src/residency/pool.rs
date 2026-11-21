@@ -12,9 +12,11 @@ use std::thread::JoinHandle;
 
 use world_core::serialize::region::RecordKind;
 use world_core::tree::ChunkData;
-use world_gen::{ChunkCoord, Generator};
+use world_gen::ChunkCoord;
+use world_render::prelude::ChunkSummaries;
 
-use super::jobs::{self, WarmChunk};
+use super::columns::ColumnCache;
+use super::jobs::{self, Generators, LoadSource, WarmChunk};
 use super::store::{RegionStore, SavedChunk};
 
 /// What the main thread asks for.
@@ -26,14 +28,27 @@ pub enum Request {
         warm: Option<WarmChunk>,
         saved: bool,
     },
-    /// Encode an edited chunk and write it to its region file.
-    Save { coord: ChunkCoord, data: ChunkData },
+    /// Encode an edited chunk and write it to its region file. With
+    /// `set_aside`, the chunk's current records are copied aside first (one
+    /// of them could not be loaded), and nothing is written if that fails.
+    Save {
+        coord: ChunkCoord,
+        data: ChunkData,
+        set_aside: bool,
+    },
     /// Build a coarse chunk column; `edited` lists its chunks that have
     /// saved coarse summaries.
     Coarse {
         x: u32,
         z: u32,
         edited: Vec<ChunkCoord>,
+    },
+    /// Compress an unchanged chunk for the warm cache; `ticket` comes back
+    /// with the result.
+    Compress {
+        coord: ChunkCoord,
+        data: ChunkData,
+        ticket: u64,
     },
 }
 
@@ -42,27 +57,59 @@ pub enum Done {
     Loaded {
         coord: ChunkCoord,
         data: ChunkData,
-        edited: bool,
+        /// The renderer's summaries of its nodes, computed here so the
+        /// render thread need not (decision 0022); `None` for air or one
+        /// material.
+        summaries: Option<ChunkSummaries>,
+        refused: bool,
         error: Option<String>,
+        source: LoadSource,
+        /// How long the worker spent on it, in microseconds.
+        micros: u64,
+        /// The lowest and highest column of its footprint, when learned.
+        heights: Option<(i32, i32)>,
+        /// Generated as one material without building.
+        uniform: bool,
     },
     Saved {
         coord: ChunkCoord,
         warm: WarmChunk,
+        /// The new coarse summary of the chunk.
+        coarse: Option<ChunkData>,
         error: Option<String>,
     },
     Coarse {
         x: u32,
         z: u32,
-        chunks: Vec<(ChunkCoord, ChunkData)>,
+        /// Each chunk with the renderer's summaries of its nodes.
+        chunks: Vec<(ChunkCoord, ChunkData, Option<ChunkSummaries>)>,
+        /// The lowest and highest coarse sample of the column's footprint
+        /// (the true columns may reach a little beyond).
+        heights: Option<(i32, i32)>,
+    },
+    Compressed {
+        coord: ChunkCoord,
+        warm: WarmChunk,
+        ticket: u64,
     },
 }
 
 /// Settings shared by every thread.
 #[derive(Clone)]
 pub struct Shared {
-    pub generator: Arc<Generator>,
-    pub generator_version: u32,
+    pub generators: Arc<Generators>,
     pub coarse_level: u32,
+    /// Column footprints shared by the workers.
+    pub columns: Arc<ColumnCache>,
+}
+
+/// An encoded chunk on its way to the I/O thread.
+struct Write {
+    coord: ChunkCoord,
+    records: Vec<SavedChunk>,
+    warm: WarmChunk,
+    coarse: Option<ChunkData>,
+    set_aside: bool,
 }
 
 enum IoJob {
@@ -71,13 +118,19 @@ enum IoJob {
     Stop,
     ReadForLoad(ChunkCoord),
     ReadForCoarse(u32, u32, Vec<ChunkCoord>),
-    Write(ChunkCoord, Vec<SavedChunk>, WarmChunk),
+    Write(Write),
 }
 
 enum WorkJob {
-    Load(ChunkCoord, Option<WarmChunk>, Vec<SavedChunk>),
-    Save(ChunkCoord, ChunkData),
+    /// The chunk's saved records, or why its region file could not be read.
+    Load(
+        ChunkCoord,
+        Option<WarmChunk>,
+        Result<Vec<SavedChunk>, String>,
+    ),
+    Save(ChunkCoord, ChunkData, bool),
     Coarse(u32, u32, Vec<(ChunkCoord, SavedChunk)>),
+    Compress(ChunkCoord, ChunkData, u64),
 }
 
 /// The I/O thread and the workers.
@@ -165,20 +218,27 @@ impl Pool {
                         let records = if saved && warm.is_none() {
                             read_saved(store, coord)
                         } else {
-                            Vec::new()
+                            Ok(Vec::new())
                         };
                         WorkJob::Load(coord, warm, records)
                     }
-                    Request::Save { coord, data } => WorkJob::Save(coord, data),
+                    Request::Save {
+                        coord,
+                        data,
+                        set_aside,
+                    } => WorkJob::Save(coord, data, set_aside),
                     Request::Coarse { x, z, edited } => {
                         WorkJob::Coarse(x, z, read_coarse(store, &edited, shared.coarse_level))
                     }
+                    Request::Compress {
+                        coord,
+                        data,
+                        ticket,
+                    } => WorkJob::Compress(coord, data, ticket),
                 };
                 match run(&shared, job) {
                     Ran::Done(d) => done.push(d),
-                    Ran::Write(coord, records, warm) => {
-                        done.push(write(store, coord, records, warm))
-                    }
+                    Ran::Write(w) => done.push(write(store, w)),
                 }
             }
             Mode::Threads { io, work, .. } => {
@@ -192,16 +252,25 @@ impl Pool {
                     Request::Load { coord, warm, saved } if saved && warm.is_none() => {
                         io.send(IoJob::ReadForLoad(coord)).is_ok()
                     }
-                    Request::Load { coord, warm, .. } => {
-                        work.send(WorkJob::Load(coord, warm, Vec::new())).is_ok()
-                    }
-                    Request::Save { coord, data } => work.send(WorkJob::Save(coord, data)).is_ok(),
+                    Request::Load { coord, warm, .. } => work
+                        .send(WorkJob::Load(coord, warm, Ok(Vec::new())))
+                        .is_ok(),
+                    Request::Save {
+                        coord,
+                        data,
+                        set_aside,
+                    } => work.send(WorkJob::Save(coord, data, set_aside)).is_ok(),
                     Request::Coarse { x, z, edited } if !edited.is_empty() => {
                         io.send(IoJob::ReadForCoarse(x, z, edited)).is_ok()
                     }
                     Request::Coarse { x, z, .. } => {
                         work.send(WorkJob::Coarse(x, z, Vec::new())).is_ok()
                     }
+                    Request::Compress {
+                        coord,
+                        data,
+                        ticket,
+                    } => work.send(WorkJob::Compress(coord, data, ticket)).is_ok(),
                 };
             }
         }
@@ -262,10 +331,10 @@ impl Drop for Pool {
     }
 }
 
-fn read_saved(store: &RegionStore, coord: ChunkCoord) -> Vec<SavedChunk> {
+fn read_saved(store: &RegionStore, coord: ChunkCoord) -> Result<Vec<SavedChunk>, String> {
     store
         .read(coord, &[RecordKind::Full, RecordKind::Overlay])
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
 }
 
 fn read_coarse(
@@ -282,52 +351,98 @@ fn read_coarse(
         .collect()
 }
 
-fn write(
-    store: &RegionStore,
-    coord: ChunkCoord,
-    records: Vec<SavedChunk>,
-    warm: WarmChunk,
-) -> Done {
-    let error = store.write(coord, records).err().map(|e| e.to_string());
-    Done::Saved { coord, warm, error }
+fn write(store: &RegionStore, w: Write) -> Done {
+    let set_aside = if w.set_aside {
+        store.set_aside(w.coord).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let error = set_aside
+        .and_then(|()| store.write(w.coord, w.records))
+        .err()
+        .map(|e| e.to_string());
+    Done::Saved {
+        coord: w.coord,
+        warm: w.warm,
+        coarse: w.coarse,
+        error,
+    }
 }
 
 enum Ran {
     Done(Done),
-    Write(ChunkCoord, Vec<SavedChunk>, WarmChunk),
+    Write(Write),
 }
 
 fn run(shared: &Shared, job: WorkJob) -> Ran {
     match job {
         WorkJob::Load(coord, warm, saved) => {
-            let loaded = jobs::load(
-                &shared.generator,
-                shared.generator_version,
-                coord,
-                warm.as_ref(),
-                &saved,
-            );
+            let start = std::time::Instant::now();
+            let loaded = match &saved {
+                Ok(saved) => jobs::load(
+                    &shared.generators,
+                    &shared.columns,
+                    coord,
+                    warm.as_ref(),
+                    saved,
+                ),
+                Err(e) => jobs::unreadable(&shared.generators, &shared.columns, coord, e),
+            };
+            let summaries = ChunkSummaries::compute(coord.min_voxel(), &loaded.data);
             Ran::Done(Done::Loaded {
                 coord,
+                summaries,
                 data: loaded.data,
-                edited: loaded.edited,
+                refused: loaded.refused,
                 error: loaded.error,
+                source: loaded.source,
+                micros: start.elapsed().as_micros() as u64,
+                heights: loaded.heights,
+                uniform: loaded.uniform,
             })
         }
-        WorkJob::Save(coord, data) => {
+        WorkJob::Save(coord, data, set_aside) => {
             let e = jobs::encode_chunk(
-                &shared.generator,
-                shared.generator_version,
+                &shared.generators,
+                &shared.columns,
                 coord,
                 data,
                 shared.coarse_level,
             );
-            Ran::Write(coord, e.records, e.warm)
+            Ran::Write(Write {
+                coord,
+                records: e.records,
+                warm: e.warm,
+                coarse: e.coarse,
+                set_aside,
+            })
         }
-        WorkJob::Coarse(x, z, saved) => Ran::Done(Done::Coarse {
-            x,
-            z,
-            chunks: jobs::coarse_column(&shared.generator, x, z, shared.coarse_level, &saved),
+        WorkJob::Coarse(x, z, saved) => {
+            let (chunks, heights) = jobs::coarse_column(
+                shared.generators.current(),
+                x,
+                z,
+                shared.coarse_level,
+                &saved,
+            );
+            let chunks = chunks
+                .into_iter()
+                .map(|(coord, data)| {
+                    let summaries = ChunkSummaries::compute(coord.min_voxel(), &data);
+                    (coord, data, summaries)
+                })
+                .collect();
+            Ran::Done(Done::Coarse {
+                x,
+                z,
+                chunks,
+                heights,
+            })
+        }
+        WorkJob::Compress(coord, data, ticket) => Ran::Done(Done::Compressed {
+            coord,
+            warm: jobs::compress(coord, data),
+            ticket,
         }),
     }
 }
@@ -349,8 +464,8 @@ fn io_loop(
                 let saved = read_coarse(store, &edited, coarse_level);
                 let _ = work.send(WorkJob::Coarse(x, z, saved));
             }
-            IoJob::Write(coord, records, warm) => {
-                let _ = done.send(write(store, coord, records, warm));
+            IoJob::Write(w) => {
+                let _ = done.send(write(store, w));
             }
         }
     }
@@ -378,8 +493,8 @@ fn work_loop(
                     return;
                 }
             }
-            Ran::Write(coord, records, warm) => {
-                if io.send(IoJob::Write(coord, records, warm)).is_err() {
+            Ran::Write(w) => {
+                if io.send(IoJob::Write(w)).is_err() {
                     return;
                 }
             }

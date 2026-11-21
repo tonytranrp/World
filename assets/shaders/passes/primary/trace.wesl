@@ -1,7 +1,7 @@
 // Primary rays: one per pixel, 8x8 workgroups, written as integer hit
 // records (layout in world_render's `gbuffer` module).
 
-import package::shaders::common::format::{HIT_WORDS, HIT_FLAG_HIT};
+import package::shaders::common::constants::{HIT_WORDS, HIT_FLAG_HIT};
 import package::shaders::traversal::tree::{TraceSettings, cast_ray};
 
 struct TraceParams {

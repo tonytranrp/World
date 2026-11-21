@@ -19,6 +19,14 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 4096;
 pub const MODE_CAMERA: u32 = 0;
 /// `mode`: rays read from the hit buffer (tests).
 pub const MODE_RAYS: u32 = 1;
+/// Whether the trace pipeline asks wgpu to zero its workgroup memory before
+/// each workgroup runs. It does not need to: every slot of the ancestor stack
+/// (`trace_stack` in `traversal/tree.wesl`) is written before it is read, from
+/// the root down to the level the descent stops at, and a ray restarts no
+/// lower than that level. Zeroing the 2.5 KiB stack made the trace 2.6 times
+/// slower on Metal (Radeon Pro 5300M: 21.7 against 8.3 ms at 1280x720). The
+/// game and the GPU tests both build the pipeline with this value.
+pub const ZERO_INIT_WORKGROUP_MEMORY: bool = false;
 
 /// The trace pass's uniform block. Every field is 16-byte aligned as WGSL
 /// uniform layout requires.

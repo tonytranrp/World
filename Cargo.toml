@@ -49,6 +49,10 @@ offset-allocator = "=0.2.0"
 # shaders on a bare wgpu device. Keep the exact version Bevy resolves.
 wesl = "=0.6.0"
 
+# macOS: keeps fixed-length measurement runs out of App Nap. Already in the
+# lockfile through winit; keep the version it resolves.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+
 # Developer tools, only in dev builds
 bevy_egui = { version = "0.43.1", default-features = false, features = ["render", "default_fonts"] }
 bevy-inspector-egui = { version = "0.38.0", default-features = false, features = ["bevy_render"] }

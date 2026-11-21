@@ -7,10 +7,16 @@
 //! player. Edits go through [`StreamedWorld::apply`] and
 //! [`StreamedWorld::fill_box`]: they are logged first, applied at once where
 //! their chunk is loaded and kept until it loads everywhere else.
+//!
+//! When the edit log grows past `log_checkpoint_kib`, a checkpoint writes
+//! every chunk with unsaved edits to its region file without stopping the
+//! game, then restarts the log from a `Checkpoint` record followed by what is
+//! still only in the log: the edits waiting for unloaded chunks and every
+//! record logged while the checkpoint ran.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use world_core::coords::BrickPos;
@@ -20,17 +26,23 @@ use world_core::tree::{CHUNK_LEVEL, ChunkData, TreeSnapshot};
 use world_core::{Edit, EditError, MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_gen::{CHUNK_SIZE, ChunkCoord, Generator, GeneratorVersion, TerrainConfig};
 
+use super::columns::ColumnCache;
 use super::config::ResidencyConfig;
-use super::jobs::WarmChunk;
-use super::plan;
+use super::jobs::{Generators, LoadSource, WarmChunk};
+use super::plan::{self, Heights, Motion};
 use super::pool::{Done, Pool, Request, Shared};
 use super::store::RegionStore;
+use super::warm::Warm;
+use world_render::prelude::ChunkSummaries;
 
 /// What one loaded chunk is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ChunkState {
-    /// Differs from the generated terrain, so it must be saved on eviction.
+    /// Holds changes that are not in its region file yet, so it must be
+    /// saved before it is dropped.
     edited: bool,
+    /// Bytes its pages hold, kept up to date so the hot cap needs no walk.
+    bytes: usize,
 }
 
 /// A logged edit waiting for its chunk to load.
@@ -40,14 +52,41 @@ enum PendingEdit {
     Fill(VoxelBox, MaterialId),
 }
 
+/// One chunk's region file write, from submission until it lands.
+#[derive(Default)]
+struct Write {
+    /// The evicted content and its bytes, kept until it is written so the
+    /// renderer still draws it and a quick return rejoins it. `None` while
+    /// the chunk is loaded (or about to join).
+    held: Option<(ChunkData, usize)>,
+    /// A write is in flight.
+    in_flight: bool,
+    /// Newer content to write once the one in flight lands; one write per
+    /// chunk at a time keeps the region file from going back in time.
+    next: Option<ChunkData>,
+}
+
+/// A checkpoint of the edit log in progress.
+struct Checkpoint {
+    sequence: u64,
+    /// Chunks whose writes must land before the log can restart.
+    waiting: BTreeSet<ChunkCoord>,
+    /// The edits waiting for unloaded chunks when it started, which are
+    /// only in the log.
+    relog: Vec<WalRecord>,
+    /// Everything logged since it started.
+    tail: Vec<WalRecord>,
+}
+
 /// What changed in the world since the renderer last asked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldChanges {
-    /// Bricks of the render tree whose content changed: edited bricks, and
-    /// one brick of every chunk that was swapped (loaded, unloaded, or
-    /// switched between full and coarse), which makes the GPU cache rebuild
-    /// that region from the snapshot.
+    /// Bricks of the render tree whose content changed by edits.
     pub render_bricks: Vec<BrickPos>,
+    /// The lowest voxel of every chunk of the render tree that was swapped
+    /// (loaded, unloaded, or switched between full and coarse), which makes
+    /// the GPU cache rebuild that region from the snapshot.
+    pub render_chunks: Vec<VoxelPos>,
     /// Bricks edited in loaded chunks.
     pub bricks: Vec<BrickPos>,
     /// Chunks that joined the tree (every brick of them is new).
@@ -64,47 +103,62 @@ pub struct ResidencyStats {
     pub loaded: usize,
     pub edited: usize,
     pub loading: usize,
+    /// Chunks with a region file write in flight or waiting.
     pub saving: usize,
+    /// Bytes of evicted chunks held until their writes land; they count
+    /// toward the hot cap.
+    pub saving_bytes: usize,
     pub pending_chunks: usize,
+    /// Loaded chunks waiting for a graft slot, and their bytes.
+    pub ready: usize,
+    pub ready_bytes: usize,
+    /// Bytes of the loaded chunks.
     pub hot_bytes: usize,
     pub warm_chunks: usize,
+    /// Of those, the ones holding saved edits.
+    pub warm_edited: usize,
     pub warm_bytes: usize,
+    /// Unchanged chunks waiting to be compressed for the warm cache or
+    /// being compressed.
+    pub compressing: usize,
+    /// Bytes of the chunks waiting to be compressed; they count toward the
+    /// hot cap.
+    pub compressing_bytes: usize,
     pub coarse_columns: usize,
     pub coarse_bytes: usize,
     pub saved_chunks: usize,
-}
-
-/// Compressed edited chunks kept in RAM after eviction, least recently used
-/// first out.
-#[derive(Default)]
-struct Warm {
-    entries: BTreeMap<ChunkCoord, (u64, WarmChunk)>,
-    bytes: usize,
-    tick: u64,
-}
-
-impl Warm {
-    fn insert(&mut self, coord: ChunkCoord, chunk: WarmChunk, cap: usize) {
-        self.tick += 1;
-        self.bytes += chunk.size();
-        if let Some((_, old)) = self.entries.insert(coord, (self.tick, chunk)) {
-            self.bytes -= old.size();
-        }
-        while self.bytes > cap {
-            let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, (t, _))| *t) else {
-                break;
-            };
-            if let Some((_, old)) = self.entries.remove(&oldest) {
-                self.bytes -= old.size();
-            }
-        }
-    }
-
-    fn take(&mut self, coord: ChunkCoord) -> Option<WarmChunk> {
-        let (_, chunk) = self.entries.remove(&coord)?;
-        self.bytes -= chunk.size();
-        Some(chunk)
-    }
+    /// Chunk writes submitted since the world opened.
+    pub writes: usize,
+    /// Edit log checkpoints completed since the world opened.
+    pub checkpoints: usize,
+    /// Bytes in the edit log.
+    pub log_bytes: u64,
+    /// Chunks within the full-detail radius that were not loaded at the last
+    /// update.
+    pub holes: usize,
+    /// Of those, the ones ahead of the player's motion.
+    pub holes_ahead: usize,
+    /// `holes` and `holes_ahead` summed over every update, and the number
+    /// of updates, for averages over an interval.
+    pub hole_sum: u64,
+    pub hole_ahead_sum: u64,
+    pub updates: u64,
+    /// Chunk loads since the world opened, by where their content came from.
+    pub generated: usize,
+    pub warm_hits: usize,
+    pub disk_loads: usize,
+    /// Worker time spent on generated loads since the world opened, in
+    /// microseconds, and the longest one.
+    pub generated_micros: u64,
+    pub generated_max_micros: u64,
+    /// Of the generated loads, those proven one material (air above the
+    /// terrain, bedrock below the caves) and not built.
+    pub uniform_loads: usize,
+    /// Column footprints served by the shared cache, and computed.
+    pub column_hits: u64,
+    pub column_misses: u64,
+    /// Bytes of the computed footprints the cache holds.
+    pub column_bytes: usize,
 }
 
 const MIB: usize = 1 << 20;
@@ -116,29 +170,99 @@ pub struct StreamedWorld {
     tree: VoxelTree,
     coarse: VoxelTree,
     /// What the renderer draws: the loaded chunks of `tree` (shared, not
-    /// copied) and, where those are not loaded, the coarse chunks.
+    /// copied), evicted chunks still being written, and elsewhere the coarse
+    /// chunks.
     render: VoxelTree,
     /// The coarse chunks by coordinate, to fill the render tree.
     coarse_chunks: BTreeMap<ChunkCoord, ChunkData>,
     loaded: BTreeMap<ChunkCoord, ChunkState>,
+    /// Sum of `bytes` over `loaded`.
+    hot_bytes: usize,
     loading: BTreeSet<ChunkCoord>,
-    /// Edited chunks evicted and not yet written, with their content, so a
-    /// quick return reloads them from here.
-    saving: BTreeMap<ChunkCoord, ChunkData>,
-    /// Loaded chunks waiting for a graft slot.
-    ready: VecDeque<(ChunkCoord, ChunkData, bool)>,
+    /// Region file writes by chunk. A chunk with an entry is never read
+    /// from disk: its newest content is loaded, joining, or held here.
+    writes: BTreeMap<ChunkCoord, Write>,
+    /// Sum of the held bytes in `writes`.
+    held_bytes: usize,
+    /// Loaded chunks waiting for a graft slot, whether they hold changes
+    /// that may not be on disk, and their summaries for the renderer when
+    /// a worker computed them.
+    ready: VecDeque<(ChunkCoord, ChunkData, bool, Option<ChunkSummaries>)>,
     pending: BTreeMap<ChunkCoord, Vec<PendingEdit>>,
     /// Chunks with records in region files.
     saved: BTreeSet<ChunkCoord>,
+    /// Chunks with a saved record that could not be loaded; it is set aside
+    /// before the chunk is written.
+    refused: BTreeSet<ChunkCoord>,
     warm: Warm,
+    /// Unchanged chunks waiting to be compressed for the warm cache, or
+    /// being compressed, with the ticket of the newest request. A write that
+    /// lands makes the requests before it stale (their content is older
+    /// than the region file).
+    compressing: BTreeMap<ChunkCoord, u64>,
+    tickets: u64,
+    /// Compressions waiting for a worker, oldest first, with their tickets
+    /// and bytes. Loads come first, but a few compressions are always in
+    /// flight (`compress_reserve`), and the oldest waiting ones are dropped
+    /// (not kept warm) past a bound.
+    to_compress: VecDeque<(ChunkCoord, ChunkData, u64, usize)>,
+    /// Sum of the bytes in `to_compress`; they count toward the hot cap.
+    to_compress_bytes: usize,
+    compress_in_flight: usize,
     coarse_loaded: BTreeMap<(u32, u32), Vec<(ChunkCoord, usize)>>,
     coarse_loading: BTreeSet<(u32, u32)>,
+    /// Columns being built while one of their chunks was written; their
+    /// result is stale and they are requested again.
+    coarse_stale: BTreeSet<(u32, u32)>,
     coarse_bytes: usize,
     pool: Pool,
     wal: WalWriter,
+    wal_path: PathBuf,
     wal_dirty: bool,
+    /// The log's length after the last sync.
+    wal_bytes: u64,
+    /// The log length that starts the next checkpoint.
+    checkpoint_at: u64,
+    checkpoint: Option<Checkpoint>,
+    checkpoint_sequence: u64,
+    checkpoints: usize,
+    writes_submitted: usize,
+    /// Chunk writes that failed since the world opened.
+    write_failures: usize,
     changes: WorldChanges,
+    /// Summaries of chunks put into the render tree this frame, computed by
+    /// the workers (decision 0022); the ones that still describe the render
+    /// tree go to the renderer with the frame's changes.
+    render_summaries: Vec<ChunkSummaries>,
     errors: Vec<String>,
+    motion: Motion,
+    /// Load and hole figures for [`ResidencyStats`].
+    counters: Counters,
+    /// Column footprints shared with the workers.
+    columns: Arc<ColumnCache>,
+    /// The terrain heights of chunk columns, from full-detail loads (exact)
+    /// and coarse columns (sampled), to put buried chunks after visible
+    /// ones.
+    heights: BTreeMap<(u32, u32), Heights>,
+}
+
+/// Column heights kept at most; beyond it the farthest are dropped.
+const MAX_HEIGHTS: usize = 8192;
+
+/// Running figures reported in [`ResidencyStats`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    holes: usize,
+    holes_ahead: usize,
+    hole_sum: u64,
+    hole_ahead_sum: u64,
+    updates: u64,
+    generated: usize,
+    warm_hits: usize,
+    disk_loads: usize,
+    generated_micros: u64,
+    generated_max_micros: u64,
+    uniform_loads: usize,
 }
 
 /// The chunk-aligned boxes of `region`, one per chunk it touches.
@@ -169,10 +293,15 @@ fn split_box(region: VoxelBox) -> Vec<(ChunkCoord, VoxelBox)> {
     out
 }
 
+/// The length of the file at `path`, 0 if it cannot be read.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
 impl StreamedWorld {
     /// A world for `config` and `terrain`, saving under `save_dir`. Reads the
-    /// saved-chunk index and replays the edit log, so edits made before a
-    /// crash wait for their chunks again.
+    /// saved-chunk index and replays the edit log from its last checkpoint,
+    /// so edits made before a crash wait for their chunks again.
     pub fn open(
         config: ResidencyConfig,
         terrain: TerrainConfig,
@@ -183,13 +312,17 @@ impl StreamedWorld {
         let generator = Arc::new(generator);
         let store = RegionStore::open(save_dir)?;
         let saved = scan_saved(&store);
-        let (wal, replay) = WalWriter::open(&store.wal_path())?;
+        let wal_path = store.wal_path();
+        let (wal, replay) = WalWriter::open(&wal_path)?;
+        let wal_bytes = file_len(&wal_path);
+        let columns = Arc::new(ColumnCache::new(config.column_cache_mib));
         let shared = Shared {
-            generator: Arc::clone(&generator),
-            generator_version: GeneratorVersion::CURRENT.0,
+            generators: Arc::new(Generators::new(Arc::clone(&generator))),
             coarse_level: config.coarse_cell_level,
+            columns: Arc::clone(&columns),
         };
         let pool = Pool::new(shared, store, config.workers);
+        let checkpoint_at = config.log_checkpoint_kib as u64 * 1024;
         let mut world = Self {
             config,
             generator,
@@ -198,20 +331,42 @@ impl StreamedWorld {
             render: VoxelTree::new(),
             coarse_chunks: BTreeMap::new(),
             loaded: BTreeMap::new(),
+            hot_bytes: 0,
             loading: BTreeSet::new(),
-            saving: BTreeMap::new(),
+            writes: BTreeMap::new(),
+            held_bytes: 0,
             ready: VecDeque::new(),
             pending: BTreeMap::new(),
             saved,
+            refused: BTreeSet::new(),
             warm: Warm::default(),
+            compressing: BTreeMap::new(),
+            tickets: 0,
+            to_compress: VecDeque::new(),
+            to_compress_bytes: 0,
+            compress_in_flight: 0,
             coarse_loaded: BTreeMap::new(),
             coarse_loading: BTreeSet::new(),
+            coarse_stale: BTreeSet::new(),
             coarse_bytes: 0,
             pool,
             wal,
+            wal_path,
             wal_dirty: false,
+            wal_bytes,
+            checkpoint_at,
+            checkpoint: None,
+            checkpoint_sequence: 0,
+            checkpoints: 0,
+            writes_submitted: 0,
+            write_failures: 0,
             changes: WorldChanges::default(),
+            render_summaries: Vec::new(),
             errors: Vec::new(),
+            motion: Motion::default(),
+            counters: Counters::default(),
+            columns,
+            heights: BTreeMap::new(),
         };
         for record in replay {
             match record {
@@ -225,7 +380,11 @@ impl StreamedWorld {
                             .push(PendingEdit::Fill(part, material));
                     }
                 }
-                WalRecord::Checkpoint(_) => {}
+                // Everything before it is in region files.
+                WalRecord::Checkpoint(sequence) => {
+                    world.pending.clear();
+                    world.checkpoint_sequence = world.checkpoint_sequence.max(sequence);
+                }
             }
         }
         Ok(world)
@@ -247,11 +406,14 @@ impl StreamedWorld {
     }
 
     /// Puts the current content of chunk `coord` into the render tree: the
-    /// loaded chunk, else its coarse chunk, else air.
+    /// loaded chunk, else the evicted content still being written, else its
+    /// coarse chunk, else air.
     fn refresh_render(&mut self, coord: ChunkCoord) {
         let min = coord.min_voxel();
         let data = if self.loaded.contains_key(&coord) {
             self.tree.chunk_data(min)
+        } else if let Some((data, _)) = self.writes.get(&coord).and_then(|w| w.held.as_ref()) {
+            Some(data.clone())
         } else {
             self.coarse_chunks.get(&coord).cloned()
         };
@@ -260,7 +422,7 @@ impl StreamedWorld {
             None => self.render.take_chunk(min).map(|_| true),
         };
         if result.is_ok() {
-            self.changes.render_bricks.push(min.brick());
+            self.changes.render_chunks.push(min);
         }
     }
 
@@ -281,6 +443,18 @@ impl StreamedWorld {
         std::mem::take(&mut self.changes)
     }
 
+    /// Summaries of chunks put into the render tree since the last call,
+    /// computed by the workers where the chunks were built (decision 0022),
+    /// for the renderer to use instead of computing them: only those that
+    /// describe exactly what the render tree holds now (a chunk edited
+    /// after it joined, or replaced again, has none). Take them with the
+    /// changes that report their chunks.
+    pub fn take_render_summaries(&mut self) -> Vec<ChunkSummaries> {
+        let mut out = std::mem::take(&mut self.render_summaries);
+        out.retain(|s| s.describes(&self.render));
+        out
+    }
+
     /// Problems met while loading or saving (unreadable records, failed
     /// writes), since the last call.
     pub fn take_errors(&mut self) -> Vec<String> {
@@ -292,15 +466,45 @@ impl StreamedWorld {
             loaded: self.loaded.len(),
             edited: self.loaded.values().filter(|s| s.edited).count(),
             loading: self.loading.len(),
-            saving: self.saving.len(),
+            saving: self.writes.len(),
+            saving_bytes: self.held_bytes,
             pending_chunks: self.pending.len(),
-            hot_bytes: self.tree.stats().bytes,
-            warm_chunks: self.warm.entries.len(),
-            warm_bytes: self.warm.bytes,
+            ready: self.ready.len(),
+            ready_bytes: self.ready.iter().map(|(_, d, _, _)| d.bytes()).sum(),
+            hot_bytes: self.hot_bytes,
+            warm_chunks: self.warm.len(),
+            warm_edited: self.warm.edited(),
+            warm_bytes: self.warm.bytes(),
+            compressing: self.to_compress.len() + self.compress_in_flight,
+            compressing_bytes: self.to_compress_bytes,
             coarse_columns: self.coarse_loaded.len(),
             coarse_bytes: self.coarse_bytes,
             saved_chunks: self.saved.len(),
+            writes: self.writes_submitted,
+            checkpoints: self.checkpoints,
+            log_bytes: self.wal_bytes,
+            holes: self.counters.holes,
+            holes_ahead: self.counters.holes_ahead,
+            hole_sum: self.counters.hole_sum,
+            hole_ahead_sum: self.counters.hole_ahead_sum,
+            updates: self.counters.updates,
+            generated: self.counters.generated,
+            warm_hits: self.counters.warm_hits,
+            disk_loads: self.counters.disk_loads,
+            generated_micros: self.counters.generated_micros,
+            generated_max_micros: self.counters.generated_max_micros,
+            uniform_loads: self.counters.uniform_loads,
+            column_hits: self.columns.counts().hits,
+            column_misses: self.columns.counts().misses,
+            column_bytes: self.columns.held_bytes(),
         }
+    }
+
+    /// The player's smoothed velocity, in metres per second.
+    pub fn velocity_m_s(&self) -> [f32; 3] {
+        self.motion
+            .velocity()
+            .map(|v| v / world_core::consts::VOXELS_PER_METER as f32)
     }
 
     /// Whether every chunk within the full-detail radius of `eye` is loaded.
@@ -310,21 +514,37 @@ impl StreamedWorld {
             .all(|c| self.loaded.contains_key(c))
     }
 
-    /// One frame of residency around `eye`.
-    pub fn update(&mut self, eye: VoxelPos) {
+    /// One frame of residency around `eye`, `dt_secs` after the previous
+    /// one (successive positions give the player's velocity).
+    pub fn update(&mut self, eye: VoxelPos, dt_secs: f32) {
+        self.motion.observe(
+            eye,
+            dt_secs,
+            self.config.velocity_smoothing_secs,
+            plan::voxels(self.config.evict_radius_m),
+        );
+        // Summaries the renderer did not take last frame are dropped: it
+        // computes them itself.
+        self.render_summaries.clear();
         for done in self.pool.drain() {
             self.finish(done, eye);
         }
         self.graft_ready();
         self.request_loads(eye);
         self.evict(eye);
+        self.submit_compressions();
         self.update_coarse(eye);
         if self.wal_dirty {
             if let Err(e) = self.wal.sync() {
                 self.errors.push(format!("edit log sync: {e}"));
             }
             self.wal_dirty = false;
+            self.wal_bytes = file_len(&self.wal_path);
         }
+        if self.checkpoint.is_none() && self.wal_bytes > self.checkpoint_at {
+            self.start_checkpoint();
+        }
+        self.finish_checkpoint();
     }
 
     /// Applies a batch of edits: logged first, applied now where the chunk is
@@ -350,14 +570,18 @@ impl StreamedWorld {
                 .push(PendingEdit::Edits(edits));
         }
         let bricks = self.tree.apply(&now)?;
+        // Only chunks whose content changed need saving.
         let mut touched = BTreeSet::new();
-        for &edit in &now {
-            if let Some(c) = ChunkCoord::containing(edit.pos)
+        for brick in bricks.as_slice() {
+            if let Some(c) = ChunkCoord::containing(brick.min_voxel())
                 && let Some(state) = self.loaded.get_mut(&c)
             {
                 state.edited = true;
                 touched.insert(c);
             }
+        }
+        for &c in &touched {
+            self.refresh_bytes(c);
         }
         self.share_edits(&touched, bricks.as_slice());
         self.changes.bricks.extend_from_slice(bricks.as_slice());
@@ -373,10 +597,13 @@ impl StreamedWorld {
         self.log(&WalRecord::Fill { region, material });
         for (c, part) in parts {
             if self.loaded.contains_key(&c) {
-                self.tree.fill_box(part, material)?;
+                if !self.tree.fill_box(part, material)? {
+                    continue;
+                }
                 if let Some(state) = self.loaded.get_mut(&c) {
                     state.edited = true;
                 }
+                self.refresh_bytes(c);
                 let before = self.changes.bricks.len();
                 self.mark_bricks(part);
                 let marked: Vec<BrickPos> = self.changes.bricks[before..].to_vec();
@@ -391,9 +618,16 @@ impl StreamedWorld {
         Ok(())
     }
 
-    /// Saves every edited chunk, loaded or waiting, and empties the edit log.
-    /// Blocks until the region files are written.
+    /// Saves every edited chunk, loaded, evicted or waiting, and empties the
+    /// edit log. Blocks until the region files are written.
     pub fn save_all(&mut self) -> io::Result<()> {
+        let errors_before = self.errors.len();
+        self.drain_all();
+        // Writes that failed earlier are tried again; from here on any
+        // failure keeps the log.
+        let failures_before = self.write_failures;
+        self.retry_failed_writes();
+        self.drain_all();
         // Chunks with waiting edits are loaded here, so their edits land in
         // their region files.
         let waiting: Vec<ChunkCoord> = self
@@ -402,24 +636,75 @@ impl StreamedWorld {
             .copied()
             .filter(|c| !self.loaded.contains_key(c))
             .collect();
-        for done in self.pool.wait_idle() {
-            self.finish_without_eye(done);
-        }
         for c in waiting {
-            if self.saving.contains_key(&c) {
+            if self.loading.contains(&c) || self.ready.iter().any(|(r, _, _, _)| *r == c) {
                 continue;
             }
+            if let Some(w) = self.writes.get_mut(&c) {
+                // Nothing is in flight after the drain: the entry is a failed
+                // write, and its content now rejoins (and is written below).
+                if let Some((data, bytes)) = w.held.take() {
+                    self.held_bytes -= bytes;
+                    self.ready.push_back((c, data, true, None));
+                }
+                if !w.in_flight {
+                    self.writes.remove(&c);
+                }
+                continue;
+            }
+            self.loading.insert(c);
             self.pool.submit(Request::Load {
                 coord: c,
-                warm: self.warm.take(c),
+                warm: self.warm.get(c),
                 saved: self.saved.contains(&c),
             });
-            self.loading.insert(c);
         }
-        for done in self.pool.wait_idle() {
-            self.finish_without_eye(done);
-        }
+        self.drain_all();
         self.graft_all_ready();
+        self.save_edited();
+        self.drain_all();
+        // The log is the only copy of anything not written: it is kept
+        // unless every change reached a region file.
+        let unsaved = self.loaded.values().filter(|s| s.edited).count();
+        if self.write_failures != failures_before
+            || !self.writes.is_empty()
+            || unsaved > 0
+            || !self.pending.is_empty()
+        {
+            let errors = self.errors[errors_before.min(self.errors.len())..].join("; ");
+            return Err(io::Error::other(format!(
+                "the edit log is kept: {} failed writes, {} writes outstanding, {} edited \
+                 chunks unsaved, {} chunks with waiting edits: {errors}",
+                self.write_failures - failures_before,
+                self.writes.len(),
+                unsaved,
+                self.pending.len()
+            )));
+        }
+        self.wal.reset()?;
+        self.wal_bytes = file_len(&self.wal_path);
+        self.checkpoint = None;
+        self.checkpoint_at = self.wal_bytes + self.checkpoint_size();
+        Ok(())
+    }
+
+    /// Waits until no request is in flight, finishing each result (which
+    /// may submit queued writes).
+    fn drain_all(&mut self) {
+        loop {
+            let done = self.pool.wait_idle();
+            if done.is_empty() {
+                break;
+            }
+            for d in done {
+                self.finish_without_eye(d);
+            }
+        }
+    }
+
+    /// Submits a write for every loaded chunk with unsaved changes, which
+    /// then counts as saved (a failed write marks it edited again).
+    fn save_edited(&mut self) {
         let edited: Vec<ChunkCoord> = self
             .loaded
             .iter()
@@ -428,16 +713,124 @@ impl StreamedWorld {
             .collect();
         for c in edited {
             if let Some(data) = self.tree.chunk_data(c.min_voxel()) {
-                self.pool.submit(Request::Save { coord: c, data });
+                if let Some(state) = self.loaded.get_mut(&c) {
+                    state.edited = false;
+                }
+                self.save(c, data, false);
             }
         }
-        for done in self.pool.wait_idle() {
-            self.finish_without_eye(done);
+    }
+
+    /// Submits again every write that failed and still holds its content.
+    fn retry_failed_writes(&mut self) {
+        let failed: Vec<(ChunkCoord, ChunkData)> = self
+            .writes
+            .iter()
+            .filter(|(_, w)| !w.in_flight)
+            .filter_map(|(&c, w)| w.held.as_ref().map(|(d, _)| (c, d.clone())))
+            .collect();
+        for (c, data) in failed {
+            if let Some(w) = self.writes.get_mut(&c) {
+                w.in_flight = true;
+            }
+            self.submit_write(c, data);
         }
-        if !self.errors.is_empty() {
-            return Err(io::Error::other(self.errors.join("; ")));
+    }
+
+    /// Writes `data` as the content of chunk `coord`, after any write of it
+    /// already in flight. With `hold`, the chunk was evicted and `data` is
+    /// kept until it lands.
+    fn save(&mut self, coord: ChunkCoord, data: ChunkData, hold: bool) {
+        let w = self.writes.entry(coord).or_default();
+        if hold {
+            let bytes = data.bytes();
+            if let Some((_, old)) = w.held.replace((data.clone(), bytes)) {
+                self.held_bytes -= old;
+            }
+            self.held_bytes += bytes;
         }
-        self.wal.reset()
+        if w.in_flight {
+            w.next = Some(data);
+        } else {
+            w.in_flight = true;
+            self.submit_write(coord, data);
+        }
+    }
+
+    fn submit_write(&mut self, coord: ChunkCoord, data: ChunkData) {
+        self.writes_submitted += 1;
+        self.pool.submit(Request::Save {
+            coord,
+            data,
+            set_aside: self.refused.contains(&coord),
+        });
+    }
+
+    /// The log growth that starts a checkpoint, in bytes.
+    fn checkpoint_size(&self) -> u64 {
+        self.config.log_checkpoint_kib as u64 * 1024
+    }
+
+    /// Starts writing every chunk whose changes are only in the log.
+    fn start_checkpoint(&mut self) {
+        // Chunks that rejoined with unsaved changes are loaded first, so
+        // they are written with the rest.
+        self.graft_all_ready();
+        self.retry_failed_writes();
+        self.save_edited();
+        let mut relog = Vec::new();
+        for edits in self.pending.values() {
+            for edit in edits {
+                relog.push(match edit {
+                    PendingEdit::Edits(edits) => WalRecord::Edits(edits.clone()),
+                    PendingEdit::Fill(region, material) => WalRecord::Fill {
+                        region: *region,
+                        material: *material,
+                    },
+                });
+            }
+        }
+        self.checkpoint_sequence += 1;
+        self.checkpoint = Some(Checkpoint {
+            sequence: self.checkpoint_sequence,
+            waiting: self.writes.keys().copied().collect(),
+            relog,
+            tail: Vec::new(),
+        });
+    }
+
+    /// Restarts the log once every write the checkpoint waits for landed.
+    fn finish_checkpoint(&mut self) {
+        if self
+            .checkpoint
+            .as_ref()
+            .is_none_or(|c| !c.waiting.is_empty())
+        {
+            return;
+        }
+        let Some(checkpoint) = self.checkpoint.take() else {
+            return;
+        };
+        // The new log replaces the old one atomically, so a crash or a
+        // failure leaves one of the two whole.
+        let mut records = Vec::with_capacity(1 + checkpoint.relog.len() + checkpoint.tail.len());
+        records.push(WalRecord::Checkpoint(checkpoint.sequence));
+        records.extend(checkpoint.relog);
+        records.extend(checkpoint.tail);
+        match self.wal.replace(&records) {
+            Ok(()) => self.checkpoints += 1,
+            Err(e) => self.errors.push(format!("edit log checkpoint: {e}")),
+        }
+        self.wal_bytes = file_len(&self.wal_path);
+        self.checkpoint_at = self.wal_bytes + self.checkpoint_size();
+    }
+
+    /// Gives up the running checkpoint after a failed write; the log keeps
+    /// everything, and the next try waits for it to grow again.
+    fn abort_checkpoint(&mut self) {
+        if self.checkpoint.take().is_some() {
+            self.checkpoint_at = self.wal_bytes + self.checkpoint_size();
+        }
     }
 
     /// Shares the edited chunks' new content with the render tree, and
@@ -451,9 +844,24 @@ impl StreamedWorld {
         self.changes.render_bricks.extend_from_slice(bricks);
     }
 
+    /// Updates the cached size of loaded chunk `coord` and the hot total.
+    fn refresh_bytes(&mut self, coord: ChunkCoord) {
+        let bytes = self
+            .tree
+            .chunk_data(coord.min_voxel())
+            .map_or(0, |d| d.bytes());
+        if let Some(state) = self.loaded.get_mut(&coord) {
+            self.hot_bytes = self.hot_bytes - state.bytes + bytes;
+            state.bytes = bytes;
+        }
+    }
+
     fn log(&mut self, record: &WalRecord) {
         if let Err(e) = self.wal.append(record) {
             self.errors.push(format!("edit log append: {e}"));
+        }
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.tail.push(record.clone());
         }
         self.wal_dirty = true;
     }
@@ -496,33 +904,67 @@ impl StreamedWorld {
             Done::Loaded {
                 coord,
                 data,
-                edited,
+                summaries,
+                refused,
                 error,
+                source,
+                micros,
+                heights,
+                uniform,
             } => {
                 self.loading.remove(&coord);
+                let n = &mut self.counters;
+                match source {
+                    LoadSource::Warm => n.warm_hits += 1,
+                    LoadSource::Saved => n.disk_loads += 1,
+                    LoadSource::Generated => {
+                        n.generated += 1;
+                        n.generated_micros += micros;
+                        n.generated_max_micros = n.generated_max_micros.max(micros);
+                        n.uniform_loads += usize::from(uniform);
+                    }
+                }
+                if let Some((lo, hi)) = heights {
+                    self.learn_heights(coord.x(), coord.z(), lo, hi, true, eye);
+                }
                 if let Some(e) = error {
                     self.errors.push(e);
+                }
+                if refused {
+                    self.refused.insert(coord);
                 }
                 let wanted = eye.x == i32::MIN
                     || plan::chunk_distance(eye, coord) <= plan::voxels(self.config.evict_radius_m)
                     || self.pending.contains_key(&coord);
                 if wanted && !self.loaded.contains_key(&coord) {
-                    self.ready.push_back((coord, data, edited));
+                    self.ready.push_back((coord, data, false, summaries));
+                } else if !wanted {
+                    // The player moved on before it arrived: keep it warm
+                    // for a return.
+                    self.keep_warm(coord, data);
                 }
             }
-            Done::Saved { coord, warm, error } => {
-                self.saving.remove(&coord);
-                match error {
-                    Some(e) => self.errors.push(format!("saving chunk {coord:?}: {e}")),
-                    None => {
-                        self.saved.insert(coord);
-                        self.warm
-                            .insert(coord, warm, self.config.warm_cap_mib as usize * MIB);
-                    }
-                }
-            }
-            Done::Coarse { x, z, chunks } => {
+            Done::Saved {
+                coord,
+                warm,
+                coarse,
+                error,
+            } => self.finish_write(coord, warm, coarse, error),
+            Done::Coarse {
+                x,
+                z,
+                chunks,
+                heights,
+            } => {
                 self.coarse_loading.remove(&(x, z));
+                if let Some((lo, hi)) = heights {
+                    self.learn_heights(x, z, lo, hi, false, eye);
+                }
+                if self.coarse_stale.remove(&(x, z)) {
+                    // Built before one of its chunks was written; asked for
+                    // again by the next update.
+                    return;
+                }
                 let wanted = eye.x == i32::MIN
                     || plan::column_distance(eye, x, z)
                         <= plan::voxels(self.config.coarse_radius_m) * 1.25;
@@ -530,7 +972,7 @@ impl StreamedWorld {
                     return;
                 }
                 let mut entry = Vec::new();
-                for (coord, data) in chunks {
+                for (coord, data, summaries) in chunks {
                     let bytes = data.bytes();
                     if self
                         .coarse
@@ -540,66 +982,321 @@ impl StreamedWorld {
                         entry.push((coord, bytes));
                         self.coarse_bytes += bytes;
                         self.coarse_chunks.insert(coord, data);
-                        if !self.loaded.contains_key(&coord) {
-                            self.refresh_render(coord);
+                        if self.refresh_render_if_coarse(coord) {
+                            self.render_summaries.extend(summaries);
                         }
                     }
                 }
                 self.coarse_loaded.insert((x, z), entry);
                 self.changes.coarse = true;
             }
+            Done::Compressed {
+                coord,
+                warm,
+                ticket,
+            } => {
+                self.compress_in_flight = self.compress_in_flight.saturating_sub(1);
+                if self.compressing.get(&coord) != Some(&ticket) {
+                    return;
+                }
+                self.compressing.remove(&coord);
+                let edited = self.saved.contains(&coord);
+                self.warm.insert(
+                    coord,
+                    warm,
+                    edited,
+                    self.warm_cap(),
+                    self.config.warm_edited_weight,
+                );
+            }
         }
+    }
+
+    /// Records the terrain heights of chunk column (`x`, `z`); sampled ones
+    /// never replace exact ones. Past [`MAX_HEIGHTS`] the columns farthest
+    /// from `eye` are dropped.
+    fn learn_heights(&mut self, x: u32, z: u32, lo: i32, hi: i32, exact: bool, eye: VoxelPos) {
+        let entry = self
+            .heights
+            .entry((x, z))
+            .or_insert(Heights { lo, hi, exact });
+        if exact || !entry.exact {
+            *entry = Heights { lo, hi, exact };
+        }
+        if self.heights.len() > MAX_HEIGHTS && eye.x != i32::MIN {
+            let mut far: Vec<(u32, (u32, u32))> = self
+                .heights
+                .keys()
+                .map(|&(x, z)| (plan::column_distance(eye, x, z).to_bits(), (x, z)))
+                .collect();
+            far.sort_unstable_by(|a, b| b.cmp(a));
+            for (_, column) in far.into_iter().take(self.heights.len() - MAX_HEIGHTS / 2) {
+                self.heights.remove(&column);
+            }
+        }
+    }
+
+    /// How far `chunk`'s load is put off, in voxels: buried chunks by
+    /// `buried_delay_m`, others not at all.
+    fn load_delay(&self, chunk: ChunkCoord) -> f32 {
+        let heights = self.heights.get(&(chunk.x(), chunk.z())).copied();
+        if plan::is_buried(chunk, heights) {
+            plan::voxels(self.config.buried_delay_m)
+        } else {
+            0.0
+        }
+    }
+
+    fn warm_cap(&self) -> usize {
+        self.config.warm_cap_mib as usize * MIB
+    }
+
+    /// Loads and compressions in flight at most.
+    fn in_flight_cap(&self) -> usize {
+        (self.config.workers.max(1) as usize) * 4
+    }
+
+    /// Keeps the unchanged chunk `data` at `coord` in the warm cache: its
+    /// entry is marked used if it has one (still exact: an entry is replaced
+    /// whenever the chunk is written), else it waits for a worker to
+    /// compress it.
+    fn keep_warm(&mut self, coord: ChunkCoord, data: ChunkData) {
+        if self.warm_cap() == 0 || self.warm.touch(coord) {
+            return;
+        }
+        self.tickets += 1;
+        self.compressing.insert(coord, self.tickets);
+        let bytes = data.bytes();
+        self.to_compress
+            .push_back((coord, data, self.tickets, bytes));
+        self.to_compress_bytes += bytes;
+        let bound = self.in_flight_cap() * 4;
+        while self.to_compress.len() > bound {
+            let Some((c, _, ticket, bytes)) = self.to_compress.pop_front() else {
+                break;
+            };
+            self.to_compress_bytes -= bytes;
+            if self.compressing.get(&c) == Some(&ticket) {
+                self.compressing.remove(&c);
+            }
+        }
+    }
+
+    /// Compressions kept in flight even while loads fill the in-flight cap:
+    /// one. A waiting chunk holds its whole pages, about 1 MiB, so waiting
+    /// for idle workers kept up to 64 of them in RAM for nothing whenever
+    /// generation fell behind (decision 0020). Compressing one (encoding
+    /// and LZ4) takes a few milliseconds against a load's tens, so a single
+    /// slot keeps up with eviction without taking workers from generation.
+    fn compress_reserve(&self) -> usize {
+        1
+    }
+
+    /// Hands waiting compressions to the workers, the most recently evicted
+    /// first (the nearest to the player, so the likeliest to be wanted
+    /// again): up to [`compress_reserve`](Self::compress_reserve) at any
+    /// time, and more while fewer loads than the in-flight cap are
+    /// outstanding.
+    fn submit_compressions(&mut self) {
+        let cap = self.in_flight_cap();
+        let reserve = self.compress_reserve();
+        while self.compress_in_flight < reserve
+            || self.loading.len() + self.compress_in_flight < cap
+        {
+            let Some((coord, data, ticket, bytes)) = self.to_compress.pop_back() else {
+                break;
+            };
+            self.to_compress_bytes -= bytes;
+            if self.compressing.get(&coord) != Some(&ticket) {
+                continue;
+            }
+            self.compress_in_flight += 1;
+            self.pool.submit(Request::Compress {
+                coord,
+                data,
+                ticket,
+            });
+        }
+    }
+
+    /// A chunk write landed (or failed).
+    fn finish_write(
+        &mut self,
+        coord: ChunkCoord,
+        warm: WarmChunk,
+        coarse: Option<ChunkData>,
+        error: Option<String>,
+    ) {
+        let failed = error.is_some();
+        match error {
+            Some(e) => {
+                self.errors.push(format!("saving chunk {coord:?}: {e}"));
+                self.write_failures += 1;
+                self.abort_checkpoint();
+            }
+            None => {
+                self.saved.insert(coord);
+                self.refused.remove(&coord);
+                // The region file changed: compressions of older content
+                // and the warm copy are stale, even if another write of the
+                // chunk is queued behind this one.
+                self.compressing.remove(&coord);
+                self.warm.remove(coord);
+            }
+        }
+        let Some(w) = self.writes.get_mut(&coord) else {
+            return;
+        };
+        if let Some(next) = w.next.take() {
+            self.submit_write(coord, next);
+            return;
+        }
+        w.in_flight = false;
+        if failed {
+            if let Some(state) = self.loaded.get_mut(&coord) {
+                state.edited = true;
+            }
+            // Evicted content stays held (and drawn) until a retry lands.
+            if w.held.is_none() {
+                self.writes.remove(&coord);
+            }
+            return;
+        }
+        if let Some(w) = self.writes.remove(&coord)
+            && let Some((_, bytes)) = w.held
+        {
+            self.held_bytes -= bytes;
+        }
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.waiting.remove(&coord);
+        }
+        let cap = self.warm_cap();
+        self.warm
+            .insert(coord, warm, true, cap, self.config.warm_edited_weight);
+        if let Some(coarse) = coarse {
+            self.replace_coarse(coord, coarse);
+        }
+        self.refresh_render_if_coarse(coord);
+    }
+
+    /// Replaces the coarse chunk at `coord` with the summary of its written
+    /// content, so the change shows from afar.
+    fn replace_coarse(&mut self, coord: ChunkCoord, data: ChunkData) {
+        let column = (coord.x(), coord.z());
+        if self.coarse_loading.contains(&column) {
+            self.coarse_stale.insert(column);
+            return;
+        }
+        // A column that is not loaded reads the summary from the region
+        // file when it is.
+        let Some(entry) = self.coarse_loaded.get_mut(&column) else {
+            return;
+        };
+        let bytes = data.bytes();
+        if self
+            .coarse
+            .insert_chunk(coord.min_voxel(), data.clone())
+            .is_err()
+        {
+            return;
+        }
+        match entry.iter_mut().find(|(c, _)| *c == coord) {
+            Some((_, old)) => {
+                self.coarse_bytes = self.coarse_bytes - *old + bytes;
+                *old = bytes;
+            }
+            None => {
+                entry.push((coord, bytes));
+                self.coarse_bytes += bytes;
+            }
+        }
+        self.coarse_chunks.insert(coord, data);
+        self.changes.coarse = true;
+    }
+
+    /// Refreshes the render tree at `coord` when it shows the coarse chunk
+    /// there (the chunk is neither loaded nor held); returns whether it did.
+    fn refresh_render_if_coarse(&mut self, coord: ChunkCoord) -> bool {
+        let held = self.writes.get(&coord).is_some_and(|w| w.held.is_some());
+        let shown = !self.loaded.contains_key(&coord) && !held;
+        if shown {
+            self.refresh_render(coord);
+        }
+        shown
     }
 
     fn graft_ready(&mut self) {
         for _ in 0..self.config.grafts_per_frame {
-            let Some((coord, data, edited)) = self.ready.pop_front() else {
+            let Some((coord, data, edited, summaries)) = self.ready.pop_front() else {
                 break;
             };
-            self.join(coord, data, edited);
+            self.join(coord, data, edited, summaries);
         }
     }
 
     fn graft_all_ready(&mut self) {
-        while let Some((coord, data, edited)) = self.ready.pop_front() {
-            self.join(coord, data, edited);
+        while let Some((coord, data, edited, summaries)) = self.ready.pop_front() {
+            self.join(coord, data, edited, summaries);
         }
     }
 
     /// Joins a loaded chunk to the tree and applies its waiting edits.
-    fn join(&mut self, coord: ChunkCoord, data: ChunkData, edited: bool) {
+    /// `summaries`, computed by the worker, go to the renderer if nothing
+    /// changed the chunk before the frame's changes are taken.
+    fn join(
+        &mut self,
+        coord: ChunkCoord,
+        data: ChunkData,
+        edited: bool,
+        summaries: Option<ChunkSummaries>,
+    ) {
         let min = coord.min_voxel();
         if self.tree.insert_chunk(min, data).is_err() {
             return;
         }
-        let mut state = ChunkState { edited };
+        let mut state = ChunkState { edited, bytes: 0 };
         for edit in self.pending.remove(&coord).unwrap_or_default() {
             let result = match edit {
-                PendingEdit::Edits(edits) => self.tree.apply(&edits).map(|_| ()),
-                PendingEdit::Fill(region, m) => self.tree.fill_box(region, m).map(|_| ()),
+                PendingEdit::Edits(edits) => self.tree.apply(&edits).map(|b| !b.is_empty()),
+                PendingEdit::Fill(region, m) => self.tree.fill_box(region, m),
             };
             match result {
-                Ok(()) => state.edited = true,
+                // Edits the region file already has change nothing.
+                Ok(changed) => state.edited |= changed,
                 Err(e) => self.errors.push(format!("waiting edit for {coord:?}: {e}")),
             }
         }
+        state.bytes = self.tree.chunk_data(min).map_or(0, |d| d.bytes());
+        self.hot_bytes += state.bytes;
         self.loaded.insert(coord, state);
         self.changes.loaded.push(coord);
         self.refresh_render(coord);
+        self.render_summaries.extend(summaries);
     }
 
     fn request_loads(&mut self, eye: VoxelPos) {
-        let in_flight_cap = (self.config.workers.max(1) as usize) * 4;
-        for coord in plan::sphere(eye, self.config.full_radius_m) {
+        let in_flight_cap = self.in_flight_cap();
+        let sphere = plan::sphere(eye, self.config.full_radius_m);
+        self.count_holes(eye, &sphere);
+        for coord in self.load_order(eye, sphere) {
             if self.loaded.contains_key(&coord)
                 || self.loading.contains(&coord)
-                || self.ready.iter().any(|(c, _, _)| *c == coord)
+                || self.ready.iter().any(|(c, _, _, _)| *c == coord)
             {
                 continue;
             }
-            if let Some(data) = self.saving.get(&coord).cloned() {
+            if let Some(w) = self.writes.get_mut(&coord) {
                 // Evicted a moment ago and not yet written: rejoin as is.
-                self.ready.push_back((coord, data, true));
+                // Without held content the chunk is already joining; either
+                // way the region file is not read while it is written.
+                if let Some((data, bytes)) = w.held.take() {
+                    self.held_bytes -= bytes;
+                    if !w.in_flight {
+                        // A failed write: the content is only here now.
+                        self.writes.remove(&coord);
+                    }
+                    self.ready.push_back((coord, data, true, None));
+                }
                 continue;
             }
             if self.loading.len() >= in_flight_cap {
@@ -608,10 +1305,78 @@ impl StreamedWorld {
             self.loading.insert(coord);
             self.pool.submit(Request::Load {
                 coord,
-                warm: self.warm.take(coord),
+                warm: self.warm.get(coord),
                 saved: self.saved.contains(&coord),
             });
         }
+    }
+
+    /// The order to request chunks in: the full-detail `sphere` (nearest
+    /// first, buried chunks put off by `buried_delay_m`) ahead of the motion
+    /// first, then, once all of it is requested and while the hot tier is
+    /// under its cap, the lookahead sphere. Every chunk of the full-detail
+    /// sphere precedes every lookahead chunk, so prefetching never starves
+    /// it.
+    fn load_order(&self, eye: VoxelPos, sphere: Vec<ChunkCoord>) -> Vec<ChunkCoord> {
+        let c = &self.config;
+        let predicted = self.motion.predicted(
+            eye,
+            c.prefetch_lookahead_secs,
+            plan::voxels(c.evict_radius_m),
+        );
+        // A player underground sees the rock around them, not the surface
+        // overhead: no chunk is put off then.
+        let underground = ChunkCoord::containing(eye).is_some_and(|c| self.load_delay(c) > 0.0);
+        let delay = |chunk| {
+            if underground {
+                0.0
+            } else {
+                self.load_delay(chunk)
+            }
+        };
+        let mut order = plan::load_priority(eye, predicted, &sphere, delay);
+        if let Some(predicted) = predicted
+            && self.hot_bytes_in_use() < c.hot_cap_mib as usize * MIB
+        {
+            // The predicted position is at most evict_radius_m away and
+            // only chunks within that of the eye are kept, so a larger
+            // radius would only add chunks to sort and drop.
+            let extra = plan::lookahead(
+                eye,
+                predicted,
+                c.prefetch_radius_m.min(2.0 * c.evict_radius_m),
+                c.full_radius_m,
+                c.evict_radius_m,
+            );
+            order.extend(plan::delayed(predicted, &extra, delay));
+        }
+        order
+    }
+
+    /// Records the chunks of the full-detail `sphere` around `eye` that are
+    /// not loaded.
+    fn count_holes(&mut self, eye: VoxelPos, sphere: &[ChunkCoord]) {
+        let (mut holes, mut ahead) = (0, 0);
+        for &c in sphere {
+            if !self.loaded.contains_key(&c) {
+                holes += 1;
+                if self.motion.is_ahead(eye, c) {
+                    ahead += 1;
+                }
+            }
+        }
+        let n = &mut self.counters;
+        n.holes = holes;
+        n.holes_ahead = ahead;
+        n.hole_sum += holes as u64;
+        n.hole_ahead_sum += ahead as u64;
+        n.updates += 1;
+    }
+
+    /// RAM held by full-detail chunks: the loaded ones, evicted ones
+    /// waiting for their writes and unchanged ones waiting to be compressed.
+    fn hot_bytes_in_use(&self) -> usize {
+        self.hot_bytes + self.held_bytes + self.to_compress_bytes
     }
 
     fn evict(&mut self, eye: VoxelPos) {
@@ -625,29 +1390,40 @@ impl StreamedWorld {
         // Over the RAM cap: also evict the farthest chunks outside the
         // full-detail radius until the estimate fits.
         let cap = self.config.hot_cap_mib as usize * MIB;
-        let mut bytes = self.tree.stats().bytes;
+        let mut bytes = self.hot_bytes_in_use();
         if bytes > cap {
             let full = plan::voxels(self.config.full_radius_m);
-            let mut extra: Vec<(u32, ChunkCoord)> = self
+            let mut extra: Vec<(u32, ChunkCoord, usize)> = self
                 .loaded
-                .keys()
-                .copied()
-                .filter(|c| !doomed.contains(c))
-                .map(|c| (plan::chunk_distance(eye, c).to_bits(), c))
-                .filter(|&(d, _)| f32::from_bits(d) > full)
+                .iter()
+                .filter(|(c, _)| !doomed.contains(c))
+                .map(|(&c, s)| (plan::chunk_distance(eye, c).to_bits(), c, s.bytes))
+                .filter(|&(d, _, _)| f32::from_bits(d) > full)
                 .collect();
             extra.sort_unstable_by(|a, b| b.cmp(a));
-            for (_, c) in extra {
+            for (_, c, chunk_bytes) in extra {
                 if bytes <= cap {
                     break;
                 }
-                bytes = bytes
-                    .saturating_sub(self.tree.chunk_data(c.min_voxel()).map_or(0, |d| d.bytes()));
+                bytes = bytes.saturating_sub(chunk_bytes);
                 doomed.push(c);
             }
         }
         for c in doomed {
             self.unload(c);
+        }
+        // An unloaded chunk waiting to be compressed still holds its RAM,
+        // so unloading alone does not bring the total under the cap: drop
+        // the oldest waiting compressions until it fits. Otherwise every
+        // frame would evict another batch for the same bytes.
+        while self.hot_bytes_in_use() > cap {
+            let Some((c, _, ticket, chunk_bytes)) = self.to_compress.pop_front() else {
+                break;
+            };
+            self.to_compress_bytes -= chunk_bytes;
+            if self.compressing.get(&c) == Some(&ticket) {
+                self.compressing.remove(&c);
+            }
         }
     }
 
@@ -655,12 +1431,26 @@ impl StreamedWorld {
         let Some(state) = self.loaded.remove(&coord) else {
             return;
         };
+        self.hot_bytes -= state.bytes;
         let Ok(data) = self.tree.take_chunk(coord.min_voxel()) else {
             return;
         };
         if state.edited {
-            self.saving.insert(coord, data.clone());
-            self.pool.submit(Request::Save { coord, data });
+            self.save(coord, data, true);
+        } else if let Some(w) = self.writes.get_mut(&coord) {
+            // Unchanged since its write was submitted: hold it until that
+            // lands, so the region file is not read before then.
+            let bytes = data.bytes();
+            if let Some((_, old)) = w.held.replace((data, bytes)) {
+                self.held_bytes -= old;
+            }
+            self.held_bytes += bytes;
+        } else if !self.refused.contains(&coord) {
+            // What the region file or the generator gives: kept compressed,
+            // so a return does not generate it again. A refused chunk is
+            // not: it stands in for a record that did not load, which the
+            // next visit reads again.
+            self.keep_warm(coord, data);
         }
         self.changes.unloaded.push(coord);
         self.refresh_render(coord);
@@ -705,13 +1495,59 @@ impl StreamedWorld {
                     let _ = self.coarse.unload(CHUNK_LEVEL, coord.min_voxel());
                     self.coarse_bytes = self.coarse_bytes.saturating_sub(bytes);
                     self.coarse_chunks.remove(&coord);
-                    if !self.loaded.contains_key(&coord) {
-                        self.refresh_render(coord);
-                    }
+                    self.refresh_render_if_coarse(coord);
                 }
                 self.changes.coarse = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl StreamedWorld {
+    /// The config, to change budgets a test cannot reach otherwise.
+    pub(super) fn config_mut(&mut self) -> &mut ResidencyConfig {
+        &mut self.config
+    }
+
+    /// The bytes of the loaded chunks, summed afresh from the tree.
+    pub(super) fn hot_bytes_walked(&self) -> usize {
+        self.loaded
+            .keys()
+            .map(|c| self.tree.chunk_data(c.min_voxel()).map_or(0, |d| d.bytes()))
+            .sum()
+    }
+
+    /// RAM the hot cap is checked against.
+    pub(super) fn hot_bytes_counted(&self) -> usize {
+        self.hot_bytes_in_use()
+    }
+
+    /// The warm cache's bytes, summed afresh from its entries.
+    pub(super) fn warm_bytes_walked(&self) -> usize {
+        self.warm.bytes_walked()
+    }
+
+    /// Whether the warm cache holds `coord`.
+    pub(super) fn is_warm(&self, coord: ChunkCoord) -> bool {
+        self.warm.contains(coord)
+    }
+
+    /// The loaded content of `coord`.
+    pub(super) fn chunk_data(&self, coord: ChunkCoord) -> Option<ChunkData> {
+        self.loaded
+            .contains_key(&coord)
+            .then(|| self.tree.chunk_data(coord.min_voxel()))
+            .flatten()
+    }
+
+    /// The loaded chunks.
+    pub(super) fn column_cache(&self) -> &ColumnCache {
+        &self.columns
+    }
+
+    pub(super) fn loaded_chunks(&self) -> Vec<ChunkCoord> {
+        self.loaded.keys().copied().collect()
     }
 }
 

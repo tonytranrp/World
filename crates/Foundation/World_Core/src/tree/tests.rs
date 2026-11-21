@@ -50,9 +50,10 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                     "a branch of one material must be a uniform child"
                 );
                 found.0 += 1;
-                if let Some((header, stored)) = b.brick_layout() {
-                    // A header, and a record for every leaf but the full ones
-                    // of the default material: the most common full material.
+                if let Some((header, len)) = b.brick_layout() {
+                    // A header, one word for every other full leaf and a
+                    // record for every leaf but the full ones of the default
+                    // material: the most common full material.
                     let mut counts = std::collections::BTreeMap::new();
                     for (_, c) in &children {
                         if let NodeRef::Uniform(m) = c {
@@ -70,8 +71,17 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                         }
                         None => assert_eq!(header, Default::default()),
                     }
-                    assert_eq!(stored, children.len() - header.full.count_ones() as usize);
-                    found.2 += 3 + RECORD_WORDS * stored;
+                    let full = children
+                        .iter()
+                        .filter(|(_, c)| matches!(c, NodeRef::Uniform(_)))
+                        .fold(0u64, |m, (slot, _)| m | 1 << slot);
+                    assert_eq!(header.full | header.other, full, "every full leaf");
+                    assert_eq!(header.full & header.other, 0);
+                    let others = header.other.count_ones() as usize;
+                    let records = children.len() - full.count_ones() as usize;
+                    let header_len = if others == 0 { 3 } else { 5 };
+                    assert_eq!(len, header_len + others + RECORD_WORDS * records);
+                    found.2 += len;
                 } else {
                     found.2 += children.len();
                 }

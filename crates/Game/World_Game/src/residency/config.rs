@@ -21,17 +21,42 @@ pub struct ResidencyConfig {
     pub coarse_cell_level: u32,
     /// Full-detail chunks may hold at most this much RAM, in MiB.
     pub hot_cap_mib: u32,
-    /// Compressed edited chunks kept after eviction, in MiB.
+    /// Compressed chunks kept after eviction (edited and generated), in MiB.
     pub warm_cap_mib: u32,
+    /// Edited chunks in the warm cache age this many times more slowly than
+    /// generated ones, so they stay longer (losing one costs a region file
+    /// read on top of generation).
+    pub warm_edited_weight: f32,
     /// Coarse chunks, in MiB.
     pub coarse_cap_mib: u32,
     /// Worker threads for generation and encoding.
     pub workers: u32,
     /// Chunks joined to the world per frame at most.
     pub grafts_per_frame: u32,
+    /// When the edit log grows this much past its size after the last
+    /// checkpoint, the edited chunks are written to their region files and
+    /// the log restarts from a checkpoint, in KiB.
+    pub log_checkpoint_kib: u32,
     /// Where region files and the edit log live, relative to the working
     /// directory.
     pub save_dir: String,
+    /// The player's velocity is averaged over about this long, in seconds.
+    pub velocity_smoothing_secs: f32,
+    /// While the player moves, full-detail chunks near where they will be
+    /// this many seconds ahead load first, and a lookahead sphere there is
+    /// loaded too. 0 turns prefetching off.
+    pub prefetch_lookahead_secs: f32,
+    /// The lookahead sphere's radius, in metres. Its chunks load only once
+    /// every chunk within the full-detail radius is requested, and only out
+    /// to the evict radius.
+    pub prefetch_radius_m: f32,
+    /// Column footprints (the heightfield under a chunk, 4 MiB each) shared
+    /// by the workers, so chunks stacked in a column compute it once, in
+    /// MiB. 0 turns the cache off.
+    pub column_cache_mib: u32,
+    /// Chunks entirely below the terrain surface load as if they were this
+    /// much farther away, in metres, so the visible ones come first.
+    pub buried_delay_m: f32,
 }
 
 impl Default for ResidencyConfig {
@@ -44,10 +69,17 @@ impl Default for ResidencyConfig {
             coarse_cell_level: 2,
             hot_cap_mib: 1300,
             warm_cap_mib: 400,
+            warm_edited_weight: 4.0,
             coarse_cap_mib: 500,
             workers: 4,
             grafts_per_frame: 8,
+            log_checkpoint_kib: 16384,
             save_dir: "saves/world".into(),
+            velocity_smoothing_secs: 0.5,
+            prefetch_lookahead_secs: 2.0,
+            prefetch_radius_m: 64.0,
+            column_cache_mib: 128,
+            buried_delay_m: 32.0,
         }
     }
 }
@@ -69,6 +101,12 @@ impl ConfigAsset for ResidencyConfig {
         range("coarse_cell_level", self.coarse_cell_level.into(), 1.0, 4.0);
         range("hot_cap_mib", self.hot_cap_mib.into(), 64.0, 65536.0);
         range("warm_cap_mib", self.warm_cap_mib.into(), 0.0, 65536.0);
+        range(
+            "warm_edited_weight",
+            self.warm_edited_weight.into(),
+            1.0,
+            64.0,
+        );
         range("coarse_cap_mib", self.coarse_cap_mib.into(), 0.0, 65536.0);
         range("workers", self.workers.into(), 0.0, 64.0);
         range(
@@ -77,6 +115,41 @@ impl ConfigAsset for ResidencyConfig {
             1.0,
             1024.0,
         );
+        range(
+            "log_checkpoint_kib",
+            self.log_checkpoint_kib.into(),
+            64.0,
+            1_048_576.0,
+        );
+        range(
+            "velocity_smoothing_secs",
+            self.velocity_smoothing_secs.into(),
+            0.0,
+            10.0,
+        );
+        range(
+            "prefetch_lookahead_secs",
+            self.prefetch_lookahead_secs.into(),
+            0.0,
+            10.0,
+        );
+        range(
+            "prefetch_radius_m",
+            self.prefetch_radius_m.into(),
+            16.0,
+            1024.0,
+        );
+        range(
+            "column_cache_mib",
+            self.column_cache_mib.into(),
+            0.0,
+            16384.0,
+        );
+        range("buried_delay_m", self.buried_delay_m.into(), 0.0, 1024.0);
+        if (1..4).contains(&self.column_cache_mib) {
+            // Less than one footprint (4 MiB) holds none.
+            problems.push("column_cache_mib must be 0 (off) or at least 4".into());
+        }
         if self.evict_radius_m < self.full_radius_m {
             problems.push("evict_radius_m must be at least full_radius_m".into());
         }
@@ -109,10 +182,17 @@ mod tests {
             full_radius_m: 200.0,
             evict_radius_m: 100.0,
             workers: 100,
+            log_checkpoint_kib: 1,
             save_dir: " ".into(),
+            velocity_smoothing_secs: f32::NAN,
+            prefetch_lookahead_secs: -1.0,
+            prefetch_radius_m: 4.0,
+            warm_edited_weight: 0.5,
+            column_cache_mib: 20000,
+            buried_delay_m: f32::NAN,
             ..ResidencyConfig::default()
         };
-        assert_eq!(bad.validate().unwrap_err().len(), 3);
+        assert_eq!(bad.validate().unwrap_err().len(), 10);
     }
 
     #[test]

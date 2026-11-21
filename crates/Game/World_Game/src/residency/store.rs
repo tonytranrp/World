@@ -131,6 +131,58 @@ impl RegionStore {
         Ok(())
     }
 
+    /// Copies every record of `chunk` into the `set_aside` folder, one file
+    /// per record named after the chunk, kind and generator version, never
+    /// replacing an earlier copy. Used before a chunk whose record could not
+    /// be loaded is written, so that record survives for a build that can
+    /// read it. Returns how many records were copied.
+    pub fn set_aside(&self, chunk: ChunkCoord) -> Result<usize, RegionError> {
+        let kinds: Vec<RecordKind> = {
+            let (region, inner) = split(chunk);
+            let path = self.path(region);
+            if !path.exists() {
+                return Ok(0);
+            }
+            let file = RegionFile::open(&path)?;
+            file.index()
+                .entries
+                .iter()
+                .filter(|e| e.chunk == inner)
+                .map(|e| e.kind)
+                .collect()
+        };
+        let records = self.read(chunk, &kinds)?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let dir = self.set_aside_dir();
+        fs::create_dir_all(&dir)?;
+        let [x, y, z] = chunk.to_array();
+        for r in &records {
+            let kind = match r.kind {
+                RecordKind::Overlay => "overlay".to_string(),
+                RecordKind::Full => "full".to_string(),
+                RecordKind::Coarse(level) => format!("coarse{level}"),
+            };
+            let stem = format!("c.{x}.{y}.{z}.{kind}.v{}", r.generator);
+            let mut n = 0;
+            let path = loop {
+                let path = dir.join(format!("{stem}.{n}.tree"));
+                if !path.exists() {
+                    break path;
+                }
+                n += 1;
+            };
+            write_atomic(&path, &r.bytes)?;
+        }
+        Ok(records.len())
+    }
+
+    /// Where [`set_aside`](Self::set_aside) puts records.
+    pub fn set_aside_dir(&self) -> PathBuf {
+        self.dir.join("set_aside")
+    }
+
     /// The edit log's path.
     pub fn wal_path(&self) -> PathBuf {
         self.dir.join("edits.wvl")

@@ -45,7 +45,7 @@ pub fn cargo() -> Command {
     Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
 }
 
-fn describe(command: &Command) -> String {
+pub fn describe(command: &Command) -> String {
     let mut parts = vec![command.get_program().to_string_lossy().into_owned()];
     parts.extend(command.get_args().map(|a| a.to_string_lossy().into_owned()));
     for (key, value) in command.get_envs() {

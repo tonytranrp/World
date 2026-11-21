@@ -64,7 +64,8 @@ impl EvictPass {
         Self { params, bind_group }
     }
 
-    /// Clears the victim block and records the pass for `params`.
+    /// Clears the victim block and records the pass for `params`, with
+    /// optional timestamps.
     pub fn record(
         &self,
         queue: &Queue,
@@ -72,6 +73,7 @@ impl EvictPass {
         pools: &GpuPools,
         pipeline: &ComputePipeline,
         params: &EvictParams,
+        timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(params));
         encoder.clear_buffer(
@@ -81,7 +83,7 @@ impl EvictPass {
         );
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("brick_cache.evict"),
-            timestamp_writes: None,
+            timestamp_writes: timestamps,
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);

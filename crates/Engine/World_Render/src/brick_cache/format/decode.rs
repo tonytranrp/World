@@ -11,8 +11,9 @@ use world_core::MaterialId;
 use world_core::coords::path::child_slot;
 
 use super::{
-    BLOCK_COUNT_MASK, BLOCK_HEADER_WORDS, BrickRef, GpuNode, Kind, LEAF_MASK_WORDS,
-    PALETTE_BITS_SHIFT, PALETTE_LEN_MASK, PAYLOAD_UNIFORM_BIT, ROOT_NODE, rank,
+    BLOCK_COUNT_MASK, BLOCK_DEFAULT_MASK_WORD, BLOCK_DEFAULT_WORD, BLOCK_FULL_MASK_WORD,
+    BLOCK_HEADER_WORDS, BrickRef, GpuNode, Kind, LEAF_MASK_WORDS, PALETTE_BITS_SHIFT,
+    PALETTE_LEN_MASK, PAYLOAD_UNIFORM_BIT, ROOT_NODE, rank,
 };
 
 /// The pools as the GPU holds them.
@@ -51,7 +52,8 @@ pub enum DecodeError {
     BlockOutOfRange {
         block: BrickRef,
     },
-    /// The block's leaf count disagrees with its node's mask.
+    /// The block's masks or partial leaf count disagree with its node's
+    /// mask.
     BlockCountMismatch {
         block: BrickRef,
     },
@@ -116,11 +118,7 @@ impl<'a> PoolView<'a> {
                 Kind::Brick if level == 1 => {
                     let block = BrickRef::unpack(node.reference);
                     let words = self.block(block)?;
-                    let n = words[1] & BLOCK_COUNT_MASK;
-                    if n != mask.count_ones() {
-                        return Err(DecodeError::BlockCountMismatch { block });
-                    }
-                    return block_voxel(words, block, n, rank(mask, slot), child_slot(local, 0));
+                    return block_voxel(words, block, mask, slot, child_slot(local, 0));
                 }
                 _ => return Err(DecodeError::KindAtWrongLevel { index, level }),
             }
@@ -128,24 +126,51 @@ impl<'a> PoolView<'a> {
     }
 }
 
-/// Voxel `voxel_slot` of leaf `k` of a block holding `n` leaves.
+/// The two-word mask at header word `at` of a block.
+fn header_mask(words: &[u32], at: u32) -> u64 {
+    u64::from(words[at as usize]) | u64::from(words[at as usize + 1]) << 32
+}
+
+/// Voxel `voxel_slot` of leaf `slot` of a block whose node has `mask`.
+/// `words` holds at least the header.
 pub fn block_voxel(
     words: &[u32],
     block: BrickRef,
-    n: u32,
-    k: u32,
+    mask: u64,
+    slot: u32,
     voxel_slot: u32,
 ) -> Result<Sample, DecodeError> {
+    let default_mask = header_mask(words, BLOCK_DEFAULT_MASK_WORD);
+    let full_mask = header_mask(words, BLOCK_FULL_MASK_WORD);
+    let stored = mask & !default_mask;
+    let partial = stored & !full_mask;
+    let p = words[1] & BLOCK_COUNT_MASK;
+    if default_mask & !mask != 0
+        || full_mask & !stored != 0
+        || p != partial.count_ones()
+        || mask & (1u64 << slot) == 0
+    {
+        return Err(DecodeError::BlockCountMismatch { block });
+    }
+    if default_mask & (1u64 << slot) != 0 {
+        return Ok(Sample::Exact(MaterialId(
+            words[BLOCK_DEFAULT_WORD as usize] as u16,
+        )));
+    }
     let out = DecodeError::BlockOutOfRange { block };
-    let at = (BLOCK_HEADER_WORDS + k * LEAF_MASK_WORDS) as usize;
-    let lo = *words.get(at).ok_or(out)?;
-    let hi = *words.get(at + 1).ok_or(out)?;
-    let leaf_mask = u64::from(lo) | u64::from(hi) << 32;
+    let leaf_mask = if full_mask & (1u64 << slot) != 0 {
+        u64::MAX
+    } else {
+        let at = (BLOCK_HEADER_WORDS + rank(partial, slot) * LEAF_MASK_WORDS) as usize;
+        let lo = *words.get(at).ok_or(out)?;
+        let hi = *words.get(at + 1).ok_or(out)?;
+        u64::from(lo) | u64::from(hi) << 32
+    };
     if leaf_mask & (1u64 << voxel_slot) == 0 {
         return Ok(Sample::Air);
     }
     let payload = *words
-        .get((BLOCK_HEADER_WORDS + n * LEAF_MASK_WORDS + k) as usize)
+        .get((BLOCK_HEADER_WORDS + p * LEAF_MASK_WORDS + rank(stored, slot)) as usize)
         .ok_or(out)?;
     if payload & PAYLOAD_UNIFORM_BIT != 0 {
         return Ok(Sample::Exact(MaterialId(payload as u16)));

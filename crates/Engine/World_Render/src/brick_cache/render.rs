@@ -5,15 +5,17 @@
 //! 1. Extract: the main world's [`VoxelWorldFeed`] is *taken* (each change
 //!    exactly once) into [`PendingFeed`]; the config and the main camera's
 //!    view point are copied.
-//! 2. `RenderGraph` / `Begin` ([`run_brick_cache`]): finished read-backs are
-//!    collected without waiting, one frame of streaming runs on the CPU, and
-//!    the upload, the apply pass and (when the pool is full) the eviction
-//!    pass are recorded ahead of every camera.
-//! 3. Cameras trace and composite (`passes`).
-//! 4. `RenderGraph` / `Render`, after the cameras ([`copy_feedback`]): the
+//! 2. `Render`, in no set ([`stream_brick_cache`]): finished read-backs are
+//!    collected without waiting and one frame of streaming runs on the CPU,
+//!    while `prepare_windows` may still be waiting for a swapchain texture.
+//! 3. `RenderGraph` / `Begin` ([`run_brick_cache`]): the upload, the apply
+//!    pass and (when the pool is full) the eviction pass are recorded ahead
+//!    of every camera.
+//! 4. Cameras trace and composite (`passes`).
+//! 5. `RenderGraph` / `Render`, after the cameras ([`copy_feedback`]): the
 //!    request block (and victims) go to a free read-back slot, and the
 //!    request counter is cleared for the next frame.
-//! 5. `RenderGraph` / `Finish` ([`map_feedback`]): the copied slots are mapped
+//! 6. `RenderGraph` / `Finish` ([`map_feedback`]): the copied slots are mapped
 //!    asynchronously.
 //!
 //! Nothing here ever blocks on the GPU.
@@ -26,7 +28,7 @@ use bevy::render::camera::ExtractedCamera;
 use bevy::render::render_resource::{
     BindGroupLayoutDescriptor, CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
+use bevy::render::renderer::{FlushCommands, RenderContext, RenderDevice, RenderQueue};
 use bevy::render::view::ExtractedView;
 use wgpu::util::StagingBelt;
 use world_core::ConfigAsset;
@@ -48,8 +50,9 @@ use super::stream::residency::Residency;
 use super::stream::select::ViewPoint;
 use super::stream::upload::{
     APPLY_ENTRY_POINTS, ApplyPipelines, UploadBuffer, apply_bind_group, apply_layout_entries,
-    record_apply,
+    record_apply_pass, stage_upload,
 };
+use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::tier::RenderTier;
 
 pub const APPLY_SHADER_PATH: &str = "shaders/brick_cache/apply.wesl";
@@ -195,6 +198,9 @@ pub struct BrickCacheState {
     victims: Vec<Victim>,
     snapshot: Option<Arc<TreeSnapshot>>,
     evicted_this_frame: bool,
+    /// What [`stream_brick_cache`] did this frame, until [`run_brick_cache`]
+    /// records it.
+    streamed: Option<FrameReport>,
     /// Frame number stamped on uploads and compared by rays (1 or more).
     pub frame: u32,
     pub last_report: FrameReport,
@@ -271,6 +277,7 @@ pub fn init_brick_cache(
         victims: Vec::new(),
         snapshot: None,
         evicted_this_frame: false,
+        streamed: None,
         frame: 0,
         last_report: FrameReport::default(),
     });
@@ -284,8 +291,13 @@ pub fn advance_frame(state: Option<ResMut<BrickCacheState>>) {
     }
 }
 
-/// One frame of streaming, recorded ahead of every camera.
-pub fn run_brick_cache(
+/// One frame of streaming on the CPU: finished read-backs, the feed, then
+/// [`run_frame`] into the upload batch. It runs in the `Render` schedule,
+/// ordered only after extraction and the cache's view point, so it overlaps
+/// `prepare_windows`, which can wait milliseconds for a swapchain texture
+/// while the GPU finishes earlier frames. [`run_brick_cache`] records what
+/// it produced.
+pub fn stream_brick_cache(
     state: Option<ResMut<BrickCacheState>>,
     pipelines: Option<Res<CachePipelines>>,
     cache: Res<PipelineCache>,
@@ -293,20 +305,30 @@ pub fn run_brick_cache(
     config: Res<ExtractedCacheConfig>,
     view: Res<CacheViewPoint>,
     device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    mut ctx: RenderContext,
 ) {
     let (Some(mut state), Some(pipelines)) = (state, pipelines) else {
         return;
     };
     let state = &mut *state;
+    if state.streamed.is_some() {
+        // Last frame's batch was never recorded (its pipelines were being
+        // rebuilt, as after a shader reload). The residency table already
+        // counts it as uploaded, so it must reach the GPU before anything
+        // else is streamed: the CPU table stays the source of truth.
+        return;
+    }
     let wgpu_device = device.wgpu_device();
     let shape = state.residency.shape();
     let layout = state.pools.layout.clone();
 
+    let ray_guided = config.0.stage == Stage::RayGuided;
     for readback in state.ring.collect(wgpu_device) {
-        let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
-        state.requests = requests;
+        // Stage 1 ignores requests: decoding and sorting a full block costs
+        // milliseconds a frame.
+        if ray_guided {
+            let (requests, _) = decode_requests(&readback.requests, layout.request_capacity, shape);
+            state.requests = requests;
+        }
         if !readback.victims.is_empty() {
             let (victims, _) =
                 decode_victims(&readback.victims, layout.victim_capacity, layout.brick_ids);
@@ -314,15 +336,14 @@ pub fn run_brick_cache(
         }
     }
 
-    let apply: Option<Vec<&bevy::render::render_resource::ComputePipeline>> = pipelines
+    let ready = pipelines
         .apply
         .iter()
-        .map(|&id| cache.get_compute_pipeline(id))
-        .collect();
-    let (Some(apply), Some(evict_pipeline)) = (apply, cache.get_compute_pipeline(pipelines.evict))
-    else {
+        .chain([&pipelines.evict])
+        .all(|&id| cache.get_compute_pipeline(id).is_some());
+    if !ready {
         return; // Shaders still compiling: keep the feed pending.
-    };
+    }
 
     let feed = std::mem::take(&mut pending.0);
     let mut refresh = feed.refresh;
@@ -350,11 +371,14 @@ pub fn run_brick_cache(
         Vec::new()
     };
     let victims = std::mem::take(&mut state.victims);
+    // Checked against the source when their chunks are applied.
+    state.residency.offer_summaries(feed.summaries);
     let input = FrameInput {
         source,
         frame: state.frame,
         refresh,
         dirty: &feed.dirty,
+        chunks: &feed.chunks,
         view: view.0,
         requests: &requests,
         victims: &victims,
@@ -364,10 +388,59 @@ pub fn run_brick_cache(
     };
     let report = run_frame(&mut state.residency, &input, &mut state.batch);
     state.last_report = report;
+    state.streamed = Some(report);
+}
+
+/// Records this frame's streaming ahead of every camera: the upload, the
+/// apply pass and, when the pool is full, the eviction pass.
+pub fn run_brick_cache(
+    state: Option<ResMut<BrickCacheState>>,
+    pipelines: Option<Res<CachePipelines>>,
+    cache: Res<PipelineCache>,
+    config: Res<ExtractedCacheConfig>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut timer: Option<ResMut<GpuPassTimer>>,
+    sampled: Option<ResMut<SampledPassTimer>>,
+    mut flush: FlushCommands,
+    mut ctx: RenderContext,
+) {
+    let (Some(mut state), Some(pipelines)) = (state, pipelines) else {
+        return;
+    };
+    let state = &mut *state;
+    if state.streamed.is_none() {
+        return;
+    }
+    let wgpu_device = device.wgpu_device();
+    let layout = state.pools.layout.clone();
+    let apply: Option<Vec<&bevy::render::render_resource::ComputePipeline>> = pipelines
+        .apply
+        .iter()
+        .map(|&id| cache.get_compute_pipeline(id))
+        .collect();
+    let (Some(apply), Some(evict_pipeline)) = (apply, cache.get_compute_pipeline(pipelines.evict))
+    else {
+        // Keep the streamed batch: `stream_brick_cache` waits for it.
+        return;
+    };
+    let Some(report) = state.streamed.take() else {
+        return;
+    };
 
     let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("brick_cache.frame"),
     });
+    // A sampled frame records each timed pass in its own encoder, to submit
+    // and time alone; otherwise they share `encoder`, with timestamps.
+    let sampling = sampled
+        .as_ref()
+        .is_some_and(|s| s.wants(TimedPass::Apply) && s.wants(TimedPass::Evict));
+    let alone = |label| {
+        wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+    };
+    let mut apply_alone = None;
+    let mut evict_alone = None;
     if !state.batch.is_empty() {
         let counts = state.batch.serialize(&mut state.words);
         state
@@ -386,15 +459,17 @@ pub fn run_brick_cache(
                 table: apply[2],
                 link: apply[3],
             };
-            record_apply(
-                &mut encoder,
-                &mut state.belt,
-                &state.upload,
-                &state.words,
-                counts,
-                bind_group,
-                &apply_pipelines,
-            );
+            if stage_upload(&mut encoder, &mut state.belt, &state.upload, &state.words) {
+                let (target, writes) = if sampling {
+                    (apply_alone.insert(alone("brick_cache.apply")), None)
+                } else {
+                    let writes = timer
+                        .as_deref_mut()
+                        .and_then(|t| t.compute_writes(TimedPass::Apply));
+                    (&mut encoder, writes)
+                };
+                record_apply_pass(target, counts, bind_group, &apply_pipelines, writes);
+            }
         }
     }
     if let Some(target) = report.evict_target
@@ -408,13 +483,48 @@ pub fn run_brick_cache(
             capacity: layout.victim_capacity,
             _pad: [0; 3],
         };
-        state
-            .evict
-            .record(&queue, &mut encoder, &state.pools, evict_pipeline, &params);
+        let (target, writes) = if sampling {
+            (evict_alone.insert(alone("brick_cache.evict")), None)
+        } else {
+            let writes = timer
+                .as_deref_mut()
+                .and_then(|t| t.compute_writes(TimedPass::Evict));
+            (&mut encoder, writes)
+        };
+        state.evict.record(
+            &queue,
+            target,
+            &state.pools,
+            evict_pipeline,
+            &params,
+            writes,
+        );
         state.evicted_this_frame = true;
     }
     state.belt.finish_and_recall_on_submit(&encoder);
-    ctx.add_command_buffer(encoder.finish());
+    match sampled {
+        Some(mut sampled) if apply_alone.is_some() || evict_alone.is_some() => {
+            // Everything before, then the staging copy, then each pass alone.
+            let mut before = Some(encoder.finish());
+            for (pass, alone) in [
+                (TimedPass::Apply, apply_alone),
+                (TimedPass::Evict, evict_alone),
+            ] {
+                let Some(alone) = alone else {
+                    continue;
+                };
+                let before = before.take();
+                let submit = || {
+                    flush.flush();
+                    if let Some(buffer) = before {
+                        queue.submit([buffer]);
+                    }
+                };
+                sampled.time_alone(pass, wgpu_device, &queue, submit, alone);
+            }
+        }
+        _ => ctx.add_command_buffer(encoder.finish()),
+    }
 }
 
 /// Copies this frame's requests (and victims) to a read-back slot and clears
@@ -444,6 +554,8 @@ pub fn map_feedback(state: Option<ResMut<BrickCacheState>>) {
 pub fn log_cache_stats(
     state: Option<Res<BrickCacheState>>,
     view: Option<Res<CacheViewPoint>>,
+    mut timer: Option<ResMut<GpuPassTimer>>,
+    mut sampled: Option<ResMut<SampledPassTimer>>,
     mut last: Local<u32>,
 ) {
     let Some(state) = state else {
@@ -458,7 +570,7 @@ pub fn log_cache_stats(
     let s = state.residency.stats();
     let r = state.last_report;
     info!(
-        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}",
+        "brick cache frame {}: {} records, {} expanded, {} bricks ({} KiB, {:.1}% bricks, {:.1}% nodes); last frame: {} loaded, {} expanded, {} edits uploaded, {} unlinked, {} changes applied, {} pending, {} evicted, {} victims, {} B upload; read-back skips {}; detail x{:.2}; so far {} summaries computed, {} chunks applied with worker summaries ({} stale)",
         state.frame,
         s.entries,
         s.expanded,
@@ -470,16 +582,34 @@ pub fn log_cache_stats(
         r.expanded,
         r.edited_uploaded,
         r.edited_unlinked,
+        r.changes_applied,
+        r.changes_pending,
         r.evicted,
         r.victims_applied,
         r.upload_bytes,
         state.ring.skipped,
         state.residency.pressure(),
+        state.residency.summaries_computed(),
+        state.residency.offers_used().0,
+        state.residency.offers_used().1,
     );
     if let Some(v) = view.as_ref().and_then(|v| v.0) {
         info!(
             "brick cache view: eye {:?} voxels, {:.2e} rad per pixel",
             v.eye, v.pixel_angle
         );
+    }
+    // GPU pass times since the last line, where the device reports them.
+    if let Some(times) = timer.as_deref_mut().and_then(GpuPassTimer::take) {
+        info!("gpu passes frame {} (timestamps): {times}", state.frame);
+    }
+    if let Some(times) = sampled.as_deref_mut().and_then(SampledPassTimer::take) {
+        info!(
+            "gpu passes frame {} (sampled, wall clock alone): {times}",
+            state.frame
+        );
+    }
+    if let Some(rays) = sampled.as_deref_mut().and_then(SampledPassTimer::take_rays) {
+        info!("primary rays frame {} (sampled): {rays}", state.frame);
     }
 }

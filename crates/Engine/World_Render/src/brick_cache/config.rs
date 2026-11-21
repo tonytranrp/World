@@ -67,6 +67,25 @@ pub struct LodTuning {
     /// many voxels, or the cache changed; `0` looks every frame.
     /// `0.0..=4096.0`.
     pub regrow_voxels: f32,
+    /// A stage 1 pass in progress starts over from the root only once the
+    /// camera moved this many voxels since it started (at least
+    /// `regrow_voxels`); smaller moves let it finish, since every node is
+    /// checked against the current view when it is taken. `0.0..=65536.0`.
+    pub restart_voxels: f32,
+    /// Nodes stage 1 or 2 expands per frame at most; the rest wait for the
+    /// next frame. `1..=1048576`.
+    pub max_expansions_per_frame: u32,
+    /// Node summaries expansions may compute per frame (on one thread,
+    /// unlike a replaced chunk's); the rest wait. `1..=16777216`.
+    pub max_expansion_summaries_per_frame: u32,
+    /// Records the shrink walk (collapse, evict) examines per frame; it
+    /// only frees memory, so it may lag behind growth. A pass started by
+    /// node pool pressure takes `max_visits_per_frame` if that is larger.
+    /// `256..=16777216`.
+    pub max_shrink_visits_per_frame: u32,
+    /// Nodes the shrink walk collapses per frame at most (each releases its
+    /// subtree); it resumes where it stopped. `1..=1048576`.
+    pub max_collapses_per_frame: u32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -95,6 +114,21 @@ pub struct BrickCacheConfig {
     /// Victims one eviction pass can return. Read at startup. `64..=1048576`.
     pub victim_capacity: u32,
     pub lod: LodTuning,
+    /// Node summaries (each over up to 64 children) that applying changed
+    /// bricks and replaced chunks may compute per frame; the rest waits for
+    /// later frames, nearest first. A
+    /// replaced 16 m chunk costs one per mixed node in it (up to about
+    /// 6,000); a chunk's are computed on up to 8 threads. Walking at 8 m/s
+    /// needs 1,500 to 2,500 a frame. `1..=16777216`.
+    pub max_summaries_per_frame: u32,
+    /// Tasks a replaced chunk's summaries are split into on the brick cache's
+    /// task pool; 0 picks one per pool thread (at most 8). `0..=64`.
+    pub summary_threads: u32,
+    /// Records whose groups and bricks are freed per frame after a collapse
+    /// or a replaced chunk took them out of the tree; the rest wait, and
+    /// nothing below them is refined until they are freed. A refined 16 m
+    /// chunk can hold over 100,000. `256..=16777216`.
+    pub max_frees_per_frame: u32,
     /// Show a small built-in scene while nothing feeds the renderer a world.
     pub debug_scene: bool,
     /// Animate a carve in the debug scene, to exercise edit uploads.
@@ -128,7 +162,15 @@ impl Default for BrickCacheConfig {
                 footprint_bias: 1.0,
                 max_visits_per_frame: 16384,
                 regrow_voxels: 16.0,
+                restart_voxels: 128.0,
+                max_expansions_per_frame: 128,
+                max_expansion_summaries_per_frame: 2048,
+                max_shrink_visits_per_frame: 4096,
+                max_collapses_per_frame: 256,
             },
+            max_summaries_per_frame: 8192,
+            summary_threads: 0,
+            max_frees_per_frame: 16384,
             debug_scene: true,
             debug_scene_edits: true,
         }
@@ -221,6 +263,49 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.regrow_voxels.into(),
             0.0,
             4096.0,
+        );
+        range(
+            "max_summaries_per_frame",
+            self.max_summaries_per_frame.into(),
+            1.0,
+            16777216.0,
+        );
+        range("summary_threads", self.summary_threads.into(), 0.0, 64.0);
+        range(
+            "max_frees_per_frame",
+            self.max_frees_per_frame.into(),
+            256.0,
+            16777216.0,
+        );
+        range(
+            "lod.restart_voxels",
+            self.lod.restart_voxels.into(),
+            0.0,
+            65536.0,
+        );
+        range(
+            "lod.max_shrink_visits_per_frame",
+            self.lod.max_shrink_visits_per_frame.into(),
+            256.0,
+            16777216.0,
+        );
+        range(
+            "lod.max_collapses_per_frame",
+            self.lod.max_collapses_per_frame.into(),
+            1.0,
+            1048576.0,
+        );
+        range(
+            "lod.max_expansion_summaries_per_frame",
+            self.lod.max_expansion_summaries_per_frame.into(),
+            1.0,
+            16777216.0,
+        );
+        range(
+            "lod.max_expansions_per_frame",
+            self.lod.max_expansions_per_frame.into(),
+            1.0,
+            1048576.0,
         );
         range(
             "lod.max_visits_per_frame",

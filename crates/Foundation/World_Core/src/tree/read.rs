@@ -15,12 +15,13 @@
 use std::fmt;
 
 use super::alloc::{Storage, StorageReader};
+use super::chunks::ChunkData;
 use super::forest::{ChunkKeys, Chunks, chunk_key, chunk_root};
 use super::mutate::LocalBox;
 use super::node::leaf::{self, Record};
 use super::node::{
-    BRICK_HEADER_WORDS, BrickHeader, CHUNK_LEVEL, Child, NOT_RESIDENT, RECORD_WORDS, UNIFORM_BIT,
-    bit, rank, slot_at, slots,
+    BRICK_HEADER_MAX_WORDS, BRICK_HEADER_WORDS, BRICK_OTHER_FULL, BrickHeader, CHUNK_LEVEL, Child,
+    NOT_RESIDENT, RECORD_WORDS, UNIFORM_BIT, bit, rank, slot_at, slots,
 };
 use super::{ROOT_LEVEL, WORLD_ORIGIN};
 use crate::consts::{TREE_DEPTH, TREE_FANOUT};
@@ -54,6 +55,15 @@ pub trait VoxelSource {
     /// with a direct lookup.
     fn get(&self, pos: VoxelPos) -> MaterialId {
         descend(self.root(), self.levels(), self.origin(), pos)
+    }
+
+    /// The content of the chunk-level region at `min`, shared, for sources
+    /// that store chunks as detachable arenas (trees and snapshots), so a
+    /// reader can tell with [`ChunkData::same_arenas`] whether it is content
+    /// it has seen. `None` for other sources and where it is not resident.
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        let _ = min;
+        None
     }
 }
 
@@ -245,6 +255,12 @@ pub trait TreeRead {
     fn get(&self, pos: VoxelPos) -> MaterialId {
         descend(self.root(), TREE_DEPTH, WORLD_ORIGIN, pos)
     }
+
+    /// As [`VoxelSource::shared_chunk`].
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        let _ = min;
+        None
+    }
 }
 
 impl<T: TreeRead + ?Sized> VoxelSource for T {
@@ -267,6 +283,10 @@ impl<T: TreeRead + ?Sized> VoxelSource for T {
 
     fn get(&self, pos: VoxelPos) -> MaterialId {
         TreeRead::get(self, pos)
+    }
+
+    fn shared_chunk(&self, min: VoxelPos) -> Option<ChunkData> {
+        TreeRead::shared_chunk(self, min)
     }
 }
 
@@ -300,6 +320,7 @@ impl<'a> NodeRef<'a> {
                     chunks,
                     level,
                     mask: node.mask,
+                    info: node.info,
                     block: storage.block(node.base, node.block_len(level)),
                 })
             }
@@ -394,8 +415,10 @@ pub struct BranchRef<'a> {
     chunks: &'a Chunks,
     level: u32,
     mask: u64,
-    /// One child word (level 2 and up) or leaf record (level 1) per non-air
-    /// child, in slot order.
+    /// The node's `info`: at level 1, the block length and flags.
+    info: u32,
+    /// One child word (level 2 and up) per non-air child, in slot order, or
+    /// a brick header and stored leaves (level 1).
     block: &'a [u32],
 }
 
@@ -417,15 +440,11 @@ impl<'a> BranchRef<'a> {
             return NodeRef::Air;
         }
         if self.level == 1 {
-            let header = BrickHeader::read(self.block);
+            let header = BrickHeader::read(self.block, self.info);
             if header.full & bit(slot) != 0 {
                 return NodeRef::Uniform(header.default);
             }
-            let at = header.record_offset(self.mask, slot);
-            return NodeRef::leaf(
-                self.storage,
-                Record::read(&self.block[at..at + RECORD_WORDS]),
-            );
+            return NodeRef::leaf(self.storage, header.stored(self.block, self.mask, slot));
         }
         self.child_at(rank(self.mask, slot))
     }
@@ -443,15 +462,10 @@ impl<'a> BranchRef<'a> {
         })
     }
 
-    /// For a level-1 node: its header and the number of stored records, for
+    /// For a level-1 node: its header and its block length in words, for
     /// storage accounting.
     pub(crate) fn brick_layout(&self) -> Option<(BrickHeader, usize)> {
-        (self.level == 1).then(|| {
-            (
-                BrickHeader::read(self.block),
-                (self.block.len() - BRICK_HEADER_WORDS) / RECORD_WORDS,
-            )
-        })
+        (self.level == 1).then(|| (BrickHeader::read(self.block, self.info), self.block.len()))
     }
 
     /// The `k`-th non-air child of a node of level 2 or higher.
@@ -744,11 +758,24 @@ pub(crate) fn step<const UNLOADED: bool, const BRICK: bool>(
         return Step::Filled(MaterialId::AIR);
     }
     if BRICK && level == 1 {
-        let header = BrickHeader::read(storage.block(node.base, BRICK_HEADER_WORDS));
-        if header.full & bit(slot) != 0 {
-            return Step::Filled(header.default);
+        let head = storage.block(node.base, BRICK_HEADER_WORDS);
+        let full = u64::from(head[0]) | u64::from(head[1]) << 32;
+        if full & bit(slot) != 0 {
+            return Step::Filled(MaterialId(head[2] as u16));
         }
-        return Step::Record(node.base + header.record_offset(node.mask, slot) as u32);
+        // Most bricks have no other-full leaves: every stored leaf is a
+        // record, one rank as before decision 0021.
+        let stored = node.mask & !full;
+        if node.info & BRICK_OTHER_FULL == 0 {
+            let at = BRICK_HEADER_WORDS + RECORD_WORDS * rank(stored, slot);
+            return Step::Record(node.base + at as u32);
+        }
+        let header = BrickHeader::read(storage.block(node.base, BRICK_HEADER_MAX_WORDS), node.info);
+        let at = node.base + header.record_offset(node.mask, slot) as u32;
+        if header.other & bit(slot) != 0 {
+            return Step::Filled(MaterialId(storage.word(at) as u16));
+        }
+        return Step::Record(at);
     }
     let k = rank(node.mask, slot) as u32;
     let word = storage.word(node.base + k);

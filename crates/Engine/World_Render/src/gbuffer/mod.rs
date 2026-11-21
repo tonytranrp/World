@@ -33,7 +33,7 @@ pub const HIT_FLAG_FOOTPRINT: u32 = 4;
 pub const HIT_FLAG_EXHAUSTED: u32 = 8;
 pub const FACE_INSIDE: u32 = 6;
 
-/// The constants `passes/primary/trace.wesl` mirrors.
+/// The hit record constants, generated into the shaders by `cargo xtask codegen`.
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("HIT_WORDS", HIT_WORDS),
     ("HIT_FLAG_HIT", HIT_FLAG_HIT),

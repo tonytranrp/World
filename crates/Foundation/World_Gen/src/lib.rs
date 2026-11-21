@@ -32,7 +32,7 @@ use std::fmt;
 
 pub use chunk::{
     CHUNK_SIZE, CHUNKS_PER_AXIS, ChunkColumns, ChunkCoord, ChunkOutOfWorld, ChunkSource,
-    CoarseColumns, CoarseSource, MAX_COARSE_LEVEL,
+    CoarseColumns, CoarseSource, FootprintBounds, MAX_COARSE_LEVEL,
 };
 pub use config::{HeightBounds, TerrainConfig};
 pub use surface::{Column, Layers};
@@ -203,6 +203,61 @@ impl Generator {
         ChunkSource::with_caves(self.columns(chunk), self.caves.clone())
     }
 
+    /// [`chunk_source`](Self::chunk_source) for `chunk` from `columns`
+    /// computed for any chunk stacked on the same footprint: columns do not
+    /// depend on `y`, so this skips the heightfield, most of the cost of a
+    /// chunk. `None` when `columns` came from another generator or
+    /// footprint.
+    pub fn chunk_source_from(
+        &self,
+        columns: &ChunkColumns,
+        chunk: ChunkCoord,
+    ) -> Option<ChunkSource> {
+        if !columns.serves(self.id, chunk) {
+            return None;
+        }
+        let columns = columns.for_chunk(chunk)?;
+        Some(ChunkSource::with_caves(columns, self.caves.clone()))
+    }
+
+    /// The one material of every voxel of `chunk`, when its footprint's
+    /// `bounds` prove it without building: air when the chunk lies at or
+    /// above every column's top (caves only carve solid voxels), bedrock
+    /// when it lies below every column's bedrock and no cave can reach it.
+    /// `None` when not proven, or when `bounds` belong to another generator
+    /// or footprint. The chunk built from
+    /// [`chunk_source`](Self::chunk_source) is that material wherever this
+    /// answers.
+    pub fn uniform_chunk(&self, bounds: &FootprintBounds, chunk: ChunkCoord) -> Option<MaterialId> {
+        if !bounds.serves(self.id, chunk) {
+            return None;
+        }
+        let bottom = i64::from(chunk.min_voxel().y);
+        let top = bottom + i64::from(CHUNK_SIZE); // exclusive
+        let (_, max_height) = bounds.height_range;
+        if bottom >= i64::from(max_height) {
+            return Some(MaterialId::AIR);
+        }
+        if top > i64::from(bounds.bedrock_below) {
+            return None;
+        }
+        // A voxel can be carved only where some column allows it, and the
+        // highest column allows the most (the cover is measured from the
+        // top), so probing it at every height of the chunk bounds them all.
+        if let Some(caves) = &self.caves {
+            let highest = Column {
+                height: max_height,
+                surface: MaterialId::AIR,
+                surface_depth: 0,
+                soil_depth: 0,
+            };
+            if (bottom..top).any(|y| caves.carvable(y as i32, &highest)) {
+                return None;
+            }
+        }
+        Some(self.layers().bedrock)
+    }
+
     /// Whether this generator carves caves.
     pub fn has_caves(&self) -> bool {
         self.caves.is_some()
@@ -287,6 +342,63 @@ mod tests {
             g.coarse_columns(ChunkCoord::new(0, 0, 0).unwrap(), 6)
                 .is_err()
         );
+    }
+
+    /// The content hash of `chunk` built from `source`, and its content when
+    /// it is one material.
+    fn built(chunk: ChunkCoord, source: &ChunkSource) -> (u64, Option<MaterialId>) {
+        let mut tree = world_core::VoxelTree::new();
+        let min = chunk.min_voxel();
+        tree.build_region(world_core::tree::CHUNK_LEVEL, min, source)
+            .unwrap();
+        let hash = world_core::serialize::content_hash(&tree);
+        (hash, tree.take_chunk(min).unwrap().uniform())
+    }
+
+    #[test]
+    fn stacked_chunks_build_the_same_from_shared_columns() {
+        for version in GeneratorVersion::SUPPORTED {
+            let g = Generator::new(0xC0FFEE, *version, TerrainConfig::default()).unwrap();
+            let probe = ChunkCoord::new(511, 512, 518).unwrap();
+            let shared = g.columns(probe);
+            let bounds = shared.bounds();
+            let (lo, hi) = shared.height_range();
+            let min = probe.min_voxel();
+            let at = |y: i32| ChunkCoord::containing(VoxelPos::new(min.x, y, min.z)).unwrap();
+            let surface = at(lo + (hi - lo) / 2);
+            let air = at(hi + CHUNK_SIZE as i32);
+            let buried = at(lo - 2 * CHUNK_SIZE as i32);
+            // Below the cave band (-256 m).
+            let deep = at(-20_000);
+            for chunk in [at(hi), air, surface, buried, deep] {
+                let fresh = g.chunk_source(chunk);
+                let from = g.chunk_source_from(&shared, chunk).unwrap();
+                assert_eq!(from.columns(), fresh.columns(), "{chunk:?}");
+                assert!(from.columns().shares_columns(&shared), "{chunk:?}");
+                let (want, content) = built(chunk, &fresh);
+                assert_eq!(built(chunk, &from).0, want, "{version:?} {chunk:?}");
+                if let Some(m) = g.uniform_chunk(&bounds, chunk) {
+                    assert_eq!(content, Some(m), "{version:?} {chunk:?}");
+                }
+            }
+            assert_eq!(g.uniform_chunk(&bounds, air), Some(MaterialId::AIR));
+            assert_eq!(g.uniform_chunk(&bounds, surface), None);
+            assert_eq!(g.uniform_chunk(&bounds, deep), Some(g.layers().bedrock));
+            // Inside the cave band, rock is uniform only without caves.
+            assert_eq!(
+                g.uniform_chunk(&bounds, buried).is_some(),
+                !g.has_caves(),
+                "{version:?}"
+            );
+            // Columns and bounds of another footprint or generator serve
+            // nothing.
+            let beside = ChunkCoord::new(512, air.y(), 518).unwrap();
+            assert!(g.chunk_source_from(&shared, beside).is_none());
+            assert_eq!(g.uniform_chunk(&bounds, beside), None);
+            let other = Generator::new(1, *version, TerrainConfig::default()).unwrap();
+            assert!(other.chunk_source_from(&shared, air).is_none());
+            assert_eq!(other.uniform_chunk(&bounds, air), None);
+        }
     }
 
     #[test]

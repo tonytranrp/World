@@ -1,0 +1,2031 @@
+//! CPU-only checks of the brick cache's per-frame budgets (decisions 0010
+//! and 0012): replaced chunks are rebuilt from their new content, changes
+//! beyond the summary budget wait and are applied nearest first, an edit
+//! costs summaries in proportion to what changed, expansions per frame are
+//! bounded, and a growth pass is bounded in pops and pushes and survives
+//! small camera moves.
+
+mod common;
+
+use common::{apply_cpu, cpu_cache, make_resident, small_layout};
+use world_core::tree::VoxelSource;
+use world_core::{BrickPos, MaterialId, VoxelBox, VoxelPos, VoxelTree};
+use world_render::internals::BrickCacheConfig;
+use world_render::internals::batch::{CpuPools, UploadBatch};
+use world_render::internals::frame::{FrameInput, FrameReport, run_frame};
+use world_render::internals::key::{NodeKey, Shape, view_at};
+use world_render::internals::residency::Residency;
+use world_render::internals::select::{GrowthState, ViewPoint, select_budgeted};
+
+/// A ground slab across four chunks, its bricks mixed so they need blocks.
+fn slab() -> VoxelTree {
+    let mut tree = VoxelTree::new();
+    tree.fill_box(
+        VoxelBox::new(VoxelPos::new(-64, -16, -64), VoxelPos::new(64, 0, 64)),
+        MaterialId(1),
+    )
+    .unwrap();
+    for x in (-64..64).step_by(8) {
+        for z in (-64..64).step_by(8) {
+            tree.set(VoxelPos::new(x, -1, z), MaterialId::AIR).unwrap();
+        }
+    }
+    tree
+}
+
+/// Different content for the chunk at `min`: a thinner slab of another
+/// material in one quarter of the old one's footprint, with holes.
+fn replacement(min: VoxelPos) -> world_core::tree::ChunkData {
+    let mut other = VoxelTree::new();
+    let x0 = if min.x < 0 { -40 } else { 0 };
+    let z0 = if min.z < 0 { -40 } else { 0 };
+    other
+        .fill_box(
+            VoxelBox::new(
+                VoxelPos::new(x0, -16, z0),
+                VoxelPos::new(x0 + 40, -6, z0 + 40),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+    for x in (x0..x0 + 40).step_by(4) {
+        other
+            .set(VoxelPos::new(x, -7, z0 + 5), MaterialId(4))
+            .unwrap();
+        other
+            .set(VoxelPos::new(x, -9, z0 + 9), MaterialId::AIR)
+            .unwrap();
+    }
+    other.chunk_data(min).expect("mixed content")
+}
+
+/// The four chunks the slab spans.
+const CHUNKS: [VoxelPos; 4] = [
+    VoxelPos::new(-1024, -1024, -1024),
+    VoxelPos::new(0, -1024, -1024),
+    VoxelPos::new(-1024, -1024, 0),
+    VoxelPos::new(0, -1024, 0),
+];
+
+/// A table and pools with room for every brick of the debug scene, so the
+/// order of loads cannot change what fits.
+fn roomy_cache(shape: Shape) -> (Residency, CpuPools) {
+    let layout = world_render::internals::layout::PoolLayout {
+        segments: vec![8 << 20, 8 << 20],
+        brick_ids: 1 << 16,
+        allocs_per_segment: 1 << 16,
+        ..small_layout()
+    };
+    let res = Residency::new(shape, &layout).expect("node space");
+    let pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    (res, pools)
+}
+
+fn verify(res: &mut Residency, source: &impl VoxelSource, pools: &CpuPools) {
+    let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        res.verify(source, &pools.nodes, &segs, &pools.table),
+        Ok(())
+    );
+}
+
+struct Frame<'a, S: VoxelSource> {
+    source: &'a S,
+    dirty: &'a [BrickPos],
+    chunks: &'a [VoxelPos],
+    view: Option<ViewPoint>,
+    config: &'a BrickCacheConfig,
+}
+
+fn step<S: VoxelSource + Sync>(
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    frame: u32,
+    f: Frame<'_, S>,
+) -> FrameReport {
+    let mut batch = UploadBatch::default();
+    let input = FrameInput {
+        source: f.source,
+        frame,
+        refresh: false,
+        dirty: f.dirty,
+        chunks: f.chunks,
+        view: f.view,
+        requests: &[],
+        victims: &[],
+        config: f.config,
+        budget: 64 << 20,
+        victim_capacity: 64,
+    };
+    let report = run_frame(res, &input, &mut batch);
+    apply_cpu(pools, &batch);
+    report
+}
+
+/// A chunk replaced wholesale (a load, an unload, a swap between full and
+/// coarse detail) is rebuilt from its new content, including everything
+/// that was resident below it, not just the path to one of its bricks.
+#[test]
+fn a_replaced_chunk_is_rebuilt_from_its_new_content() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig::default();
+
+    let min = CHUNKS[3];
+    tree.insert_chunk(min, replacement(min)).unwrap();
+    let snap = tree.snapshot();
+    let r = step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[],
+            chunks: &[min],
+            view: None,
+            config: &config,
+        },
+    );
+    assert_eq!((r.changes_applied, r.changes_pending), (1, 0));
+    verify(&mut res, &snap, &pools);
+
+    // Unloaded: the region becomes not resident.
+    tree.take_chunk(min).unwrap();
+    let snap = tree.snapshot();
+    step(
+        &mut res,
+        &mut pools,
+        11,
+        Frame {
+            source: &snap,
+            dirty: &[],
+            chunks: &[min],
+            view: None,
+            config: &config,
+        },
+    );
+    verify(&mut res, &snap, &pools);
+}
+
+/// Changes whose summaries exceed the per-frame budget wait: each frame
+/// makes progress on the nearest, and once all are applied the table
+/// matches the source exactly.
+#[test]
+fn changes_over_the_summary_budget_wait_and_go_nearest_first() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    for min in CHUNKS {
+        tree.insert_chunk(min, replacement(min)).unwrap();
+    }
+    let snap = tree.snapshot();
+    let chunk_key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    // The new content is mostly material 3, the old one material 1.
+    let chunk_material = |_: VoxelPos| MaterialId(3);
+    let mut applied_order = Vec::new();
+    let mut frame = 10;
+    loop {
+        let before: Vec<bool> = CHUNKS
+            .iter()
+            .map(|&m| res.record(chunk_key(m)).map(|r| r.material()) == Some(chunk_material(m)))
+            .collect();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &CHUNKS } else { &[] },
+                view: None,
+                config: &config,
+            },
+        );
+        assert!(r.changes_applied <= 1, "{r:?}");
+        for (i, &m) in CHUNKS.iter().enumerate() {
+            let now = res.record(chunk_key(m)).map(|r| r.material()) == Some(chunk_material(m));
+            if now && !before[i] {
+                applied_order.push(i);
+            }
+        }
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < 40, "the changes never drained");
+    }
+    assert!(frame > 14, "the budget spread the changes over frames");
+    applied_order.sort_unstable();
+    assert_eq!(applied_order, [0, 1, 2, 3], "each applied once");
+    verify(&mut res, &snap, &pools);
+
+    // With a view, the nearest change goes first.
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    for min in CHUNKS {
+        tree.insert_chunk(min, replacement(min)).unwrap();
+    }
+    let snap = tree.snapshot();
+    // Over the last chunk, with a pixel angle so fine that stage 1 keeps
+    // everything resident.
+    let near = CHUNKS[3];
+    let view = ViewPoint {
+        eye: [near.x as f32 + 40.0, 0.0, near.z as f32 + 40.0],
+        pixel_angle: 1e-6,
+    };
+    let mut frame = 10;
+    loop {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &CHUNKS } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        frame += 1;
+        if r.changes_applied > 0 {
+            assert_eq!((r.changes_applied, r.changes_pending), (1, 3), "{r:?}");
+            break;
+        }
+        assert!(frame < 20, "nothing was applied");
+    }
+    let material = |min: VoxelPos| res.record(chunk_key(min)).map(|r| r.material());
+    assert_eq!(
+        material(near),
+        Some(MaterialId(3)),
+        "the nearest chunk went first"
+    );
+    for &m in &CHUNKS[..3] {
+        assert_eq!(material(m), Some(MaterialId(1)), "{m:?} waits");
+    }
+}
+
+/// A replaced chunk too large for one frame's budget is summarized over
+/// several frames, each within the budget plus one grandchild's summaries
+/// (at most 65) and the chunk's own path once it is applied.
+#[test]
+fn a_large_replaced_chunk_is_summarized_across_frames() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let budget = 20u64;
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: budget as u32,
+        ..Default::default()
+    };
+    // A rough slab over a 256 x 256 footprint: 16 mixed level-2 nodes of
+    // mixed bricks.
+    let min = CHUNKS[3];
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(VoxelPos::new(0, -16, 0), VoxelPos::new(256, -2, 256)),
+            MaterialId(3),
+        )
+        .unwrap();
+    for x in (0..256).step_by(5) {
+        for z in (0..256).step_by(7) {
+            other.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    tree.insert_chunk(min, other.chunk_data(min).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    let key = NodeKey::containing(shape.local(min).unwrap(), 4);
+    let mixed = count_mixed(view_at(&snap, key), 4);
+    assert!(mixed > 3 * budget, "{mixed} mixed nodes");
+    let mins = [min];
+    let mut frame = 10;
+    loop {
+        let before = res.summaries_computed();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &mins } else { &[] },
+                view: None,
+                config: &config,
+            },
+        );
+        let spent = res.summaries_computed() - before;
+        let slack = 65 + u64::from(shape.root_level()) + 64;
+        assert!(spent <= budget + slack, "frame {frame}: {spent} summaries");
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert_eq!(r.changes_applied, 0, "applied only once summarized");
+        assert!(frame < 200, "never applied");
+    }
+    assert!(frame > 13, "spread over frames");
+    verify(&mut res, &snap, &pools);
+}
+
+/// Nothing in a replaced chunk that waits is expanded or loaded: applying
+/// it drops what the table held there.
+#[test]
+fn a_waiting_chunk_is_not_refined() {
+    use world_render::internals::residency::{Change, Refused};
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let min = CHUNKS[1];
+    let key = NodeKey::containing(shape.local(min).unwrap(), 4);
+    let mut batch = UploadBatch::default();
+    res.collapse(key, &mut batch).unwrap();
+    tree.insert_chunk(min, replacement(min)).unwrap();
+    let snap = tree.snapshot();
+    res.queue_changes([Change::Chunk(key)]);
+    assert!(res.in_waiting_chunk(key));
+    assert!(res.in_waiting_chunk(key.child(0)));
+    assert_eq!(res.expand(&snap, key, &mut batch), Err(Refused::Waiting));
+    // Applied, it refines as usual.
+    res.apply_changes(&snap, None, u64::MAX, 1, |_| true, &mut batch);
+    assert!(!res.in_waiting_chunk(key));
+    assert!(res.expand(&snap, key, &mut batch).is_ok());
+}
+
+/// An edit recomputes one summary per level on its path, however much of
+/// the world is resident; a replaced chunk about one per mixed node in it.
+#[test]
+fn an_edit_costs_summaries_in_proportion_to_what_changed() {
+    let config = BrickCacheConfig::default();
+    let edit_cost = |tree: &mut VoxelTree| {
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let (mut res, mut pools) = cpu_cache(shape);
+        make_resident(&mut res, &snap, &mut pools);
+        let dirty = tree
+            .apply(&[world_core::Edit::new(
+                VoxelPos::new(3, -5, 3),
+                MaterialId(2),
+            )])
+            .unwrap();
+        let snap = tree.snapshot();
+        let before = res.summaries_computed();
+        step(
+            &mut res,
+            &mut pools,
+            10,
+            Frame {
+                source: &snap,
+                dirty: dirty.as_slice(),
+                chunks: &[],
+                view: None,
+                config: &config,
+            },
+        );
+        verify(&mut res, &snap, &pools);
+        (res.summaries_computed() - before, shape.root_level())
+    };
+    let (small, levels) = edit_cost(&mut slab());
+    let mut big = slab();
+    big.fill_box(
+        VoxelBox::new(VoxelPos::new(-64, -48, -64), VoxelPos::new(64, -32, 64)),
+        MaterialId(5),
+    )
+    .unwrap();
+    for x in (-64..64).step_by(8) {
+        big.set(VoxelPos::new(x, -40, 7), MaterialId::AIR).unwrap();
+    }
+    let (large, _) = edit_cost(&mut big);
+    assert!(small <= u64::from(levels), "{small} summaries for one edit");
+    assert_eq!(small, large, "the cost does not grow with the world");
+
+    // A replaced chunk: its mixed nodes, plus the path above it.
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let min = CHUNKS[0];
+    tree.insert_chunk(min, replacement(min)).unwrap();
+    let snap = tree.snapshot();
+    let key = NodeKey::containing(shape.local(min).unwrap(), 4);
+    let mixed = count_mixed(view_at(&snap, key), 4);
+    let before = res.summaries_computed();
+    step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[],
+            chunks: &[min],
+            view: None,
+            config: &config,
+        },
+    );
+    let cost = res.summaries_computed() - before;
+    assert!(
+        cost <= mixed + u64::from(shape.root_level()),
+        "{cost} summaries for a chunk of {mixed} mixed nodes"
+    );
+    verify(&mut res, &snap, &pools);
+}
+
+/// Mixed nodes of level 1 and up under and including `node` (of `level`).
+fn count_mixed<N: world_core::tree::NodeView>(node: N, level: u32) -> u64 {
+    use world_core::tree::NodeKind;
+    if level == 0 || node.kind() != NodeKind::Branch {
+        return 0;
+    }
+    1 + node
+        .children()
+        .map(|(_, c)| count_mixed(c, level - 1))
+        .sum::<u64>()
+}
+
+/// No frame expands more nodes than `lod.max_expansions_per_frame`, and a
+/// tight limit reaches the same cache as a roomy one, later.
+#[test]
+fn a_frame_never_expands_more_than_its_budget() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let run = |limit: u32, frames: u32| {
+        let mut config = BrickCacheConfig::default();
+        config.lod.max_expansions_per_frame = limit;
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut most = 0;
+        let mut late = 0;
+        for frame in 1..=frames {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 24 << 20,
+                victim_capacity: 64,
+            };
+            let r = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            most = most.max(r.expanded);
+            if frame > frames - 5 {
+                late += r.expanded + r.loaded;
+            }
+        }
+        verify(&mut res, &snap, &pools);
+        let s = res.stats();
+        (most, late, s.expanded, s.bricks)
+    };
+    let roomy = run(1 << 20, 60);
+    let tight = run(3, 600);
+    assert!(
+        roomy.0 > 3,
+        "the roomy run expands more per frame: {roomy:?}"
+    );
+    assert!(tight.0 <= 3, "{tight:?}");
+    assert_eq!((roomy.1, tight.1), (0, 0), "both settled");
+    assert_eq!((tight.2, tight.3), (roomy.2, roomy.3));
+}
+
+/// Stage 1 keeps only a few frames' worth of load candidates. Under a
+/// still camera and an upload budget of a few bricks a frame, the ones it
+/// left out are found by a later pass, so the cache loads exactly what a
+/// roomy budget loads.
+#[test]
+fn bricks_left_out_of_a_frame_are_loaded_by_a_later_pass() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let config = BrickCacheConfig::default();
+    let run = |budget: u64, frames: u32| {
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut late = 0;
+        for frame in 1..=frames {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget,
+                victim_capacity: 64,
+            };
+            let r = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if frame > frames - 5 {
+                late += r.expanded + r.loaded;
+            }
+        }
+        verify(&mut res, &snap, &pools);
+        let s = res.stats();
+        (late, s.expanded, s.bricks)
+    };
+    let roomy = run(64 << 20, 60);
+    let tight = run(u64::from(config.mean_brick_bytes) * 2, 3000);
+    assert!(roomy.2 > 100, "enough bricks to leave some out: {roomy:?}");
+    assert_eq!((roomy.0, tight.0), (0, 0), "both settled");
+    assert_eq!((tight.1, tight.2), (roomy.1, roomy.2));
+}
+
+/// A growth step makes at most `max_visits` queue pops and pushes, plus
+/// the pushes of the one node that crossed the limit.
+#[test]
+fn a_growth_step_is_bounded_in_pops_and_pushes() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = cpu_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let lod = BrickCacheConfig::default().lod;
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 1e-4,
+    };
+    // Collapse everything below the forced levels, so a pass has work.
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    for budget in [1u32, 2, 16, 100] {
+        let mut steps = 0;
+        loop {
+            select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, budget);
+            assert!(
+                growth.last_visits() < budget + 64,
+                "{} visits on a budget of {budget}",
+                growth.last_visits()
+            );
+            steps += 1;
+            if !growth.is_active() {
+                break;
+            }
+        }
+        assert!(steps >= 1);
+        growth = GrowthState::default();
+    }
+}
+
+/// A growth pass in progress keeps going when the camera moves less than
+/// `lod.restart_voxels`, since every node it takes is judged from the
+/// current view; a larger move starts it over from the new view.
+#[test]
+fn a_growth_pass_survives_small_moves() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, _pools) = cpu_cache(shape);
+    let config = BrickCacheConfig::default();
+    let lod = config.lod;
+    assert!(lod.restart_voxels > 2.0 * lod.regrow_voxels);
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    // A few frames on a small budget: partly refined, much left to do.
+    let mut batch = UploadBatch::default();
+    for frame in 1..=8 {
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 256 << 10,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+    }
+    let mut walk = Vec::new();
+    let mut growth = GrowthState::default();
+    select_budgeted(&res, &mut walk, &mut growth, &view, &lod, 1.0, 2);
+    assert!(growth.is_active());
+    assert_eq!(growth.started_at(), Some(view));
+
+    let small = ViewPoint {
+        eye: [0.0, 0.0, 2.0 * lod.regrow_voxels],
+        ..view
+    };
+    select_budgeted(&res, &mut walk, &mut growth, &small, &lod, 1.0, 2);
+    assert_eq!(
+        growth.started_at(),
+        Some(view),
+        "a small move keeps the pass"
+    );
+
+    let large = ViewPoint {
+        eye: [0.0, 0.0, 2.0 * lod.restart_voxels],
+        ..view
+    };
+    select_budgeted(&res, &mut walk, &mut growth, &large, &lod, 1.0, 2);
+    assert_eq!(growth.started_at(), Some(large), "a large move restarts it");
+}
+
+/// No frame collapses more than `lod.max_collapses_per_frame` nodes, and a
+/// camera that leaves the scene still ends with everything collapsed that
+/// a roomy limit collapses.
+#[test]
+fn a_frame_never_collapses_more_than_its_budget() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let near = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let far = ViewPoint {
+        eye: [0.0, 0.0, -20000.0],
+        ..near
+    };
+    let run = |limit: u32| {
+        let mut config = BrickCacheConfig::default();
+        config.lod.max_collapses_per_frame = limit;
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut most = 0;
+        for frame in 1..=400 {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(if frame <= 60 { near } else { far }),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 24 << 20,
+                victim_capacity: 64,
+            };
+            let r = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            most = most.max(r.collapsed);
+        }
+        verify(&mut res, &snap, &pools);
+        let s = res.stats();
+        (most, s.expanded, s.bricks)
+    };
+    let roomy = run(1 << 20);
+    let tight = run(2);
+    assert!(
+        roomy.0 > 2,
+        "the roomy run collapses more per frame: {roomy:?}"
+    );
+    assert!(tight.0 <= 2, "{tight:?}");
+    assert_eq!((tight.1, tight.2), (roomy.1, roomy.2));
+}
+
+/// The shrink pass a node pool pressure change starts walks at the growth
+/// budget, never the whole table in one frame, and the pressure holds while
+/// it runs.
+#[test]
+fn a_pressure_change_shrinks_within_the_visit_budget() {
+    use world_render::internals::layout::PoolLayout;
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let mut config = BrickCacheConfig::default();
+    // Small enough that a shrink pass over this scene spans frames.
+    config.lod.max_visits_per_frame = 64;
+    config.lod.max_shrink_visits_per_frame = 16;
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let layout = PoolLayout {
+        node_count: 5 << 9,
+        node_groups: 5 << 7,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    let mut settling_frames = 0;
+    for frame in 1..=400 {
+        let pressure = res.pressure();
+        let settling = res.settling();
+        let input = FrameInput {
+            source: &snap,
+            frame,
+            refresh: frame == 1,
+            dirty: &[],
+            chunks: &[],
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config: &config,
+            budget: 24 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(&mut res, &input, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        assert!(res.growth().last_shrink_visits() <= 64, "frame {frame}");
+        // Held through every frame whose shrink step used its whole budget,
+        // so the pass is still running.
+        if settling && res.growth().last_shrink_visits() == 64 {
+            settling_frames += 1;
+            assert_eq!(res.pressure(), pressure, "frame {frame}: held");
+        }
+    }
+    assert!(res.pressure() > 1.0, "the small pool raised the pressure");
+    assert!(
+        settling_frames > 0,
+        "a pressure change started a shrink pass"
+    );
+    assert!(!res.settling(), "and it finished");
+    verify(&mut res, &snap, &pools);
+}
+
+/// A rough slab of material 3 over `x0..x0 + 256` and `z0..z0 + 256`, 14
+/// voxels thick with holes: 16 mixed level-2 nodes, so summarizing it takes
+/// several frames on a small budget.
+fn rough_slab(x0: i32, z0: i32) -> VoxelTree {
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(
+                VoxelPos::new(x0, -16, z0),
+                VoxelPos::new(x0 + 256, -2, z0 + 256),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+    for x in (x0..x0 + 256).step_by(5) {
+        for z in (z0..z0 + 256).step_by(7) {
+            other.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    other
+}
+
+/// A small slab of material 3 inside the chunk at `min`.
+fn replacement_at(min: VoxelPos) -> world_core::tree::ChunkData {
+    let mut other = VoxelTree::new();
+    other
+        .fill_box(
+            VoxelBox::new(
+                VoxelPos::new(min.x, -16, min.z),
+                VoxelPos::new(min.x + 40, -6, min.z + 40),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+    other.chunk_data(min).expect("mixed content")
+}
+
+/// The table is consistent while a replaced chunk waits, even when a
+/// sibling's change rewrites the group holding the waiting chunk with a
+/// different mask: the waiting chunk's old children are never read through
+/// the new mask, and collapsing it frees everything below it.
+#[test]
+fn a_waiting_chunk_stays_consistent_when_its_parent_group_is_rewritten() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    // c1 holds part of the slab and is expanded; c2, in the same level-5
+    // node, is air until it is replaced.
+    let c1 = VoxelPos::new(0, -1024, 0);
+    let c2 = VoxelPos::new(1024, -1024, 0);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    assert_eq!(key(c1).parent(), key(c2).parent());
+    assert!(res.is_expanded(key(c1)) && res.is_expanded(key(c1).parent()));
+    assert!(!res.has_record(key(c2)));
+    // c1's new content sits in another level-3 cell, so its mask changes.
+    tree.insert_chunk(c1, rough_slab(256, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c2, replacement_at(c2)).unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    // Over c2, with a pixel angle so fine that stage 1 keeps everything.
+    let view = ViewPoint {
+        eye: [c2.x as f32 + 40.0, -10.0, c2.z as f32 + 40.0],
+        pixel_angle: 1e-6,
+    };
+    let both = [c1, c2];
+    let mut frame = 10;
+    while !res.has_record(key(c2)) {
+        step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        frame += 1;
+        assert!(frame < 30, "c2 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    verify(&mut res, &snap, &pools);
+
+    // Collapsing the waiting chunk leaks nothing: after a reset no node
+    // group and no brick id is left in use.
+    let mut batch = UploadBatch::default();
+    let _ = res.collapse(key(c1), &mut batch);
+    apply_cpu(&mut pools, &batch);
+    verify(&mut res, &snap, &pools);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    let s = res.stats();
+    assert_eq!((s.expanded, s.bricks), (0, 0), "{s:?}");
+}
+
+/// An edit inside a replaced chunk that waits is folded into the chunk's
+/// own change, which rebuilds it anyway: it never uploads new content into
+/// the old structure or summarizes the new chunk outside the budget.
+#[test]
+fn an_edit_inside_a_waiting_chunk_waits_for_the_chunk() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let c1 = VoxelPos::new(0, -1024, 0);
+    tree.insert_chunk(c1, rough_slab(256, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    // An edit in a brick that is resident in the old content.
+    let at = VoxelPos::new(3, -5, 3);
+    let dirty = tree
+        .apply(&[world_core::Edit::new(at, MaterialId(2))])
+        .unwrap();
+    let snap = tree.snapshot();
+    let budget = 4u64;
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: budget as u32,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [at.x as f32, at.y as f32, at.z as f32],
+        pixel_angle: 1e-6,
+    };
+    let one = [c1];
+    let mut frame = 10;
+    loop {
+        let before = res.summaries_computed();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: if frame == 10 { dirty.as_slice() } else { &[] },
+                chunks: if frame == 10 { &one } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        let spent = res.summaries_computed() - before;
+        // The budget, one grandchild (65), the chunk's path once applied.
+        let slack = 65 + u64::from(shape.root_level()) + 64;
+        assert!(spent <= budget + slack, "frame {frame}: {spent} summaries");
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < 200, "never applied");
+    }
+    verify(&mut res, &snap, &pools);
+}
+
+/// Changed bricks count against the summary budget too: many edits on a
+/// budget of one apply about one a frame, nearest first, and converge.
+#[test]
+fn many_edits_spread_over_frames_on_a_small_budget() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let edits: Vec<world_core::Edit> = (0..12)
+        .map(|i| world_core::Edit::new(VoxelPos::new(-60 + 10 * i, -5, 3), MaterialId(2)))
+        .collect();
+    let dirty = tree.apply(&edits).unwrap();
+    assert!(dirty.len() >= 8, "{} bricks", dirty.len());
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    // At the far end of the row: the nearest brick goes first.
+    let view = ViewPoint {
+        eye: [60.0, -5.0, 3.0],
+        pixel_angle: 1e-6,
+    };
+    let nearest = shape
+        .brick_key(world_core::BrickPos::containing(VoxelPos::new(50, -5, 3)))
+        .unwrap();
+    let edited_material =
+        |res: &Residency| res.record(nearest).map(|r| r.edited()).unwrap_or_default();
+    let mut frame = 10;
+    loop {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: if frame == 10 { dirty.as_slice() } else { &[] },
+                chunks: &[],
+                view: Some(view),
+                config: &config,
+            },
+        );
+        if frame == 10 {
+            assert_eq!(r.changes_applied, 1, "{r:?}");
+            assert!(edited_material(&res), "the nearest brick went first");
+        }
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < 100, "never drained");
+    }
+    assert!(frame - 10 >= dirty.len() as u32, "one a frame");
+    verify(&mut res, &snap, &pools);
+}
+
+/// A change that waits below an expanded node changes that node's mask in
+/// the source; when a change elsewhere rewrites the group above it, the
+/// node keeps its record and everything resident below it, instead of
+/// dropping its whole subtree for stage 1 to rebuild (which, walking, threw
+/// away up to 600,000 records in one frame).
+#[test]
+fn a_waiting_change_below_keeps_its_ancestors_resident() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    // c0 holds part of the slab; c1, in the same level-5 node, is air until
+    // replaced and then waits; c3, in another level-5 node of the same
+    // level-6 node, is air until replaced and is applied first.
+    let c0 = VoxelPos::new(0, -1024, 0);
+    let c1 = VoxelPos::new(1024, -1024, 0);
+    let c3 = VoxelPos::new(4096, -1024, 0);
+    assert_eq!(key(c0).parent(), key(c1).parent());
+    assert_ne!(key(c0).parent(), key(c3).parent());
+    assert_eq!(key(c0).ancestor(6), key(c3).ancestor(6));
+    assert!(res.is_expanded(key(c0)));
+    let expanded_before = res.stats().expanded;
+    tree.insert_chunk(c1, rough_slab(1024, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c3, replacement_at(c3)).unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [c3.x as f32 + 40.0, -10.0, c3.z as f32 + 40.0],
+        pixel_angle: 1e-6,
+    };
+    let both = [c1, c3];
+    let mut frame = 10;
+    while !res.has_record(key(c3)) {
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config: &config,
+            },
+        );
+        assert_eq!(r.collapsed, 0);
+        frame += 1;
+        assert!(frame < 30, "c3 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    assert!(res.is_expanded(key(c0)), "c0 kept its detail");
+    assert!(
+        res.stats().expanded >= expanded_before,
+        "{} expanded, {expanded_before} before",
+        res.stats().expanded
+    );
+    verify(&mut res, &snap, &pools);
+}
+
+/// A frame whose only change is an edit inside a waiting chunk (which only
+/// marks its path edited) leaves the root's record on the mask its group
+/// is laid out for, even when the waiting chunk changes the root's mask.
+/// (Ported from the second review.)
+#[test]
+fn an_edit_folded_into_a_waiting_chunk_keeps_the_root_on_its_layout() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let root = shape.root();
+    let old_mask = res.record(root).unwrap().mask();
+    // A chunk in a level-8 child of the root that was air.
+    let c = VoxelPos::new(-524288, -1024, 0);
+    let ck = NodeKey::containing(shape.local(c).unwrap(), 4);
+    tree.insert_chunk(c, rough_slab(c.x, c.z).chunk_data(c).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    {
+        use world_core::tree::NodeView;
+        assert_ne!(
+            view_at(&snap, root).mask(),
+            old_mask,
+            "the root's mask changes"
+        );
+    }
+    let brick = BrickPos::containing(VoxelPos::new(c.x + 3, -5, c.z + 3));
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[brick],
+            chunks: &[c],
+            view: None,
+            config: &config,
+        },
+    );
+    assert!(res.in_waiting_chunk(ck), "the chunk still waits");
+    verify(&mut res, &snap, &pools);
+}
+
+/// The setup of `a_waiting_change_below_keeps_its_ancestors_resident`: c0
+/// resident, c1 (same level-5 node, air) replaced and waiting, c3 (another
+/// level-5 node of the same level-6 node, air) replaced and applied first,
+/// so the level-5 node above c0 and c1 keeps its record.
+fn keep_level5(
+    tree: &mut VoxelTree,
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    shape: Shape,
+    config: &BrickCacheConfig,
+    view: ViewPoint,
+) -> u32 {
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    let (c1, c3) = (VoxelPos::new(1024, -1024, 0), VoxelPos::new(4096, -1024, 0));
+    tree.insert_chunk(c1, rough_slab(1024, 0).chunk_data(c1).unwrap())
+        .unwrap();
+    tree.insert_chunk(c3, replacement_at(c3)).unwrap();
+    let snap = tree.snapshot();
+    let both = [c1, c3];
+    let mut frame = 10;
+    while !res.has_record(key(c3)) {
+        step(
+            res,
+            pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: if frame == 10 { &both } else { &[] },
+                view: Some(view),
+                config,
+            },
+        );
+        frame += 1;
+        assert!(frame < 30, "c3 was never applied");
+    }
+    assert!(res.in_waiting_chunk(key(c1)), "c1 still waits");
+    let l5 = key(c1).parent();
+    {
+        use world_core::tree::NodeView;
+        assert_ne!(
+            res.record(l5).map(|r| r.mask()),
+            Some(view_at(&snap, l5).mask()),
+            "the level-5 node kept its record"
+        );
+    }
+    frame
+}
+
+/// Runs frames until the queue is empty, then 20 more for stage 1,
+/// verifying after each (fully once nothing is pending).
+fn drain<S: VoxelSource + Sync>(
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    mut frame: u32,
+    source: &S,
+    first: (&[BrickPos], &[VoxelPos]),
+    view: ViewPoint,
+    config: &BrickCacheConfig,
+) {
+    let start = frame;
+    loop {
+        let (dirty, chunks) = if frame == start {
+            first
+        } else {
+            (&[][..], &[][..])
+        };
+        let r = step(
+            res,
+            pools,
+            frame,
+            Frame {
+                source,
+                dirty,
+                chunks,
+                view: Some(view),
+                config,
+            },
+        );
+        verify(res, source, pools);
+        frame += 1;
+        if r.changes_pending == 0 {
+            break;
+        }
+        assert!(frame < start + 400, "the queue never drained");
+    }
+    for f in frame..frame + 20 {
+        step(
+            res,
+            pools,
+            f,
+            Frame {
+                source,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                config,
+            },
+        );
+        verify(res, source, pools);
+    }
+}
+
+/// A kept record is rewritten once the change below it applies: draining
+/// the queue leaves a table that verifies fully.
+#[test]
+fn a_kept_record_is_rewritten_once_the_queue_drains() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    let snap = tree.snapshot();
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (&[], &[]),
+        view,
+        &config,
+    );
+    let c0 = NodeKey::containing(shape.local(VoxelPos::new(0, -1024, 0)).unwrap(), 4);
+    assert!(res.is_expanded(c0));
+}
+
+/// A kept record whose waiting chunk is replaced back by air before it
+/// applies: the queue drains to a table that verifies fully.
+#[test]
+fn a_kept_record_survives_its_chunk_being_reverted() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let c1 = VoxelPos::new(1024, -1024, 0);
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    // Back to air before it applies.
+    tree.fill_box(VoxelBox::from_min_size(c1, [1024; 3]), MaterialId::AIR)
+        .unwrap();
+    let snap = tree.snapshot();
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (&[], &[c1]),
+        view,
+        &config,
+    );
+}
+
+/// A kept record, then an edit below it (a whole brick carved out and one
+/// voxel changed) that applies before the waiting chunk: every frame
+/// verifies, and fully once the queue is drained.
+#[test]
+fn a_kept_record_survives_an_edit_below_it() {
+    let mut tree = slab();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    let view = ViewPoint {
+        eye: [4096.0 + 40.0, -10.0, 40.0],
+        pixel_angle: 1e-6,
+    };
+    let frame = keep_level5(&mut tree, &mut res, &mut pools, shape, &config, view);
+    let mut edits = Vec::new();
+    for x in 0..16 {
+        for y in -16..0 {
+            for z in 0..16 {
+                edits.push(world_core::Edit::new(
+                    VoxelPos::new(x, y, z),
+                    MaterialId::AIR,
+                ));
+            }
+        }
+    }
+    edits.push(world_core::Edit::new(
+        VoxelPos::new(40, -5, 40),
+        MaterialId(2),
+    ));
+    let dirty = tree.apply(&edits).unwrap();
+    let snap = tree.snapshot();
+    let near = ViewPoint {
+        eye: [5.0, -5.0, 5.0],
+        pixel_angle: 1e-6,
+    };
+    drain(
+        &mut res,
+        &mut pools,
+        frame,
+        &snap,
+        (dirty.as_slice(), &[]),
+        near,
+        &config,
+    );
+}
+
+/// While a change waits, verify still checks every record that change
+/// cannot touch: a uniform sibling of the waiting chunk, in the group of a
+/// node on the change's path, must match the source.
+#[test]
+fn verify_still_checks_the_siblings_of_a_waiting_change() {
+    let mut tree = slab();
+    // A uniform chunk next to the one that will be replaced: a record in
+    // the level-5 group with no entry of its own.
+    let u = VoxelPos::new(1024, -1024, 0);
+    tree.fill_box(VoxelBox::from_min_size(u, [1024; 3]), MaterialId(5))
+        .unwrap();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let (mut res, mut pools) = roomy_cache(shape);
+    make_resident(&mut res, &snap, &mut pools);
+    let key = |min: VoxelPos| NodeKey::containing(shape.local(min).unwrap(), 4);
+    let c = VoxelPos::new(0, -1024, 0);
+    let p = key(c).parent();
+    assert_eq!(key(u).parent(), p);
+    assert!(!res.has_record(key(u)), "uniform: no entry");
+    tree.insert_chunk(c, rough_slab(256, 0).chunk_data(c).unwrap())
+        .unwrap();
+    let snap = tree.snapshot();
+    let config = BrickCacheConfig {
+        max_summaries_per_frame: 1,
+        ..Default::default()
+    };
+    step(
+        &mut res,
+        &mut pools,
+        10,
+        Frame {
+            source: &snap,
+            dirty: &[],
+            chunks: &[c],
+            view: None,
+            config: &config,
+        },
+    );
+    assert!(res.in_waiting_chunk(key(c)), "c waits");
+    verify(&mut res, &snap, &pools);
+
+    // Corrupt the uniform sibling's record in the pool.
+    let record = res.record(p).unwrap();
+    let slot = key(u).slot_in_parent();
+    let at = record.reference + (record.mask() & ((1u64 << slot) - 1)).count_ones();
+    let mut bad = pools.nodes[at as usize];
+    bad.info ^= 1;
+    pools.nodes[at as usize] = bad;
+    let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+    assert!(
+        res.verify(&snap, &pools.nodes, &segs, &pools.table)
+            .is_err(),
+        "the corrupted sibling went unnoticed"
+    );
+}
+
+/// The residency table is split into small maps: with tens of thousands of
+/// records, no single map holds more than a level-3 node's worth (64 + 64^2
+/// entries), so no insertion ever grows or rehashes the whole table (once
+/// 282 ms on the floor Mac, after a node pool pressure collapse).
+#[test]
+fn the_residency_table_never_rehashes_much_at_once() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    // Every node expanded, no brick loaded: a record per mixed brick.
+    loop {
+        let todo: Vec<NodeKey> = res
+            .keys()
+            .into_iter()
+            .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+            .collect();
+        if todo
+            .iter()
+            .all(|&k| res.expand(&snap, k, &mut batch).is_err())
+        {
+            break;
+        }
+    }
+    let entries = res.stats().entries;
+    assert!(entries > 10_000, "{entries} entries");
+    let largest = res.largest_table_part();
+    assert!(
+        largest <= 64 + 64 * 64,
+        "{largest} of {entries} entries in one map"
+    );
+}
+
+/// A rough slab like `rough_slab`, `size` voxels square from the origin.
+fn rough_slab_wide(size: i32) -> VoxelTree {
+    let mut tree = VoxelTree::new();
+    tree.fill_box(
+        VoxelBox::new(VoxelPos::new(0, -16, 0), VoxelPos::new(size, -2, size)),
+        MaterialId(3),
+    )
+    .unwrap();
+    for x in (0..size).step_by(5) {
+        for z in (0..size).step_by(7) {
+            tree.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    tree
+}
+
+/// The shipped budget keeps up with a stream of replaced chunks about as
+/// costly as an 8 m/s walk's (1,500 to 2,500 summaries a frame measured;
+/// here a chunk of over 2,048 every frame): the queue stays short
+/// instead of growing frame after frame, and drains to an exact table.
+#[test]
+fn the_shipped_budget_keeps_up_with_a_walks_chunk_stream() {
+    let config = BrickCacheConfig::default();
+    // More chunks than the queue could hold if it fell behind, so repeats
+    // do not cap it.
+    let mins: Vec<VoxelPos> = (0..12)
+        .map(|i| VoxelPos::new(1024 * (i % 4), -1024, 1024 * (i / 4)))
+        .collect();
+    // Two contents per chunk, swapped in turn.
+    let content = |min: VoxelPos, step: i32| {
+        let mut t = VoxelTree::new();
+        t.fill_box(
+            VoxelBox::new(
+                VoxelPos::new(min.x, -16, min.z),
+                VoxelPos::new(min.x + 1024, -2, min.z + 1024),
+            ),
+            MaterialId(3),
+        )
+        .unwrap();
+        for x in (min.x..min.x + 1024).step_by(step as usize) {
+            for z in (min.z..min.z + 1024).step_by(7) {
+                t.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+            }
+        }
+        t.chunk_data(min).unwrap()
+    };
+    let datas: Vec<[world_core::tree::ChunkData; 2]> = mins
+        .iter()
+        .map(|&m| [content(m, 5), content(m, 6)])
+        .collect();
+    let mut tree = VoxelTree::new();
+    for (m, d) in mins.iter().zip(&datas) {
+        tree.insert_chunk(*m, d[0].clone()).unwrap();
+    }
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    let key = |m: VoxelPos| NodeKey::containing(shape.local(m).unwrap(), 4);
+    let cost = count_mixed(view_at(&snap, key(mins[0])), 4);
+    assert!(cost > 2048, "each chunk costs {cost} summaries");
+    let view = ViewPoint {
+        eye: [512.0, 0.0, 512.0],
+        pixel_angle: 1e-9,
+    };
+    // A chunk replaced every frame, round the twelve.
+    let mut most = 0;
+    for frame in 10..70u32 {
+        let swap = Some(frame as usize);
+        let changed: Vec<VoxelPos> = swap
+            .map(|n| {
+                let i = n % mins.len();
+                tree.insert_chunk(mins[i], datas[i][(n / mins.len()) % 2].clone())
+                    .unwrap();
+                vec![mins[i]]
+            })
+            .unwrap_or_default();
+        let snap = tree.snapshot();
+        let r = step(
+            &mut res,
+            &mut pools,
+            frame,
+            Frame {
+                source: &snap,
+                dirty: &[],
+                chunks: &changed,
+                view: Some(view),
+                config: &config,
+            },
+        );
+        most = most.max(r.changes_pending);
+    }
+    assert!(most <= 2, "the queue grew to {most}");
+    let snap = tree.snapshot();
+    drain(&mut res, &mut pools, 200, &snap, (&[], &[]), view, &config);
+}
+
+/// Expands every node of `source` the table holds, without loading bricks:
+/// a record for every mixed node.
+fn grow_records<S: VoxelSource>(res: &mut Residency, source: &S, pools: &mut CpuPools) {
+    let mut batch = UploadBatch::default();
+    loop {
+        let mut changed = false;
+        for k in res.keys() {
+            if k.level >= 2 && !res.is_expanded(k) {
+                changed |= res.expand(source, k, &mut batch).is_ok();
+            }
+        }
+        apply_cpu(pools, &batch);
+        batch.clear();
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// The records of `res` against those of a fresh cache grown over
+/// `source`, whose summaries are computed one node at a time from nothing:
+/// every key the fresh cache has, with the record's mask and material.
+fn records_match_a_fresh_cache<S: VoxelSource>(res: &Residency, source: &S) {
+    let shape = Shape::of(source);
+    let (mut fresh, mut pools) = roomy_cache(shape);
+    let mut batch = UploadBatch::default();
+    fresh.reset(source, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut fresh, source, &mut pools);
+    let describe = |r: &Residency, k: NodeKey| r.record(k).map(|r| (r.mask(), r.material()));
+    let diffs: Vec<_> = fresh
+        .keys()
+        .into_iter()
+        .filter(|&k| describe(res, k) != describe(&fresh, k))
+        .map(|k| (k, describe(res, k), describe(&fresh, k)))
+        .take(5)
+        .collect();
+    assert!(
+        diffs.is_empty(),
+        "records differ from a fresh cache: {diffs:?}"
+    );
+}
+
+/// A replaced chunk summarized over many calls, on one thread or eight,
+/// gives the records a fresh cache gives, and both give identical pools.
+#[test]
+fn warming_on_threads_matches_a_fresh_cache() {
+    use world_render::internals::residency::Change;
+    let run = |threads: usize| {
+        let mut tree = slab();
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        res.reset(&snap, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        grow_records(&mut res, &snap, &mut pools);
+        let c = VoxelPos::new(0, -1024, 0);
+        tree.insert_chunk(c, chunk_slab(c, 5)).unwrap();
+        let snap = tree.snapshot();
+        let key = NodeKey::containing(shape.local(c).unwrap(), 4);
+        let mut batch = UploadBatch::default();
+        res.queue_changes([Change::Chunk(key)]);
+        let mut calls = 0;
+        while res.pending_changes() > 0 {
+            res.apply_changes(&snap, None, 300, threads, |_| true, &mut batch);
+            calls += 1;
+        }
+        assert!(
+            calls > 5,
+            "{calls} calls: the budget should split the chunk"
+        );
+        res.free_buried(u32::MAX, &mut batch);
+        apply_cpu(&mut pools, &batch);
+        grow_records(&mut res, &snap, &mut pools);
+        verify(&mut res, &snap, &pools);
+        records_match_a_fresh_cache(&res, &snap);
+        (
+            res.summaries_computed(),
+            res.keys(),
+            pools.nodes.clone(),
+            pools.segments.clone(),
+        )
+    };
+    assert!(run(1) == run(8), "threads changed the result");
+}
+
+/// In a tree whose chunk level is 3 (a 4-level source), a replaced chunk's
+/// summaries are still those of a fresh cache: uniform leaves weigh 64
+/// voxels, not a level-1 node's 4096. (Ported from the third review.)
+#[test]
+fn a_level3_chunk_summarizes_like_a_fresh_cache() {
+    use world_core::DenseGrid;
+    use world_render::internals::residency::Change;
+    let mut g = DenseGrid::new(4, VoxelPos::new(0, 0, 0));
+    let shape = Shape::of(&g);
+    assert_eq!(shape.root_level(), 3);
+    let (mut res, mut pools) = roomy_cache(shape);
+    let mut batch = UploadBatch::default();
+    g.set(VoxelPos::new(100, 100, 100), MaterialId(5));
+    g.set(VoxelPos::new(101, 100, 100), MaterialId(6));
+    res.reset(&g, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &g, &mut pools);
+    // In the brick at the origin: a uniform leaf of 1 and two leaves of 60
+    // voxels of 2.
+    for x in 0..4 {
+        for y in 0..4 {
+            for z in 0..4 {
+                g.set(VoxelPos::new(x, y, z), MaterialId(1));
+                if (x, y, z) != (0, 0, 0) && (x, y, z) != (1, 0, 0) {
+                    g.set(VoxelPos::new(x + 4, y, z), MaterialId(2));
+                    g.set(VoxelPos::new(x + 8, y, z), MaterialId(2));
+                }
+            }
+        }
+    }
+    g.set(VoxelPos::new(20, 0, 0), MaterialId(3));
+    let mut batch = UploadBatch::default();
+    res.queue_changes([Change::Chunk(shape.root())]);
+    while res.pending_changes() > 0 {
+        res.apply_changes(&g, None, u64::MAX, 8, |_| true, &mut batch);
+    }
+    res.free_buried(u32::MAX, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &g, &mut pools);
+    records_match_a_fresh_cache(&res, &g);
+}
+
+/// Collapsing large subtrees frees their records a bounded number at a
+/// time (`max_frees_per_frame`), never a whole refined region in one frame
+/// (236,000 records, 58 ms, once on a long walk); nothing below them is
+/// refined meanwhile, and the table ends exact and refines again.
+#[test]
+fn collapsed_subtrees_are_freed_a_bounded_number_a_frame() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let max_frees = 1000u32;
+    let max_collapses = 2u32;
+    let mut config = BrickCacheConfig {
+        max_frees_per_frame: max_frees,
+        ..Default::default()
+    };
+    config.lod.max_collapses_per_frame = max_collapses;
+    config.lod.max_expansions_per_frame = 1 << 20;
+    config.lod.max_expansion_summaries_per_frame = 1 << 24;
+    let near = ViewPoint {
+        eye: [1024.0, -8.0, 1024.0],
+        pixel_angle: 1e-4,
+    };
+    let far = ViewPoint {
+        eye: [1024.0, -8.0, -200000.0],
+        pixel_angle: 0.5,
+    };
+    let mut frame = 1;
+    let mut run = |res: &mut Residency, pools: &mut CpuPools, view: ViewPoint, frames: u32| {
+        let mut most_dropped = 0usize;
+        for _ in 0..frames {
+            let before = res.stats().entries;
+            let mut batch = UploadBatch::default();
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget: 64 << 20,
+                victim_capacity: 64,
+            };
+            run_frame(res, &input, &mut batch);
+            apply_cpu(pools, &batch);
+            verify(res, &snap, pools);
+            most_dropped = most_dropped.max(before.saturating_sub(res.stats().entries));
+            frame += 1;
+        }
+        most_dropped
+    };
+    run(&mut res, &mut pools, near, 40);
+    let refined = res.stats().expanded;
+    assert!(res.stats().entries > 10_000, "{:?}", res.stats());
+    // Far away: everything below the always-expanded levels collapses.
+    let dropped = run(&mut res, &mut pools, far, 120);
+    assert!(
+        dropped as u32 <= max_frees + 64 * max_collapses,
+        "{dropped} records left the table in one frame"
+    );
+    assert_eq!(res.buried(), 0, "everything was freed");
+    assert!(res.stats().expanded < refined / 4, "{:?}", res.stats());
+    // Back: the region refines again.
+    run(&mut res, &mut pools, near, 60);
+    assert_eq!(res.stats().expanded, refined);
+}
+
+/// A rough 1024 x 1024 slab filling the chunk at `min`, with holes every
+/// `step` voxels along x.
+fn chunk_slab(min: VoxelPos, step: i32) -> world_core::tree::ChunkData {
+    let mut t = VoxelTree::new();
+    t.fill_box(
+        VoxelBox::new(
+            VoxelPos::new(min.x, -16, min.z),
+            VoxelPos::new(min.x + 1024, -2, min.z + 1024),
+        ),
+        MaterialId(3),
+    )
+    .unwrap();
+    for x in (min.x..min.x + 1024).step_by(step as usize) {
+        for z in (min.z..min.z + 1024).step_by(7) {
+            t.set(VoxelPos::new(x, -3, z), MaterialId::AIR).unwrap();
+        }
+    }
+    t.chunk_data(min).unwrap()
+}
+
+/// Runs `frames` frames under a still camera over the chunk at the
+/// origin, the chunks in `first` replaced in the first of them.
+fn still_frames(
+    res: &mut Residency,
+    pools: &mut CpuPools,
+    tree: &VoxelTree,
+    frame: &mut u32,
+    frames: u32,
+    first: &[VoxelPos],
+    config: &BrickCacheConfig,
+) {
+    let view = ViewPoint {
+        eye: [512.0, 0.0, 512.0],
+        pixel_angle: 1e-3,
+    };
+    let snap = tree.snapshot();
+    for i in 0..frames {
+        let mut batch = UploadBatch::default();
+        let input = FrameInput {
+            source: &snap,
+            frame: *frame,
+            refresh: *frame == 1,
+            dirty: &[],
+            chunks: if i == 0 { first } else { &[] },
+            view: Some(view),
+            requests: &[],
+            victims: &[],
+            config,
+            budget: 64 << 20,
+            victim_capacity: 64,
+        };
+        run_frame(res, &input, &mut batch);
+        apply_cpu(pools, &batch);
+        *frame += 1;
+    }
+}
+
+/// A replaced chunk refines again under a still camera once its old
+/// subtree is freed, to exactly what a fresh cache shows: freeing the last
+/// buried entry must start a new growth pass. (Ported from the third
+/// review, which found it stayed at 6 expanded nodes.)
+#[test]
+fn a_replaced_chunk_refines_again_under_a_still_camera() {
+    let config = BrickCacheConfig {
+        max_frees_per_frame: 256,
+        ..Default::default()
+    };
+    let min = VoxelPos::new(0, -1024, 0);
+    let mut tree = VoxelTree::new();
+    tree.insert_chunk(min, chunk_slab(min, 5)).unwrap();
+    let shape = Shape::of(&tree.snapshot());
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        segments: vec![8 << 20, 8 << 20],
+        brick_ids: 1 << 16,
+        allocs_per_segment: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).unwrap();
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut frame = 1;
+    still_frames(&mut res, &mut pools, &tree, &mut frame, 200, &[], &config);
+    tree.insert_chunk(min, chunk_slab(min, 6)).unwrap();
+    still_frames(
+        &mut res,
+        &mut pools,
+        &tree,
+        &mut frame,
+        400,
+        &[min],
+        &config,
+    );
+    assert_eq!(res.buried(), 0);
+    let after = res.stats();
+
+    let mut fresh = Residency::new(shape, &layout).unwrap();
+    let mut fresh_pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut fresh_frame = 1;
+    still_frames(
+        &mut fresh,
+        &mut fresh_pools,
+        &tree,
+        &mut fresh_frame,
+        400,
+        &[],
+        &config,
+    );
+    let want = fresh.stats();
+    assert_eq!(
+        (after.expanded, after.bricks),
+        (want.expanded, want.bricks),
+        "the replaced chunk did not refine again"
+    );
+    verify(&mut res, &tree.snapshot(), &pools);
+}
+
+/// A deterministic random sequence for the burial stress test.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+}
+
+/// Entries the root reaches through the child masks.
+fn reachable(res: &Residency) -> usize {
+    let mut n = 0;
+    let mut stack = vec![res.shape().root()];
+    while let Some(k) = stack.pop() {
+        n += 1;
+        if let Some(s) = res.node_state(k)
+            && s.expanded
+        {
+            for slot in 0..64 {
+                if s.kids & (1 << slot) != 0 {
+                    stack.push(k.child(slot));
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Burials kept alive across random operations stay exact: collapses
+/// (also of leftovers, which are refused), re-expansions while burying,
+/// loads, evictions, partial frees, edits and chunk swaps applied on 1 to 8
+/// threads under random budgets. Every step verifies; after draining,
+/// every entry is reachable, the group and brick counts are exact, and the
+/// table regrows like a fresh one. (Ported from the third review's stress
+/// test; seeds scale with the test profile.)
+#[test]
+fn burials_stay_exact_under_random_operations() {
+    use world_render::internals::residency::Change;
+    let seeds = u64::from(world_testkit::profile::scale().cases).max(16);
+    for seed in 0..seeds {
+        let mut rng = Lcg(seed * 7919 + 1);
+        let mut tree = slab();
+        let originals: Vec<_> = CHUNKS
+            .iter()
+            .map(|&m| tree.chunk_data(m).unwrap())
+            .collect();
+        let snap = tree.snapshot();
+        let shape = Shape::of(&snap);
+        let (mut res, mut pools) = roomy_cache(shape);
+        make_resident(&mut res, &snap, &mut pools);
+        let mut log = Vec::new();
+        for step in 0..100 {
+            let mut batch = UploadBatch::default();
+            let op = rng.next() % 10;
+            let keys = res.keys();
+            let pick = keys[rng.next() as usize % keys.len()];
+            let threads = 1 + (rng.next() % 8) as usize;
+            let budget = 1 + rng.next() % 3000;
+            log.push((op, pick));
+            let s = tree.snapshot();
+            match op {
+                0 | 1 => {
+                    let _ = res.collapse(pick, &mut batch);
+                }
+                2 => {
+                    let _ = res.expand(&s, pick, &mut batch);
+                }
+                3 => {
+                    let _ = res.load_brick(&s, pick, &mut batch);
+                }
+                4 => {
+                    let _ = res.evict_brick(pick, &mut batch);
+                }
+                5 => {
+                    res.free_buried((rng.next() % 40) as u32, &mut batch);
+                }
+                6 => {
+                    let x = (rng.next() % 128) as i32 - 64;
+                    let z = (rng.next() % 128) as i32 - 64;
+                    let y = -((rng.next() % 16) as i32) - 1;
+                    let p = VoxelPos::new(x, y, z);
+                    tree.set(p, MaterialId((rng.next() % 3) as u16)).unwrap();
+                    let k = NodeKey::containing(shape.local(p).unwrap(), 1);
+                    res.queue_changes([Change::Brick(k)]);
+                    let s = tree.snapshot();
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                7 => {
+                    let i = rng.next() as usize % CHUNKS.len();
+                    let data = if rng.next().is_multiple_of(2) {
+                        replacement(CHUNKS[i])
+                    } else {
+                        originals[i].clone()
+                    };
+                    tree.insert_chunk(CHUNKS[i], data).unwrap();
+                    let k = NodeKey::containing(shape.local(CHUNKS[i]).unwrap(), 4);
+                    res.queue_changes([Change::Chunk(k)]);
+                    let s = tree.snapshot();
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                8 => {
+                    res.apply_changes(&s, None, budget, threads, |_| true, &mut batch);
+                }
+                _ => {
+                    apply_cpu(&mut pools, &batch);
+                    batch.clear();
+                    grow_records(&mut res, &s, &mut pools);
+                }
+            }
+            apply_cpu(&mut pools, &batch);
+            let s = tree.snapshot();
+            let segs: Vec<&[u32]> = pools.segments.iter().map(Vec::as_slice).collect();
+            if let Err(e) = res.verify(&s, &pools.nodes, &segs, &pools.table) {
+                panic!("seed {seed} step {step}: {e}\nlog {log:?}");
+            }
+        }
+        // Drain everything.
+        let s = tree.snapshot();
+        for _ in 0..1000 {
+            let mut batch = UploadBatch::default();
+            res.free_buried(u32::MAX, &mut batch);
+            res.apply_changes(&s, None, u64::MAX, 4, |_| true, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if res.pending_changes() == 0 && res.buried() == 0 {
+                break;
+            }
+        }
+        assert_eq!((res.pending_changes(), res.buried()), (0, 0), "seed {seed}");
+        verify(&mut res, &s, &pools);
+        assert_eq!(
+            reachable(&res),
+            res.stats().entries,
+            "seed {seed}: entries left out of the tree"
+        );
+        grow_records(&mut res, &s, &mut pools);
+        verify(&mut res, &s, &pools);
+        records_match_a_fresh_cache(&res, &s);
+    }
+}
+
+/// The graveyard frees the oldest burial first: a collapse made later does
+/// not hold back one made earlier.
+#[test]
+fn the_oldest_burial_is_freed_first() {
+    let tree = rough_slab_wide(2048);
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = world_render::internals::layout::PoolLayout {
+        node_count: 1 << 20,
+        node_groups: 1 << 16,
+        ..small_layout()
+    };
+    let mut res = Residency::new(shape, &layout).expect("node space");
+    let mut pools = CpuPools::new(layout.node_count, &layout.segments, layout.brick_ids);
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    apply_cpu(&mut pools, &batch);
+    grow_records(&mut res, &snap, &mut pools);
+    let key =
+        |x: i32, z: i32| NodeKey::containing(shape.local(VoxelPos::new(x, -8, z)).unwrap(), 4);
+    let (first, second) = (key(0, 0), key(1024, 1024));
+    let probe = |res: &Residency, k: NodeKey| res.is_blocked(k.child(0).child(0));
+    let mut batch = UploadBatch::default();
+    res.collapse(first, &mut batch).unwrap();
+    res.collapse(second, &mut batch).unwrap();
+    assert!(probe(&res, first) && probe(&res, second));
+    while probe(&res, first) {
+        res.free_buried(100, &mut batch);
+        // The later one waits until the earlier one is done.
+        assert!(probe(&res, second), "the newer burial was freed first");
+    }
+    while res.buried() > 0 {
+        res.free_buried(100, &mut batch);
+    }
+    apply_cpu(&mut pools, &batch);
+    verify(&mut res, &snap, &pools);
+}

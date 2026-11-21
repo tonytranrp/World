@@ -234,6 +234,7 @@ fn gpu_eviction_chooses_the_oldest_bricks_and_the_cpu_frees_them() {
         &cache.pools,
         &pipelines.evict,
         &params,
+        None,
     );
     gpu.queue.submit([encoder.finish()]);
     let words = read_words(&gpu, &cache.pools.victims);
@@ -320,6 +321,7 @@ fn gpu_destroyed_bricks_never_stay_visible_and_requests_page_them_back() {
         frame: 5,
         refresh: false,
         dirty: &dirty,
+        chunks: &[],
         view: None,
         requests: &[],
         victims: &[],
@@ -375,6 +377,7 @@ fn gpu_destroyed_bricks_never_stay_visible_and_requests_page_them_back() {
         frame: 6,
         refresh: false,
         dirty: &[],
+        chunks: &[],
         view: None,
         requests: &requests,
         victims: &[],

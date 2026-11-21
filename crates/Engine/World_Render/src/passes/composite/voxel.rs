@@ -1,29 +1,33 @@
-//! Composite, version 1: voxel hits to colour and depth.
+//! Composite, version 2: the lit voxel image to colour and depth.
 //!
-//! A fullscreen pass right after Bevy's opaque pass reads each pixel's hit
-//! record, shades it with the material colour and a fixed light per face,
-//! and writes colour and depth with a `GreaterEqual` depth test (reverse Z),
-//! so voxels and rasterized geometry occlude each other both ways. Covered
-//! pixels get alpha 0 so the sky composite, which runs later, leaves them
-//! alone; misses are discarded and keep the cleared background.
+//! Lighting (`passes::lighting`) writes the lit target at the trace's
+//! (internal) resolution. A fullscreen pass right after it stretches that
+//! target over the viewport, each screen pixel loading the traced pixel
+//! under it (nearest), and writes colour and depth with a `GreaterEqual`
+//! depth test (reverse Z), so voxels and rasterized geometry occlude each
+//! other both ways. Covered pixels get alpha 0 so the sky composite, which
+//! runs later, leaves them alone; misses are discarded and keep the cleared
+//! background. The pass does no shading: its cost per screen pixel is one
+//! texture load and the colour and depth writes (decision 0017).
 
 use bevy::core_pipeline::FullscreenShader;
 use bevy::core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-use bevy::render::MainWorld;
 use bevy::render::render_resource::{
     BindGroupLayoutDescriptor, CachedRenderPipelineId, ColorTargetState, ColorWrites,
     CompareFunction, DepthStencilState, FragmentState, MultisampleState, PipelineCache,
     RenderPipelineDescriptor, TextureFormat, VertexState,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::renderer::{FlushCommands, RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
-use wgpu::{BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages, StoreOp};
-use world_core::MaterialTable;
-use world_reload::Config;
+use wgpu::{
+    BindGroupLayoutEntry, BindingType, BufferBindingType, ShaderStages, StoreOp, TextureSampleType,
+    TextureViewDimension,
+};
 
-use crate::brick_cache::stream::upload::storage_entry;
+use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
+use crate::passes::lighting::shade::VoxelLitTarget;
 use crate::passes::primary::VoxelViewTargets;
 
 /// Asset path of the voxel composite shader.
@@ -39,10 +43,18 @@ pub struct VoxelCompositePipeline {
 
 fn layout_entries() -> Vec<BindGroupLayoutEntry> {
     vec![
-        storage_entry(0, true, ShaderStages::FRAGMENT),
-        storage_entry(1, true, ShaderStages::FRAGMENT),
         BindGroupLayoutEntry {
-            binding: 2,
+            binding: 0,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Texture {
+                sample_type: TextureSampleType::Float { filterable: false },
+                view_dimension: TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        BindGroupLayoutEntry {
+            binding: 1,
             visibility: ShaderStages::FRAGMENT,
             ty: BindingType::Buffer {
                 ty: BufferBindingType::Uniform,
@@ -106,95 +118,13 @@ impl VoxelCompositePipeline {
     }
 }
 
-/// Linear material colours by id (index 0 is air), from the material table.
-#[derive(Resource, Default, Clone, PartialEq)]
-pub struct MaterialColors(pub Vec<[f32; 4]>);
-
-fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// Copies the material table's colours when they change.
-pub fn extract_material_colors(main_world: Res<MainWorld>, mut colors: ResMut<MaterialColors>) {
-    let Some(table) = main_world.get_resource::<Config<MaterialTable>>() else {
-        return;
-    };
-    let max = table.iter().map(|m| m.id.0).max().unwrap_or(0) as usize;
-    let mut next = vec![[1.0, 0.0, 1.0, 1.0]; max + 1];
-    next[0] = [0.0, 0.0, 0.0, 0.0];
-    for m in table.iter() {
-        let c = m.color;
-        next[m.id.0 as usize] = [
-            srgb_to_linear(c.0),
-            srgb_to_linear(c.1),
-            srgb_to_linear(c.2),
-            1.0,
-        ];
-    }
-    if colors.0 != next {
-        colors.0 = next;
-    }
-}
-
-/// The colour buffer on the GPU.
-#[derive(Resource)]
-pub struct MaterialColorBuffer {
-    pub buffer: wgpu::Buffer,
-    pub count: u32,
-    /// Changes whenever `buffer` is replaced.
-    pub generation: u64,
-    uploaded: Vec<[f32; 4]>,
-}
-
-pub fn prepare_material_colors(
-    mut commands: Commands,
-    colors: Res<MaterialColors>,
-    existing: Option<ResMut<MaterialColorBuffer>>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    mut generation: Local<u64>,
-) {
-    let mut data = colors.0.clone();
-    if data.is_empty() {
-        data.push([1.0, 0.0, 1.0, 1.0]);
-    }
-    match existing {
-        Some(mut b) if b.count as usize == data.len() => {
-            if b.uploaded != data {
-                queue.write_buffer(&b.buffer, 0, bytemuck::cast_slice(&data));
-                b.uploaded = data;
-            }
-        }
-        _ => {
-            let buffer = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("composite.material_colors"),
-                size: (data.len() * 16) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&data));
-            *generation += 1;
-            commands.insert_resource(MaterialColorBuffer {
-                buffer,
-                count: data.len() as u32,
-                generation: *generation,
-                uploaded: data,
-            });
-        }
-    }
-}
-
 /// One view's composite pipeline and bind group, rebuilt only when what
 /// they refer to changes.
 #[derive(Component)]
 pub struct VoxelCompositeView {
     pipeline: CachedRenderPipelineId,
     bind_group: wgpu::BindGroup,
-    key: (u64, u64, u32, UVec2),
+    key: (u64, UVec2),
     _params: wgpu::Buffer,
 }
 
@@ -204,28 +134,23 @@ pub fn prepare_composite(
         Entity,
         &ExtractedView,
         &VoxelViewTargets,
+        &VoxelLitTarget,
         Option<&Msaa>,
         Option<&VoxelCompositeView>,
     )>,
     pipeline: Option<ResMut<VoxelCompositePipeline>>,
-    colors: Option<Res<MaterialColorBuffer>>,
     cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
-    let (Some(mut pipeline), Some(colors)) = (pipeline, colors) else {
+    let Some(mut pipeline) = pipeline else {
         return;
     };
     let wgpu_device = device.wgpu_device();
-    for (entity, view, targets, msaa, existing) in &views {
+    for (entity, view, targets, lit, msaa, existing) in &views {
         let samples = msaa.map_or(1, Msaa::samples);
         let id = pipeline.variant(&cache, view.target_format, samples);
-        let key = (
-            targets.generation,
-            colors.generation,
-            colors.count,
-            targets.viewport,
-        );
+        let key = (lit.generation, targets.viewport);
         if let Some(e) = existing
             && e.key == key
             && e.pipeline == id
@@ -239,10 +164,10 @@ pub fn prepare_composite(
             mapped_at_creation: false,
         });
         let p = [
-            targets.size.x,
-            targets.size.y,
-            colors.count,
+            lit.size.x,
+            lit.size.y,
             0u32,
+            0,
             targets.viewport.x,
             targets.viewport.y,
             0,
@@ -256,14 +181,10 @@ pub fn prepare_composite(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: targets.hits.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&lit.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: colors.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
                     resource: params.as_entire_binding(),
                 },
             ],
@@ -277,29 +198,59 @@ pub fn prepare_composite(
     }
 }
 
-/// Draws the voxels into the view's colour and depth (Core3d, after the trace).
+/// Draws the voxels into the view's colour and depth (Core3d, after
+/// lighting). The first view of a frame is timed (see `gpu_timing`).
 pub fn voxel_composite(
     view: ViewQuery<(&ViewTarget, &ViewDepthStencilTexture, &VoxelCompositeView)>,
     cache: Res<PipelineCache>,
+    timer: Option<ResMut<GpuPassTimer>>,
+    sampled: Option<ResMut<SampledPassTimer>>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut flush: FlushCommands,
     mut ctx: RenderContext,
 ) {
     let (target, depth, composite) = view.into_inner();
     let Some(pipeline) = cache.get_render_pipeline(composite.pipeline) else {
         return;
     };
-    let color = target.get_color_attachment();
-    let depth = depth.get_attachment(StoreOp::Store);
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&wgpu::RenderPassDescriptor {
+    let record = |encoder: &mut wgpu::CommandEncoder,
+                  timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>| {
+        let color = target.get_color_attachment();
+        let depth = depth.get_attachment(StoreOp::Store);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("composite.voxel"),
             color_attachments: &[Some(color)],
             depth_stencil_attachment: Some(depth),
-            timestamp_writes: None,
+            timestamp_writes: timestamps,
             occlusion_query_set: None,
             multiview_mask: None,
         });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &composite.bind_group, &[]);
-    pass.draw(0..3, 0..1);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &composite.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    };
+    match sampled {
+        Some(mut sampled) if sampled.wants(TimedPass::Composite) => {
+            let device = device.wgpu_device();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composite.voxel"),
+            });
+            record(&mut encoder, None);
+            sampled.time_alone(
+                TimedPass::Composite,
+                device,
+                &queue,
+                || flush.flush(),
+                encoder,
+            );
+        }
+        _ => {
+            let mut timer = timer;
+            let writes = timer
+                .as_deref_mut()
+                .and_then(|t| t.render_writes(TimedPass::Composite));
+            record(ctx.command_encoder(), writes);
+        }
+    }
 }

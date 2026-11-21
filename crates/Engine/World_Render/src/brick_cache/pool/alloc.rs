@@ -144,6 +144,8 @@ pub struct NodeSpace {
     allocator: Allocator,
     capacity: u32,
     used: u32,
+    /// Groups handed out and not freed.
+    groups: u32,
     _root: Allocation,
 }
 
@@ -163,6 +165,7 @@ impl NodeSpace {
             allocator,
             capacity,
             used: 1,
+            groups: 0,
             _root: root,
         })
     }
@@ -171,6 +174,7 @@ impl NodeSpace {
     pub fn allocate(&mut self, len: u32) -> Option<NodeAlloc> {
         let allocation = self.allocator.allocate(len.max(1))?;
         self.used += len.max(1);
+        self.groups += 1;
         Some(NodeAlloc {
             first: allocation.offset,
             len: len.max(1),
@@ -181,6 +185,12 @@ impl NodeSpace {
     pub fn free(&mut self, alloc: NodeAlloc) {
         self.allocator.free(alloc.allocation);
         self.used -= alloc.len;
+        self.groups -= 1;
+    }
+
+    /// Groups handed out and not freed.
+    pub fn groups(&self) -> u32 {
+        self.groups
     }
 
     pub fn used(&self) -> u32 {

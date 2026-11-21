@@ -52,7 +52,41 @@
         // this many voxels or the cache changed; 0 looks every frame.
         // 0.0..=4096.0
         regrow_voxels: 16.0,
+        // A pass in progress starts over only once the camera moved this
+        // many voxels (at least regrow_voxels); smaller moves let it finish.
+        // 0.0..=65536.0
+        restart_voxels: 128.0,
+        // Nodes expanded per frame at most; the rest wait for the next
+        // frame. Each costs tens of microseconds on the floor Mac.
+        // 1..=1048576
+        max_expansions_per_frame: 128,
+        // Node summaries expansions may compute per frame (on one thread,
+        // unlike a replaced chunk's); the rest wait. 1..=16777216
+        max_expansion_summaries_per_frame: 2048,
+        // Records the shrink walk (collapse, evict) examines per frame; it
+        // only frees memory, so it may lag behind growth. A pass started by
+        // node pool pressure takes max_visits_per_frame if that is larger.
+        // 256..=16777216
+        max_shrink_visits_per_frame: 4096,
+        // Nodes the shrink walk collapses per frame at most (each releases
+        // its subtree); it resumes where it stopped. 1..=1048576
+        max_collapses_per_frame: 256,
     ),
+    // Node summaries (each over up to 64 children) that applying edits and
+    // replaced chunks may compute per frame; the rest waits for later
+    // frames, nearest first. A replaced 16 m chunk
+    // costs one per mixed node in it (up to about 6,000); a chunk's are
+    // computed on up to 8 threads. Walking at 8 m/s needs 1,500 to 2,500 a
+    // frame. 1..=16777216
+    max_summaries_per_frame: 8192,
+    // Tasks a replaced chunk's summaries are split into on the brick cache's
+    // task pool; 0 picks one per pool thread (at most 8). 0..=64
+    summary_threads: 0,
+    // Records whose groups and bricks are freed per frame after a collapse or
+    // a replaced chunk took them out of the tree; the rest wait, and nothing
+    // below them is refined until they are freed. A refined 16 m chunk can
+    // hold over 100,000. 256..=16777216
+    max_frees_per_frame: 16384,
     // A small built-in scene while nothing feeds the renderer a world.
     debug_scene: true,
     // Animate a carve in the debug scene, exercising edit uploads.

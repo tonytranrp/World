@@ -1,6 +1,8 @@
-//! The render passes, in frame order: primary rays, then composite.
+//! The render passes, in frame order: primary rays, lighting, then
+//! composite.
 
 pub mod composite;
+pub mod lighting;
 pub mod primary;
 
 use bevy::prelude::*;

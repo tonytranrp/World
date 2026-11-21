@@ -2,6 +2,8 @@
 //! how every edit is kept (decision 0006). The core is plain Rust in
 //! [`world`]; this module adds the Bevy glue.
 
+mod autopilot;
+mod columns;
 pub mod config;
 mod jobs;
 pub mod plan;
@@ -11,6 +13,7 @@ pub mod world;
 
 #[cfg(test)]
 mod tests;
+mod warm;
 
 use std::sync::Arc;
 
@@ -21,7 +24,9 @@ use world_gen::TerrainConfig;
 use world_reload::{AppConfigExt, Config, ConfigOrigin, ConfigRegistry};
 use world_render::prelude::VoxelWorldFeed;
 
+pub use autopilot::Autopilot;
 pub use config::ResidencyConfig;
+use world::ResidencyStats;
 pub use world::StreamedWorld;
 
 use crate::player::PlayerCamera;
@@ -41,6 +46,7 @@ impl Plugin for ResidencyPlugin {
                 (
                     open_world,
                     place_on_ground,
+                    autopilot::walk,
                     update_world,
                     feed_renderer,
                     log_stats,
@@ -119,7 +125,7 @@ fn update_world(
         *opened_at = Some(time.elapsed_secs());
     }
     let eye = eye_voxel(transform);
-    world.0.update(eye);
+    world.0.update(eye, time.delta_secs());
     if let Some(start) = *opened_at
         && world.0.is_settled(eye)
     {
@@ -137,18 +143,25 @@ fn update_world(
     }
 }
 
-/// Hands the renderer this frame's render tree and the bricks that changed.
-/// A newly opened world replaces whatever the renderer showed.
+/// Hands the renderer this frame's render tree and the bricks that changed,
+/// with the summaries the workers computed for the chunks it replaced. A
+/// newly opened world replaces whatever the renderer showed.
 fn feed_renderer(world: Option<ResMut<World>>, feed: Option<ResMut<VoxelWorldFeed>>) {
     let (Some(mut world), Some(mut feed)) = (world, feed) else {
         return;
     };
     let snapshot = Arc::new(world.0.render_snapshot());
     let changes = world.0.take_changes();
+    let summaries = world.0.take_render_summaries();
     if world.is_added() {
         feed.replace(snapshot);
     } else {
-        feed.publish(snapshot, &DirtyBricks::from_unsorted(changes.render_bricks));
+        feed.publish_with_chunks(
+            snapshot,
+            &DirtyBricks::from_unsorted(changes.render_bricks),
+            &changes.render_chunks,
+        );
+        feed.offer_summaries(summaries);
     }
 }
 
@@ -187,30 +200,64 @@ fn place_on_ground(
     *placed = true;
 }
 
-/// Logs the residency figures every few seconds.
-fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<f32>) {
+/// Logs the residency figures every few seconds: what is held, and over the
+/// interval the mean number of holes in the full-detail sphere (all of them
+/// and those ahead of the player's motion) and where loaded chunks came from.
+fn log_stats(world: Option<Res<World>>, time: Res<Time>, mut last: Local<(f32, ResidencyStats)>) {
     let Some(world) = world else {
         return;
     };
+    if world.is_added() {
+        *last = (time.elapsed_secs(), ResidencyStats::default());
+    }
     let now = time.elapsed_secs();
-    if now - *last < 5.0 {
+    if now - last.0 < 5.0 {
         return;
     }
-    *last = now;
     let s = world.0.stats();
+    let p = std::mem::replace(&mut *last, (now, s)).1;
+    let updates = s.updates.saturating_sub(p.updates).max(1) as f64;
+    let mean = |sum: u64, before: u64| sum.saturating_sub(before) as f64 / updates;
+    let v = world.0.velocity_m_s();
     debug!(
-        "world: {} chunks loaded ({} edited, {} loading, {} saving), {:.0} MiB hot,          {} warm ({:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting",
+        "world: {} chunks loaded ({} edited, {} loading, {} saving, {:.0} MiB held), {:.0} MiB hot, \
+         {} joining ({:.0} MiB), {} compressing ({:.0} MiB), {} warm ({} edited, {:.0} MiB), {} coarse columns ({:.0} MiB), {} saved, {} waiting; \
+         interval: holes {:.1} mean ({:.1} ahead), {} now, loads {} generated / {} warm / \
+         {} disk, generation {:.1} ms mean per chunk (longest {:.0} ms so far, {} uniform), columns {} hits / {} \
+         computed ({:.0} MiB held), speed {:.1} m/s",
         s.loaded,
         s.edited,
         s.loading,
         s.saving,
+        s.saving_bytes as f64 / 1048576.0,
         s.hot_bytes as f64 / 1048576.0,
+        s.ready,
+        s.ready_bytes as f64 / 1048576.0,
+        s.compressing,
+        s.compressing_bytes as f64 / 1048576.0,
         s.warm_chunks,
+        s.warm_edited,
         s.warm_bytes as f64 / 1048576.0,
         s.coarse_columns,
         s.coarse_bytes as f64 / 1048576.0,
         s.saved_chunks,
         s.pending_chunks,
+        mean(s.hole_sum, p.hole_sum),
+        mean(s.hole_ahead_sum, p.hole_ahead_sum),
+        s.holes,
+        s.generated - p.generated.min(s.generated),
+        s.warm_hits - p.warm_hits.min(s.warm_hits),
+        s.disk_loads - p.disk_loads.min(s.disk_loads),
+        {
+            let n = s.generated.saturating_sub(p.generated).max(1) as f64;
+            s.generated_micros.saturating_sub(p.generated_micros) as f64 / n / 1000.0
+        },
+        s.generated_max_micros as f64 / 1000.0,
+        s.uniform_loads - p.uniform_loads.min(s.uniform_loads),
+        s.column_hits - p.column_hits.min(s.column_hits),
+        s.column_misses - p.column_misses.min(s.column_misses),
+        s.column_bytes as f64 / 1048576.0,
+        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt(),
     );
 }
 

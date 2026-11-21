@@ -9,6 +9,8 @@
 //!
 //! The device and tier are decided once; changing them needs a restart.
 
+mod awake;
+mod frame_stats;
 #[cfg(feature = "hotpatch")]
 mod hot_probe;
 mod select;
@@ -21,7 +23,7 @@ use bevy::render::RenderPlugin;
 use bevy::render::settings::{Backends, PowerPreference, WgpuSettings};
 use clap::Parser;
 use world_anim::prelude::WorldAnimPlugin;
-use world_game::prelude::WorldGamePlugin;
+use world_game::prelude::{Autopilot, WorldGamePlugin};
 use world_physics::prelude::WorldPhysicsPlugin;
 use world_reload::prelude::WorldReloadPlugin;
 use world_render::prelude::{
@@ -120,8 +122,23 @@ fn assemble(config: &Config, chosen: &Chosen, tier: RenderTier) -> App {
     hot_probe::build(&mut app);
 
     if let Some(frames) = config.exit_after_frames {
-        app.insert_resource(ExitAfter(frames))
-            .add_systems(Update, exit_after_frames);
+        // Automated runs (benchmarks, screenshots, CI) must not depend on
+        // window focus: Bevy's default lets an unfocused window wait on a
+        // timer, which macOS App Nap stretches to seconds in the background.
+        // Continuous updates are not enough when the window cannot be seen
+        // at all (behind others, or the screen locked): App Nap then lowers
+        // the whole process's priority and its frames slow by ten times.
+        awake::stay_out_of_app_nap();
+        app.insert_resource(bevy::winit::WinitSettings::continuous())
+            .insert_resource(ExitAfter(frames))
+            .insert_resource(frame_stats::FrameTimes {
+                csv: config.frame_times.clone(),
+                ..default()
+            })
+            .add_systems(Update, (frame_stats::record, exit_after_frames).chain());
+        if let Some(speed) = config.walk {
+            app.insert_resource(Autopilot::new(speed));
+        }
         if let Some(path) = &config.screenshot {
             app.insert_resource(ScreenshotAt {
                 frame: frames.saturating_sub(SCREENSHOT_LEAD_FRAMES).max(1),
@@ -180,9 +197,20 @@ struct ExitAfter(u32);
 fn exit_after_frames(
     limit: Res<ExitAfter>,
     mut frames: Local<u32>,
+    times: Res<frame_stats::FrameTimes>,
+    pilot: Option<Res<Autopilot>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frames += 1;
+    if *frames == limit.0 {
+        frame_stats::report(&times);
+        if let Some(pilot) = pilot {
+            info!(
+                "walked {:.0} m at {} m/s",
+                pilot.walked_m, pilot.speed_m_per_s
+            );
+        }
+    }
     if *frames >= limit.0 {
         exit.write(AppExit::Success);
     }

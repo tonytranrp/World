@@ -3,6 +3,7 @@
 pub use crate::WorldRenderPlugin;
 pub use crate::brick_cache::config::{BrickCacheConfig, Stage};
 pub use crate::brick_cache::stream::feed::VoxelWorldFeed;
+pub use crate::brick_cache::stream::summaries::ChunkSummaries;
 pub use crate::passes::composite::{SKY_SHADER_PATH, SkyComposite};
 pub use crate::tier::{
     AdapterReport, Budgets, Capabilities, Classification, Profile, RenderTier, Tier, Unsupported,

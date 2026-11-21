@@ -35,6 +35,10 @@
 //! A cube smaller than a cell lies in one cell, where the interpolated field
 //! is multilinear and so takes its extremes at the cube's eight corner
 //! voxels; those eight values decide it, with the same margin on both sides.
+//! A leaf (4 voxels) whose corners fall inside the margin, as leaves along
+//! a cave wall do, is decided from all 64 of its values instead, computed
+//! exactly as the leaf itself computes them ([`block_field`]), so it is
+//! never read voxel by voxel only to come out uniform.
 
 use serde::{Deserialize, Serialize};
 
@@ -232,8 +236,14 @@ impl Caves {
         let scale = 1.0 / (1 << COARSE_SHIFT) as f32;
         let t = (di as f32 * scale, dj as f32 * scale, dk as f32 * scale);
         let field = |n: usize| trilerp(&std::array::from_fn(|c| corners[c][n]), t);
-        let tunnel = field(0).abs().max(field(1).abs()) - self.tunnel_radius;
-        let cavern = self.cavern_threshold - field(2);
+        self.combine([field(0), field(1), field(2)])
+    }
+
+    /// The cave value from the three upsampled fields `(a, b, c)`.
+    #[inline]
+    fn combine(&self, [a, b, c]: [f32; 3]) -> f32 {
+        let tunnel = a.abs().max(b.abs()) - self.tunnel_radius;
+        let cavern = self.cavern_threshold - c;
         tunnel.min(cavern)
     }
 
@@ -256,6 +266,14 @@ impl Caves {
         y >= self.band.0
             && y < self.band.1
             && i64::from(y) < i64::from(column.height) - i64::from(self.cover)
+    }
+
+    /// The heights `lo..hi` at which `column` may be carved:
+    /// [`carvable`](Self::carvable) is `lo <= y && y < hi`.
+    #[inline]
+    pub fn carvable_range(&self, column: &Column) -> (i64, i64) {
+        let hi = i64::from(self.band.1).min(i64::from(column.height) - i64::from(self.cover));
+        (i64::from(self.band.0), hi)
     }
 
     /// Whether the solid voxel at `pos` in `column` is carved, computed from
@@ -316,29 +334,54 @@ impl Caves {
                 }
             }
         }
+        // Upsampling, one axis at a time: each lattice value goes through
+        // `upsample`'s lerps in its order (x, then y, then z), but a lerp
+        // along x is shared by every lattice point with the same x and
+        // coarse row, and one along y by every point with the same x and y.
         let n = CELLS + 1;
         let mask = (1 << COARSE_SHIFT) - 1;
-        let mut lattice = Vec::with_capacity(n * (rows + 1) * n);
-        for k in 0..n {
-            let gz = gk + k as i32;
-            for j in 0..=rows {
-                let gy = gj + j as i32;
-                for i in 0..n {
-                    let gx = gi + i as i32;
-                    let (oi, oj, ok) = (
-                        ((gx >> COARSE_SHIFT) - ci) as usize,
-                        ((gy >> COARSE_SHIFT) - cj) as usize,
-                        ((gz >> COARSE_SHIFT) - ck) as usize,
-                    );
-                    let corners: [[f32; 3]; 8] = std::array::from_fn(|c| {
-                        let (dx, dy, dz) = corner(c);
-                        let at =
-                            ((ok + dz as usize) * cy + oj + dy as usize) * cx + oi + dx as usize;
-                        coarse[at]
-                    });
-                    lattice.push(self.upsample(&corners, (gx & mask, gy & mask, gz & mask)));
-                }
+        let scale = 1.0 / (1 << COARSE_SHIFT) as f32;
+        // Per lattice index on an axis: its coarse cell and position in it.
+        let axis = |g0: i32, c0: i32, count: usize| -> Vec<(usize, f32)> {
+            (0..count)
+                .map(|i| {
+                    let g = g0 + i as i32;
+                    (
+                        ((g >> COARSE_SHIFT) - c0) as usize,
+                        (g & mask) as f32 * scale,
+                    )
+                })
+                .collect()
+        };
+        let (xs, ys, zs) = (axis(gi, ci, n), axis(gj, cj, rows + 1), axis(gk, ck, n));
+        let lerp3 = |t: f32, a: &[f32; 3], b: &[f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|f| a[f] + t * (b[f] - a[f]))
+        };
+        // Along x, on every coarse row: `[k][j][i]` for coarse `k`, `j`.
+        let mut along_x = Vec::with_capacity(cz * cy * n);
+        for row in coarse.chunks_exact(cx) {
+            along_x.extend(xs.iter().map(|&(o, t)| lerp3(t, &row[o], &row[o + 1])));
+        }
+        // Then along y: `[k][j][i]` for coarse `k`, lattice `j`.
+        let mut along_y = Vec::with_capacity(cz * (rows + 1) * n);
+        for k in 0..cz {
+            for &(o, t) in &ys {
+                let low = &along_x[(k * cy + o) * n..][..n];
+                let high = &along_x[(k * cy + o + 1) * n..][..n];
+                along_y.extend(low.iter().zip(high).map(|(a, b)| lerp3(t, a, b)));
             }
+        }
+        // Then along z, combined into the cave value.
+        let mut lattice = Vec::with_capacity(n * (rows + 1) * n);
+        let slab = (rows + 1) * n;
+        for &(o, t) in &zs {
+            let low = &along_y[o * slab..][..slab];
+            let high = &along_y[(o + 1) * slab..][..slab];
+            lattice.extend(
+                low.iter()
+                    .zip(high)
+                    .map(|(a, b)| self.combine(lerp3(t, a, b))),
+            );
         }
         let mut grid = CaveGrid {
             origin: min,
@@ -362,11 +405,39 @@ impl Caves {
         grid: Option<&CaveGrid>,
         min: VoxelPos,
         size: u32,
+        heights: (i32, i32),
+    ) -> CubeCaves {
+        self.classify(chunk, grid, min, size, heights, true)
+    }
+
+    /// [`cube`](Self::cube) from whole-cell bounds alone, never looking inside
+    /// a cell: slower to settle small cubes, and simple enough to check the
+    /// fast answers against.
+    #[cfg(test)]
+    pub(crate) fn cube_by_cells(
+        &self,
+        chunk: ChunkCoord,
+        grid: Option<&CaveGrid>,
+        min: VoxelPos,
+        size: u32,
+        heights: (i32, i32),
+    ) -> CubeCaves {
+        self.classify(chunk, grid, min, size, heights, false)
+    }
+
+    #[inline]
+    fn classify(
+        &self,
+        chunk: ChunkCoord,
+        grid: Option<&CaveGrid>,
+        min: VoxelPos,
+        size: u32,
         (min_height, max_height): (i32, i32),
+        inside_cells: bool,
     ) -> CubeCaves {
         let bottom = i64::from(min.y);
         let top = bottom + i64::from(size); // exclusive
-        if top <= i64::from(self.band.0) || bottom >= self.carve_top(max_height) {
+        if !self.reaches(bottom, top, max_height) {
             return CubeCaves::None;
         }
         let c = chunk.min_voxel();
@@ -380,31 +451,77 @@ impl Caves {
         let Some(grid) = grid else {
             return CubeCaves::None;
         };
-        let hi = if size as i32 <= CAVE_CELL {
-            // One cell: the eight corner voxels bound the cube.
+        let one_cell = |v: i32| (v & (CAVE_CELL - 1)) + size as i32 <= CAVE_CELL;
+        if inside_cells && one_cell(min.x) && one_cell(min.y) && one_cell(min.z) {
+            // One cell. A cell with no negative corner carves nothing (the
+            // test leaves make), which settles most cubes in one lookup;
+            // otherwise the eight corner voxels bound the cube.
+            if grid.cell_bounds(min).0 >= 0.0 {
+                return CubeCaves::None;
+            }
             let Some(corners) = grid.corners(min) else {
                 return CubeCaves::None;
             };
             let last = size as i32 - 1;
-            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-            for n in 0..8 {
-                let (dx, dy, dz) = corner(n);
-                let p = VoxelPos::new(min.x + dx * last, min.y + dy * last, min.z + dz * last);
-                let f = trilinear(&corners, p);
-                lo = lo.min(f);
-                hi = hi.max(f);
+            let at_corners = range(&block_field(&corners, min, [0, last]));
+            let all = (size == 4).then_some(|| range(&block_field(&corners, min, [0, 1, 2, 3])));
+            return self.settle_in_cell(bottom, top, min_height, at_corners, all);
+        }
+        let (lo, hi) = grid.bounds(min, size);
+        if lo >= 0.0 {
+            return CubeCaves::None;
+        }
+        self.carved_or_mixed(bottom, top, min_height, hi)
+    }
+
+    /// Whether a cube from height `bottom` to `top` (exclusive), under a
+    /// footprint whose highest column is `max_height`, holds any voxel that
+    /// may be carved (the band and the cover; says nothing about the field).
+    #[inline]
+    pub fn reaches(&self, bottom: i64, top: i64, max_height: i32) -> bool {
+        top > i64::from(self.band.0) && bottom < self.carve_top(max_height)
+    }
+
+    /// What the field does to a cube from `bottom` to `top` (exclusive)
+    /// inside one cell, under a footprint whose lowest column is
+    /// `min_height`, from the range of the field at its eight corner voxels.
+    /// Corners within [`CARVED_MARGIN`] of zero leave the cube mixed unless
+    /// `all` gives the range of every voxel's value (for a leaf, computed
+    /// exactly as the leaf computes them), which settles it exactly.
+    #[inline]
+    pub fn settle_in_cell(
+        &self,
+        bottom: i64,
+        top: i64,
+        min_height: i32,
+        (lo, hi): (f32, f32),
+        all: Option<impl FnOnce() -> (f32, f32)>,
+    ) -> CubeCaves {
+        if lo >= CARVED_MARGIN {
+            return CubeCaves::None;
+        }
+        let hi = match all {
+            Some(all) if hi > -CARVED_MARGIN => {
+                // Near a cave wall rounding could put an inner voxel past the
+                // corners, so decide from every value.
+                let (lo, hi) = all();
+                if lo >= 0.0 {
+                    return CubeCaves::None;
+                }
+                // All carved needs `hi < 0`; the margin test below asks for
+                // more, so pass a value that meets it exactly when it holds.
+                if hi < 0.0 { -CARVED_MARGIN } else { hi }
             }
-            if lo >= CARVED_MARGIN {
-                return CubeCaves::None;
-            }
-            hi
-        } else {
-            let (lo, hi) = grid.bounds(min, size);
-            if lo >= 0.0 {
-                return CubeCaves::None;
-            }
-            hi
+            _ => hi,
         };
+        self.carved_or_mixed(bottom, top, min_height, hi)
+    }
+
+    /// All carved when the field stays below `-CARVED_MARGIN` (`hi` bounds
+    /// it; the margin absorbs rounding) and every voxel of the cube from
+    /// `bottom` to `top` (exclusive) may be carved; else mixed. For a cube
+    /// whose field is known to go below zero somewhere.
+    fn carved_or_mixed(&self, bottom: i64, top: i64, min_height: i32, hi: f32) -> CubeCaves {
         let under_cover = top <= i64::from(min_height) - i64::from(self.cover);
         if hi <= -CARVED_MARGIN
             && bottom >= i64::from(self.band.0)
@@ -531,11 +648,13 @@ impl CaveGrid {
         let j = ((pos.y - self.origin.y) >> CAVE_CELL_SHIFT) as usize;
         let k = ((pos.z - self.origin.z) >> CAVE_CELL_SHIFT) as usize;
         let j = j.checked_sub(self.first).filter(|&j| j < self.rows)?;
-        let mut corners = [0.0f32; 8];
-        for (n, c) in corners.iter_mut().enumerate() {
-            *c = self.at(i + (n & 1), j + (n >> 1 & 1), k + (n >> 2));
-        }
-        Some(corners)
+        let row = CELLS + 1;
+        let plane = (self.rows + 1) * row;
+        let base = k * plane + j * row + i;
+        let cell = &self.lattice[base..=base + plane + row + 1];
+        Some(std::array::from_fn(|n| {
+            cell[(n & 1) + (n >> 1 & 1) * row + (n >> 2) * plane]
+        }))
     }
 
     /// The `(min, max)` corner bound of the cell holding `pos`.
@@ -554,6 +673,58 @@ impl CaveGrid {
 #[inline]
 const fn corner(n: usize) -> (i32, i32, i32) {
     ((n & 1) as i32, (n >> 1 & 1) as i32, (n >> 2) as i32)
+}
+
+/// The field at the voxels `min + (offsets[i], offsets[j], offsets[k])`,
+/// all in the cave cell whose corners are `c`, as `[k][j][i]`. Each value
+/// equals [`trilinear`] at its voxel bit for bit: the lerps along `x` are
+/// shared by every `j` and `k`, and those along `y` by every `k`, but each
+/// value goes through the same operations in the same order.
+#[inline]
+pub fn block_field<const N: usize>(
+    c: &[f32; 8],
+    min: VoxelPos,
+    offsets: [i32; N],
+) -> [[[f32; N]; N]; N] {
+    let mask = CAVE_CELL - 1;
+    let scale = 1.0 / CAVE_CELL as f32;
+    let t = |v: i32, d: i32| (v.wrapping_add(d) & mask) as f32 * scale;
+    let lerp = |t: f32, a: f32, b: f32| a + t * (b - a);
+    let xs: [[f32; 4]; N] = std::array::from_fn(|i| {
+        let tx = t(min.x, offsets[i]);
+        [
+            lerp(tx, c[0], c[1]),
+            lerp(tx, c[2], c[3]),
+            lerp(tx, c[4], c[5]),
+            lerp(tx, c[6], c[7]),
+        ]
+    });
+    let ys: [[(f32, f32); N]; N] = std::array::from_fn(|j| {
+        let ty = t(min.y, offsets[j]);
+        std::array::from_fn(|i| {
+            let [x00, x10, x01, x11] = xs[i];
+            (lerp(ty, x00, x10), lerp(ty, x01, x11))
+        })
+    });
+    std::array::from_fn(|k| {
+        let tz = t(min.z, offsets[k]);
+        std::array::from_fn(|j| std::array::from_fn(|i| lerp(tz, ys[j][i].0, ys[j][i].1)))
+    })
+}
+
+/// The smallest and largest of a block of field values (which are never NaN).
+#[inline]
+pub fn range<const N: usize>(f: &[[[f32; N]; N]; N]) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in f.as_flattened().as_flattened() {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+    }
+    (lo, hi)
 }
 
 /// The field at `pos` from the eight corners of its cave cell: [`trilerp`]
@@ -620,6 +791,41 @@ mod tests {
             let p = VoxelPos::new(v(), v(), v());
             let f = trilinear(&c, p);
             assert!((-1.0..=1.0).contains(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn grid_values_are_the_lattice_values_bit_for_bit() {
+        let caves = caves();
+        // A chunk inside the band and one cut by its top (fewer rows).
+        for (chunk, max_height) in [
+            (ChunkCoord::new(511, 506, 513).unwrap(), i32::MAX / 2),
+            (ChunkCoord::new(517, 512, 509).unwrap(), 600),
+        ] {
+            let grid = caves.grid(chunk, max_height).unwrap();
+            let min = chunk.min_voxel();
+            let (gi, gj, gk) = (
+                min.x >> CAVE_CELL_SHIFT,
+                (min.y >> CAVE_CELL_SHIFT) + grid.first as i32,
+                min.z >> CAVE_CELL_SHIFT,
+            );
+            let mut s = crate::noise::Stream::new(9);
+            let mut pick = |n: usize| (s.next_u64() % n as u64) as usize;
+            for step in 0..4_000 {
+                // Every corner and edge of the lattice, then random points.
+                let (i, j, k) = if step < 8 {
+                    let c = corner(step);
+                    (
+                        c.0 as usize * CELLS,
+                        c.1 as usize * grid.rows,
+                        c.2 as usize * CELLS,
+                    )
+                } else {
+                    (pick(CELLS + 1), pick(grid.rows + 1), pick(CELLS + 1))
+                };
+                let want = caves.lattice_value(gi + i as i32, gj + j as i32, gk + k as i32);
+                assert_eq!(grid.at(i, j, k).to_bits(), want.to_bits(), "{i} {j} {k}");
+            }
         }
     }
 
