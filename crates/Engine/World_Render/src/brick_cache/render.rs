@@ -310,7 +310,13 @@ pub fn stream_brick_cache(
         return;
     };
     let state = &mut *state;
-    state.streamed = None;
+    if state.streamed.is_some() {
+        // Last frame's batch was never recorded (its pipelines were being
+        // rebuilt, as after a shader reload). The residency table already
+        // counts it as uploaded, so it must reach the GPU before anything
+        // else is streamed: the CPU table stays the source of truth.
+        return;
+    }
     let wgpu_device = device.wgpu_device();
     let shape = state.residency.shape();
     let layout = state.pools.layout.clone();
@@ -401,9 +407,9 @@ pub fn run_brick_cache(
         return;
     };
     let state = &mut *state;
-    let Some(report) = state.streamed.take() else {
+    if state.streamed.is_none() {
         return;
-    };
+    }
     let wgpu_device = device.wgpu_device();
     let layout = state.pools.layout.clone();
     let apply: Option<Vec<&bevy::render::render_resource::ComputePipeline>> = pipelines
@@ -413,6 +419,10 @@ pub fn run_brick_cache(
         .collect();
     let (Some(apply), Some(evict_pipeline)) = (apply, cache.get_compute_pipeline(pipelines.evict))
     else {
+        // Keep the streamed batch: `stream_brick_cache` waits for it.
+        return;
+    };
+    let Some(report) = state.streamed.take() else {
         return;
     };
 
