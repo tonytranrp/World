@@ -7,10 +7,10 @@
 //! | schedule / set | systems |
 //! |----------------|---------|
 //! | `ExtractSchedule` | take the feed, copy config and material colours |
-//! | `Render` / `Prepare` | create the pools once, advance the frame number, the camera's view point |
+//! | `Render`, after `ExtractCommands`, in no set | create the pools once, advance the frame number, the camera's view point, then one frame of streaming on the CPU (overlapping `prepare_windows`) |
 //! | `Render` / `PrepareResources` | per-view hit buffers and trace parameters, material colours |
 //! | `Render` / `PrepareBindGroups` | lit targets and shading bind groups, then composite pipelines and bind groups |
-//! | `RenderGraph` / `Begin` | streaming, upload, apply and eviction passes |
+//! | `RenderGraph` / `Begin` | the streamed frame's upload, apply and eviction passes |
 //! | `Core3d` / `MainPass`, after the opaque pass | trace, shade (internal resolution), then composite (colour and depth) |
 //! | `RenderGraph` / `Render`, after `camera_driver` | copy requests and victims to a read-back slot, resolve the frame's GPU timestamps |
 //! | `RenderGraph` / `Finish` | map the read-back slots and the timing slot |
@@ -30,7 +30,7 @@ use crate::brick_cache::config::BrickCacheConfig;
 use crate::brick_cache::render::{
     CacheConfigReady, CacheViewPoint, ExtractedCacheConfig, PendingFeed, advance_frame,
     copy_feedback, extract_feed, init_brick_cache, init_cache_pipelines, log_cache_stats,
-    map_feedback, run_brick_cache, update_view_point,
+    map_feedback, run_brick_cache, stream_brick_cache, update_view_point,
 };
 use crate::brick_cache::stream::feed::VoxelWorldFeed;
 use crate::debug::{start_debug_scene, update_debug_scene};
@@ -79,12 +79,23 @@ pub(crate) fn build(app: &mut App, tier: &RenderTier) {
         .add_systems(
             Render,
             (
-                (init_brick_cache, advance_frame, update_view_point)
+                // In no set, so that streaming overlaps `prepare_windows`
+                // (its wait for a swapchain texture) instead of following it.
+                (
+                    init_brick_cache,
+                    advance_frame,
+                    update_view_point,
+                    stream_brick_cache,
+                )
                     .chain()
-                    .in_set(RenderSystems::Prepare),
+                    .after(RenderSystems::ExtractCommands)
+                    .before(RenderSystems::Render),
                 begin_gpu_timing.in_set(RenderSystems::Prepare),
-                (prepare_view_targets, prepare_material_colors)
+                // The trace parameters carry this frame's number.
+                prepare_view_targets
+                    .after(advance_frame)
                     .in_set(RenderSystems::PrepareResources),
+                prepare_material_colors.in_set(RenderSystems::PrepareResources),
                 (prepare_shade, prepare_composite)
                     .chain()
                     .in_set(RenderSystems::PrepareBindGroups),

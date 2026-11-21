@@ -5,15 +5,17 @@
 //! 1. Extract: the main world's [`VoxelWorldFeed`] is *taken* (each change
 //!    exactly once) into [`PendingFeed`]; the config and the main camera's
 //!    view point are copied.
-//! 2. `RenderGraph` / `Begin` ([`run_brick_cache`]): finished read-backs are
-//!    collected without waiting, one frame of streaming runs on the CPU, and
-//!    the upload, the apply pass and (when the pool is full) the eviction
-//!    pass are recorded ahead of every camera.
-//! 3. Cameras trace and composite (`passes`).
-//! 4. `RenderGraph` / `Render`, after the cameras ([`copy_feedback`]): the
+//! 2. `Render`, in no set ([`stream_brick_cache`]): finished read-backs are
+//!    collected without waiting and one frame of streaming runs on the CPU,
+//!    while `prepare_windows` may still be waiting for a swapchain texture.
+//! 3. `RenderGraph` / `Begin` ([`run_brick_cache`]): the upload, the apply
+//!    pass and (when the pool is full) the eviction pass are recorded ahead
+//!    of every camera.
+//! 4. Cameras trace and composite (`passes`).
+//! 5. `RenderGraph` / `Render`, after the cameras ([`copy_feedback`]): the
 //!    request block (and victims) go to a free read-back slot, and the
 //!    request counter is cleared for the next frame.
-//! 5. `RenderGraph` / `Finish` ([`map_feedback`]): the copied slots are mapped
+//! 6. `RenderGraph` / `Finish` ([`map_feedback`]): the copied slots are mapped
 //!    asynchronously.
 //!
 //! Nothing here ever blocks on the GPU.
@@ -196,6 +198,9 @@ pub struct BrickCacheState {
     victims: Vec<Victim>,
     snapshot: Option<Arc<TreeSnapshot>>,
     evicted_this_frame: bool,
+    /// What [`stream_brick_cache`] did this frame, until [`run_brick_cache`]
+    /// records it.
+    streamed: Option<FrameReport>,
     /// Frame number stamped on uploads and compared by rays (1 or more).
     pub frame: u32,
     pub last_report: FrameReport,
@@ -272,6 +277,7 @@ pub fn init_brick_cache(
         victims: Vec::new(),
         snapshot: None,
         evicted_this_frame: false,
+        streamed: None,
         frame: 0,
         last_report: FrameReport::default(),
     });
@@ -285,8 +291,13 @@ pub fn advance_frame(state: Option<ResMut<BrickCacheState>>) {
     }
 }
 
-/// One frame of streaming, recorded ahead of every camera.
-pub fn run_brick_cache(
+/// One frame of streaming on the CPU: finished read-backs, the feed, then
+/// [`run_frame`] into the upload batch. It runs in the `Render` schedule,
+/// ordered only after extraction and the cache's view point, so it overlaps
+/// `prepare_windows`, which can wait milliseconds for a swapchain texture
+/// while the GPU finishes earlier frames. [`run_brick_cache`] records what
+/// it produced.
+pub fn stream_brick_cache(
     state: Option<ResMut<BrickCacheState>>,
     pipelines: Option<Res<CachePipelines>>,
     cache: Res<PipelineCache>,
@@ -294,16 +305,12 @@ pub fn run_brick_cache(
     config: Res<ExtractedCacheConfig>,
     view: Res<CacheViewPoint>,
     device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    mut timer: Option<ResMut<GpuPassTimer>>,
-    sampled: Option<ResMut<SampledPassTimer>>,
-    mut flush: FlushCommands,
-    mut ctx: RenderContext,
 ) {
     let (Some(mut state), Some(pipelines)) = (state, pipelines) else {
         return;
     };
     let state = &mut *state;
+    state.streamed = None;
     let wgpu_device = device.wgpu_device();
     let shape = state.residency.shape();
     let layout = state.pools.layout.clone();
@@ -323,15 +330,14 @@ pub fn run_brick_cache(
         }
     }
 
-    let apply: Option<Vec<&bevy::render::render_resource::ComputePipeline>> = pipelines
+    let ready = pipelines
         .apply
         .iter()
-        .map(|&id| cache.get_compute_pipeline(id))
-        .collect();
-    let (Some(apply), Some(evict_pipeline)) = (apply, cache.get_compute_pipeline(pipelines.evict))
-    else {
+        .chain([&pipelines.evict])
+        .all(|&id| cache.get_compute_pipeline(id).is_some());
+    if !ready {
         return; // Shaders still compiling: keep the feed pending.
-    };
+    }
 
     let feed = std::mem::take(&mut pending.0);
     let mut refresh = feed.refresh;
@@ -374,6 +380,41 @@ pub fn run_brick_cache(
     };
     let report = run_frame(&mut state.residency, &input, &mut state.batch);
     state.last_report = report;
+    state.streamed = Some(report);
+}
+
+/// Records this frame's streaming ahead of every camera: the upload, the
+/// apply pass and, when the pool is full, the eviction pass.
+pub fn run_brick_cache(
+    state: Option<ResMut<BrickCacheState>>,
+    pipelines: Option<Res<CachePipelines>>,
+    cache: Res<PipelineCache>,
+    config: Res<ExtractedCacheConfig>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut timer: Option<ResMut<GpuPassTimer>>,
+    sampled: Option<ResMut<SampledPassTimer>>,
+    mut flush: FlushCommands,
+    mut ctx: RenderContext,
+) {
+    let (Some(mut state), Some(pipelines)) = (state, pipelines) else {
+        return;
+    };
+    let state = &mut *state;
+    let Some(report) = state.streamed.take() else {
+        return;
+    };
+    let wgpu_device = device.wgpu_device();
+    let layout = state.pools.layout.clone();
+    let apply: Option<Vec<&bevy::render::render_resource::ComputePipeline>> = pipelines
+        .apply
+        .iter()
+        .map(|&id| cache.get_compute_pipeline(id))
+        .collect();
+    let (Some(apply), Some(evict_pipeline)) = (apply, cache.get_compute_pipeline(pipelines.evict))
+    else {
+        return;
+    };
 
     let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("brick_cache.frame"),
