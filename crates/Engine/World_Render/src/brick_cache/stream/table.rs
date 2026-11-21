@@ -127,6 +127,70 @@ impl<V> Node<V> {
         None
     }
 
+    /// The node `depth` slots below a part's top holding `entries`, whose
+    /// `paths` all pass through it, grouped as [`Part::from_grouped`]
+    /// requires.
+    fn grouped(paths: &[Path], entries: &[(NodeKey, V)], depth: usize) -> Self
+    where
+        V: Clone,
+    {
+        assert!(
+            paths.iter().all(|p| p.len > depth),
+            "entries grouped depth first, each key once"
+        );
+        // The runs of entries under each child slot, with the run's own
+        // value (a path ending at this depth) at either end.
+        let runs = || {
+            let mut start = 0;
+            std::iter::from_fn(move || {
+                let slot = paths.get(start)?.slots[depth];
+                let len = paths[start..]
+                    .iter()
+                    .take_while(|p| p.slots[depth] == slot)
+                    .count();
+                let run = start..start + len;
+                start += len;
+                let own = |i: usize| paths[i].len == depth + 1;
+                let (value, below) = if own(run.end - 1) {
+                    (Some(run.end - 1), run.start..run.end - 1)
+                } else if own(run.start) {
+                    (Some(run.start), run.start + 1..run.end)
+                } else {
+                    (None, run)
+                };
+                Some((slot, value, below))
+            })
+        };
+        let (mut values, mut subs) = (0, 0);
+        for (_, value, below) in runs() {
+            values += usize::from(value.is_some());
+            subs += usize::from(!below.is_empty());
+        }
+        let mut node = Self {
+            has: 0,
+            values: VecDeque::with_capacity(values),
+            below: 0,
+            subs: VecDeque::with_capacity(subs),
+        };
+        for (slot, value, below) in runs() {
+            let bit = 1u64 << slot;
+            assert!(
+                (node.has | node.below) < bit,
+                "siblings in ascending slot order, each run once"
+            );
+            if let Some(i) = value {
+                node.has |= bit;
+                node.values.push_back(entries[i].1.clone());
+            }
+            if !below.is_empty() {
+                node.below |= bit;
+                let sub = Self::grouped(&paths[below.clone()], &entries[below], depth + 1);
+                node.subs.push_back(sub);
+            }
+        }
+        node
+    }
+
     /// Removes the value at `path` (slots from this node down, the last one
     /// the key's slot in its parent), dropping nodes that empty on the way
     /// back up.
@@ -227,7 +291,9 @@ impl<V> Part<V> {
 
     /// Inserts or replaces the value of `key`, a node below the split level;
     /// returns the value replaced. Keys inserted in slot order, children
-    /// before their parent, only ever append.
+    /// before their parent, only ever append. Parts are built with
+    /// [`from_grouped`](Self::from_grouped); this is the tests' reference.
+    #[cfg(test)]
     pub fn insert(&mut self, key: NodeKey, value: V) -> Option<V> {
         assert!(
             key.level() < self.split,
@@ -247,6 +313,31 @@ impl<V> Part<V> {
             self.len += 1;
         }
         old
+    }
+
+    /// A part holding exactly `entries`, built with every array allocated
+    /// once at its final length (inserting one by one grows each array
+    /// fifteen times on the way to 64 values). The entries must be grouped
+    /// depth first: everything below a node next to each other, siblings in
+    /// ascending slot order, and a node's own value just before or just
+    /// after its descendants (slot order with children before their
+    /// parent is one such order). Panics otherwise, or for a key at or
+    /// above the split.
+    pub fn from_grouped(split: u32, entries: &[(NodeKey, V)]) -> Self
+    where
+        V: Clone,
+    {
+        let mut part = Self::new(split);
+        let paths: Vec<Path> = entries
+            .iter()
+            .map(|(k, _)| {
+                assert!(k.level() < split, "a part holds keys below its split");
+                Path::of(k, split)
+            })
+            .collect();
+        part.node = Node::grouped(&paths, entries, 0);
+        part.len = entries.len();
+        part
     }
 
     /// The value of `key`, by its path below the split level.
@@ -546,6 +637,70 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(built.insert_part(here, Part::new(split)), n as usize);
         assert_eq!(built.len(), 1);
+    }
+
+    /// A part built from grouped entries, with parents after their
+    /// children or before them, holds what inserting them one by one holds,
+    /// with every array at its exact length; entries out of order are
+    /// refused.
+    #[test]
+    fn a_part_from_grouped_entries_equals_one_built_by_inserting() {
+        let split = 4;
+        let top = key(4, 0, 0, 0);
+        let (mut after, mut before) = (Vec::new(), Vec::new());
+        let mut n = 0;
+        for s in (0..64).step_by(7) {
+            let child = top.child(s);
+            let mut run = Vec::new();
+            for g in (s % 3..64).step_by(9) {
+                let grandchild = child.child(g);
+                let mut leaves: Vec<_> = (g % 4..64)
+                    .step_by(11)
+                    .map(|l| (grandchild.child(l), n + l))
+                    .collect();
+                n += 100;
+                if g % 2 == 0 {
+                    leaves.push((grandchild, n));
+                } else {
+                    leaves.insert(0, (grandchild, n));
+                }
+                run.extend(leaves);
+            }
+            if s % 2 == 0 {
+                run.push((child, n + 1));
+            }
+            after.extend(run.iter().copied());
+            before.push((child, n + 1));
+            before.extend(run.into_iter().filter(|&(k, _)| k != child));
+            n += 2;
+        }
+        for entries in [&after, &before] {
+            let built = Part::from_grouped(split, entries);
+            let mut inserted = Part::new(split);
+            for &(k, v) in entries.iter() {
+                inserted.insert(k, v);
+            }
+            assert_eq!(built.len(), inserted.len());
+            for &(k, v) in entries.iter() {
+                assert_eq!(built.get(&k), Some(&v), "{k:?}");
+            }
+            let walk = |p: &Part<u32>| {
+                let mut out = Vec::new();
+                p.node.walk(top, &mut |k, &v| out.push((k, v)));
+                out
+            };
+            assert_eq!(walk(&built), walk(&inserted));
+            fn exact(n: &Node<u32>) -> bool {
+                n.values.capacity() == n.values.len()
+                    && n.subs.capacity() == n.subs.len()
+                    && n.subs.iter().all(exact)
+            }
+            assert!(exact(&built.node));
+        }
+        let mut shuffled = after.clone();
+        shuffled.swap(0, after.len() - 1);
+        let refused = std::panic::catch_unwind(|| Part::from_grouped(split, &shuffled));
+        assert!(refused.is_err(), "entries out of order");
     }
 
     #[test]

@@ -55,6 +55,11 @@ pub(crate) fn set_voxels(
         }),
         "voxel edits must be in tree order, one per voxel"
     );
+    // No edits meet no region: nothing is skipped, even where nothing is
+    // loaded.
+    if edits.is_empty() {
+        return false;
+    }
     // Edits that all fall in one chunk the index knows go straight into it:
     // the levels above keep their words unless the chunk collapses.
     if let (Some(first), Some(last)) = (edits.first(), edits.last()) {

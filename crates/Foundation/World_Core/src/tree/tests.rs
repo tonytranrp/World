@@ -949,3 +949,79 @@ proptest! {
         prop_assert!(same_content(&grid, &grid.clone()));
     }
 }
+
+/// An empty batch is a no-op everywhere, also on a tree whose root is not
+/// loaded yet (`StreamedWorld::apply` before anything has loaded, with every
+/// edit waiting for its chunk).
+#[test]
+fn an_empty_batch_changes_nothing_even_where_nothing_is_loaded() {
+    let mut unloaded = VoxelTree::unloaded();
+    assert!(unloaded.apply(&[]).unwrap().is_empty());
+    assert!(matches!(unloaded.root(), NodeRef::NotResident));
+
+    let mut tree = VoxelTree::new();
+    tree.fill_box(cube([0, 0, 0], 5), STONE).unwrap();
+    let before = tree.snapshot();
+    let stats = tree.stats();
+    assert!(tree.apply(&[]).unwrap().is_empty());
+    assert_eq!(tree.stats(), stats);
+    assert!(tree.shares_everything_with(&before));
+}
+
+/// Every level-1 node under `node`, a child at `level`.
+fn bricks<'a>(node: NodeRef<'a>, level: u32, out: &mut Vec<NodeRef<'a>>) {
+    if let NodeRef::Branch(b) = node {
+        if level == 1 {
+            out.push(node);
+        } else {
+            for (_, child) in b.children() {
+                bricks(child, level - 1, out);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(world_testkit::profile::proptest_config())]
+
+    /// A brick's stored counts (the default leaves, other full leaves,
+    /// records and palette indices) sum, per material, to its voxels counted
+    /// one by one; nodes above level 1 have none.
+    #[test]
+    fn brick_counts_match_counting_every_voxel(
+        ops in vec(op(), 0..=world_testkit::profile::scale().edits_per_case)
+    ) {
+        use std::collections::BTreeMap;
+        let mut tree = VoxelTree::new();
+        let mut model = Dense::new();
+        for op in &ops {
+            let _ = run(op, &mut tree, &mut model);
+        }
+        let snap = tree.snapshot();
+        let mut found = Vec::new();
+        bricks(snap.root(), TREE_DEPTH - 1, &mut found);
+        for brick in found {
+            let mut stored = BTreeMap::<MaterialId, u32>::new();
+            let mut empty = false;
+            let counted = brick.brick_counts(&mut |m, n| {
+                empty |= n == 0;
+                *stored.entry(m).or_default() += n;
+            });
+            prop_assert!(counted, "the world tree counts its bricks");
+            prop_assert!(!empty, "no empty counts");
+            let mut voxels = BTreeMap::<MaterialId, u32>::new();
+            for (_, leaf) in brick.children() {
+                for slot in 0..64 {
+                    let m = leaf.voxel(slot);
+                    if !m.is_air() {
+                        *voxels.entry(m).or_default() += 1;
+                    }
+                }
+            }
+            prop_assert_eq!(stored, voxels);
+        }
+        if let NodeRef::Branch(_) = snap.root() {
+            prop_assert!(!snap.root().brick_counts(&mut |_, _| ()));
+        }
+    }
+}

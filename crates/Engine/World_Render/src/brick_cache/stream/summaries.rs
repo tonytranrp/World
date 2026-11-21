@@ -46,8 +46,9 @@ impl std::fmt::Debug for ChunkSummaries {
 impl ChunkSummaries {
     /// The summaries of `data`, the content of the chunk whose lowest voxel
     /// is `min`. `None` for air or one material, which have none, or a
-    /// position that is not a chunk's. Costs what summarizing the chunk on
-    /// the render thread would: about a microsecond per mixed node.
+    /// position that is not a chunk's. Bricks are counted from what the tree
+    /// stores per brick ([`NodeView::brick_counts`]), not leaf by leaf, and
+    /// the part is built with each array allocated once (decision 0024).
     pub fn compute(min: VoxelPos, data: &ChunkData) -> Option<Self> {
         if data.uniform().is_some() {
             return None;
@@ -143,16 +144,23 @@ pub(super) fn summarize_level2_node<N: NodeView>(
 }
 
 /// The summaries of every mixed node below the level-4 node `chunk`, keyed
-/// under the level-4 node at the origin (a part only keeps paths), inserted
-/// in slot order with children before their parent.
+/// under the level-4 node at the origin (a part only keeps paths), computed
+/// in slot order with children before their parent and stored with each
+/// array allocated once.
 fn chunk_part<N: NodeView>(chunk: N) -> Part<Summary> {
+    let mut entries = Vec::new();
+    summarize_chunk(chunk, &mut |k, s| entries.push((k, s)));
+    Part::from_grouped(WARMED_LEVEL, &entries)
+}
+
+/// [`chunk_part`]'s summaries, each passed to `out` as it is computed.
+fn summarize_chunk<N: NodeView>(chunk: N, out: &mut impl FnMut(NodeKey, Summary)) {
     let top = NodeKey {
         level: WARMED_LEVEL as u8,
         x: 0,
         y: 0,
         z: 0,
     };
-    let mut part = Part::new(WARMED_LEVEL);
     let mut tally = Tally::default();
     for (s1, child) in chunk.children() {
         if content(&child) != Content::Branch {
@@ -162,16 +170,87 @@ fn chunk_part<N: NodeView>(chunk: N) -> Part<Summary> {
         let mut node = Tally::default();
         for (s2, grandchild) in child.children() {
             let s = match content(&grandchild) {
-                Content::Branch => {
-                    summarize_level2_node(grandchild, k3.child(s2), &mut tally, &mut |k, s| {
-                        part.insert(k, s);
-                    })
-                }
+                Content::Branch => summarize_level2_node(grandchild, k3.child(s2), &mut tally, out),
                 kind => plain_summary(grandchild, kind, 2),
             };
             node.add(s.material, s.solid);
         }
-        part.insert(k3, node.summary());
+        out(k3, node.summary());
     }
-    part
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use world_core::tree::{NodeKind, RegionSource};
+    use world_gen::{ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
+
+    /// A view that hides how its source stores bricks: every brick is
+    /// counted leaf by leaf, and every leaf of two or more materials voxel
+    /// by voxel.
+    #[derive(Clone, Copy)]
+    struct Plain<N>(N);
+
+    impl<N: NodeView> NodeView for Plain<N> {
+        fn kind(&self) -> NodeKind {
+            self.0.kind()
+        }
+        fn mask(&self) -> u64 {
+            self.0.mask()
+        }
+        fn child(&self, slot: u32) -> Self {
+            Plain(self.0.child(slot))
+        }
+        fn voxel(&self, slot: u32) -> world_core::MaterialId {
+            self.0.voxel(slot)
+        }
+    }
+
+    /// Every summary below the chunk-level view `chunk`, in order.
+    fn summaries<N: NodeView>(chunk: N) -> Vec<(NodeKey, Summary)> {
+        let mut out = Vec::new();
+        summarize_chunk(chunk, &mut |k, s| out.push((k, s)));
+        out
+    }
+
+    /// On real terrain (a surface chunk, the chunk below it, and the
+    /// surface chunk built from coarse cells), the summaries counted from
+    /// the tree's stored bricks are exactly those counted voxel by voxel.
+    #[test]
+    fn stored_brick_counts_give_the_summaries_of_counting_every_voxel() {
+        let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
+            .expect("the default config is valid");
+        let probe = ChunkCoord::new(512, 0, 512).unwrap().min_voxel();
+        let (x, z) = (probe.x + 512, probe.z + 512);
+        let height = generator.column(x, z).unwrap().height;
+        let top = ChunkCoord::containing(VoxelPos::new(x, height, z)).unwrap();
+        let below = ChunkCoord::new(top.x(), top.y() - 1, top.z()).unwrap();
+        let coarse = CoarseSource::new(generator.coarse_columns(top, 2).unwrap());
+        let cases: [(ChunkCoord, &dyn Fn(&mut VoxelTree, VoxelPos)); 3] = [
+            (top, &|t, min| build(t, min, &generator.chunk_source(top))),
+            (below, &|t, min| {
+                build(t, min, &generator.chunk_source(below))
+            }),
+            (top, &|t, min| build(t, min, &coarse)),
+        ];
+        for (coord, make) in cases {
+            let min = coord.min_voxel();
+            let mut tree = VoxelTree::new();
+            make(&mut tree, min);
+            let key = NodeKey::containing(Shape::of(&tree).local(min).unwrap(), CHUNK_LEVEL);
+            let view = view_at(&tree, key);
+            let fast = summaries(view);
+            assert!(fast.len() > 100, "{} mixed nodes", fast.len());
+            assert_eq!(fast, summaries(Plain(view)));
+            let offer = ChunkSummaries::compute(min, &tree.chunk_data(min).unwrap()).unwrap();
+            assert_eq!(offer.len(), fast.len());
+            for (k, s) in fast {
+                assert_eq!(offer.get(&k), Some(s), "{k:?}");
+            }
+        }
+    }
+
+    fn build(tree: &mut VoxelTree, min: VoxelPos, source: &impl RegionSource) {
+        tree.build_region(CHUNK_LEVEL, min, source).unwrap();
+    }
 }
