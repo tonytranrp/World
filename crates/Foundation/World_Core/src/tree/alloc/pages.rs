@@ -149,7 +149,7 @@ impl<T: Copy + Default, const N: usize> Pages<T, N> {
             .flat_map(|chunk| chunk.iter().map(|page| &page[..]))
     }
 
-    #[inline]
+    #[inline(always)]
     fn page(&self, page: usize) -> &[T] {
         &self.dir[page / CHUNK_PAGES][page % CHUNK_PAGES]
     }
@@ -214,14 +214,14 @@ pub(super) struct PageReader<'a, T, const N: usize> {
 
 impl<'a, T: Copy + Default, const N: usize> PageReader<'a, T, N> {
     /// Item `index`. Panics past the last page.
-    #[inline]
+    #[inline(always)]
     pub fn get(&mut self, index: u32) -> T {
         let index = index as usize;
         self.page(index / N)[index % N]
     }
 
     /// `len` items from `start`, which must lie in one page.
-    #[inline]
+    #[inline(always)]
     pub fn slice(&mut self, start: u32, len: usize) -> &'a [T] {
         let start = start as usize;
         let offset = start % N;
@@ -229,13 +229,13 @@ impl<'a, T: Copy + Default, const N: usize> PageReader<'a, T, N> {
     }
 
     /// The items from `start` to the end of its page.
-    #[inline]
+    #[inline(always)]
     pub fn tail(&mut self, start: u32) -> &'a [T] {
         let start = start as usize;
         &self.page(start / N)[start % N..]
     }
 
-    #[inline]
+    #[inline(always)]
     fn page(&mut self, page: usize) -> &'a [T] {
         if page != self.index {
             self.page = self.pages.page(page);
