@@ -6,7 +6,9 @@
 //! - `alloc`: brick space allocate/free churn and node group churn, the
 //!   bookkeeping of every upload and eviction.
 //! - `residency`: making a whole scene resident (expand + load), the work
-//!   of the first frames and of a fast camera turn.
+//!   of the first frames and of a fast camera turn; and `expand_churn`,
+//!   collapsing and expanding again nodes whose summaries are cached, the
+//!   table work of the refined band a walk moves every frame.
 //!
 //! - `load_bricks`: loading every brick of the terrain into pools, with the
 //!   encoder on 1 and on 8 threads, the path a frame takes.
@@ -188,6 +190,59 @@ fn residency(c: &mut Criterion) {
             })
         });
     }
+    // Collapsing and expanding again every expanded level-2 and level-3 node
+    // of the terrain, its summaries cached: the table work of the nodes a
+    // walk refines and coarsens each frame.
+    let tree = terrain();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let layout = PoolLayout {
+        node_count: 1 << 20,
+        segments: vec![256 << 20],
+        brick_ids: 1 << 18,
+        allocs_per_segment: 1 << 18,
+        node_groups: 1 << 18,
+        upload_budget: 1 << 30,
+        request_capacity: 1024,
+        victim_capacity: 1024,
+    };
+    let mut res = Residency::new(shape, &layout).unwrap();
+    let mut batch = UploadBatch::default();
+    res.reset(&snap, &mut batch);
+    loop {
+        let todo: Vec<NodeKey> = res
+            .keys()
+            .into_iter()
+            .filter(|k| k.level >= 2 && !res.is_expanded(*k))
+            .collect();
+        if todo.is_empty() {
+            break;
+        }
+        for k in todo {
+            let _ = res.expand(&snap, k, &mut batch);
+        }
+    }
+    let mut churn: Vec<NodeKey> = res
+        .keys()
+        .into_iter()
+        .filter(|k| (2..=3).contains(&k.level) && res.is_expanded(*k))
+        .collect();
+    churn.sort_unstable();
+    group.throughput(Throughput::Elements(churn.len() as u64));
+    group.bench_function("expand_churn/terrain", |b| {
+        b.iter(|| {
+            batch.clear();
+            // Level 3 first, then the level-2 children it expands again.
+            for &k in churn.iter().rev() {
+                let _ = res.collapse(k, &mut batch);
+            }
+            res.free_buried(u32::MAX, &mut batch);
+            for &k in churn.iter().rev() {
+                let _ = res.expand(&snap, k, &mut batch);
+            }
+            batch.data_bytes()
+        })
+    });
     group.finish();
 }
 
