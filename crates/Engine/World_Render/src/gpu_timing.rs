@@ -37,7 +37,8 @@ use world_reload::Config;
 /// The passes that are timed, in the order the log line lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimedPass {
-    /// The primary pass's beam prepass (decision 0023), with the trace.
+    /// The primary pass's beam prepass (decision 0023), with the trace, and
+    /// the bottom tile rows its dispatch traces (decision 0026).
     Beam,
     /// Primary rays (once per frame: the first 3D view that traces).
     Trace,

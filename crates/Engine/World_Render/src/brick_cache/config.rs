@@ -90,6 +90,10 @@ pub struct LodTuning {
     /// rays to find where they may start (decision 0023); `0` turns the
     /// prepass off and rays start at the camera. `0..=1024`.
     pub beam_iterations: u32,
+    /// Share of the camera trace's 8-pixel tile rows, from the bottom, that
+    /// the beam prepass's dispatch traces from the camera while its beams
+    /// march (decision 0026). `0.0..=0.5`.
+    pub beam_head_share: f32,
 }
 
 /// Everything the brick cache reads from its config file.
@@ -172,6 +176,7 @@ impl Default for BrickCacheConfig {
                 max_shrink_visits_per_frame: 4096,
                 max_collapses_per_frame: 256,
                 beam_iterations: 64,
+                beam_head_share: 0.125,
             },
             max_summaries_per_frame: 8192,
             summary_threads: 0,
@@ -299,6 +304,12 @@ impl ConfigAsset for BrickCacheConfig {
             self.lod.beam_iterations.into(),
             0.0,
             1024.0,
+        );
+        range(
+            "lod.beam_head_share",
+            self.lod.beam_head_share.into(),
+            0.0,
+            0.5,
         );
         range(
             "lod.max_collapses_per_frame",

@@ -424,6 +424,7 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
             trace::DEFAULT_MAX_ITERATIONS,
             trace::BEAM_OFF,
         ],
+        head: [0; 4],
     };
     let params = gpu
         .device

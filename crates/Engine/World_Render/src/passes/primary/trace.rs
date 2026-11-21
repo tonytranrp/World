@@ -60,6 +60,18 @@ pub struct TraceParams {
     /// Request capacity, word offset of the request stamps, iteration cap,
     /// beam iteration cap ([`BEAM_OFF`]: no prepass; camera mode only).
     pub limits: [u32; 4],
+    /// Tile rows at the bottom of a camera trace that the prepass's dispatch
+    /// traces from the camera ([`head_rows`]); y to w unused.
+    pub head: [u32; 4],
+}
+
+/// The tile rows at the bottom of a `height`-pixel camera trace that the
+/// prepass's dispatch traces from the camera while its beams march (decision
+/// 0026): `share` of the rows, rounded down, never all of them. The shader
+/// clamps the same way (`head_rows` in `view.wesl`).
+pub fn head_rows(height: u32, share: f32) -> u32 {
+    let (_, rows) = beam_tiles(1, height);
+    ((rows as f32 * share.clamp(0.0, 1.0)) as u32).min(rows - 1)
 }
 
 /// Bindings: nodes, segments 0 to 3 (read), brick table and feedback
@@ -155,27 +167,32 @@ pub fn record_trace(
     );
 }
 
-/// Records the beam prepass over a `width x height` trace's tiles. The
-/// trace recorded after it reads the start distances when `limits.w` is not
-/// [`BEAM_OFF`].
+/// Workgroups of the prepass over a `width x height` camera trace whose
+/// bottom `head` tile rows ([`head_rows`], the value in `TraceParams::head`)
+/// it traces: 8x8 beam tiles over the rows above, then one per head tile.
+pub fn beam_groups(width: u32, height: u32, head: u32) -> u32 {
+    let (columns, rows) = beam_tiles(width, height);
+    let head = head.min(rows - 1);
+    columns.div_ceil(BEAM_WORKGROUP) * (rows - head).div_ceil(BEAM_WORKGROUP) + columns * head
+}
+
+/// Records the beam prepass over a `width x height` camera trace's tiles,
+/// and the trace of its bottom `head` tile rows (the value in
+/// `TraceParams::head`). The trace recorded after it reads the start
+/// distances when `limits.w` is not [`BEAM_OFF`], and skips the head rows.
 pub fn record_beam(
     encoder: &mut CommandEncoder,
     pipeline: &ComputePipeline,
     bind_group: &BindGroup,
-    width: u32,
-    height: u32,
+    (width, height): (u32, u32),
+    head: u32,
     timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
 ) {
-    let (columns, rows) = beam_tiles(width, height);
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("primary.beam"),
         timestamp_writes: timestamps,
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(
-        columns.div_ceil(BEAM_WORKGROUP),
-        rows.div_ceil(BEAM_WORKGROUP),
-        1,
-    );
+    pass.dispatch_workgroups(beam_groups(width, height, head), 1, 1);
 }
