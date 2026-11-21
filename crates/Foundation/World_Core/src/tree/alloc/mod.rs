@@ -196,6 +196,15 @@ impl Store {
         }
     }
 
+    /// Cuts each arena's last page to the items in use. A built chunk's
+    /// arenas are written once and seldom grow again, so the rest of those
+    /// pages would be held for nothing; a later allocation there grows the
+    /// page back.
+    pub fn trim(&mut self) {
+        self.storage.nodes.trim(self.nodes.end());
+        self.storage.words.trim(self.blocks.end());
+    }
+
     pub fn stats(&self) -> TreeStats {
         TreeStats {
             branches: self.nodes.live(),
@@ -204,8 +213,8 @@ impl Store {
             free_nodes: self.nodes.free_count(),
             free_words: self.blocks.free_words(),
             chunks: 0,
-            bytes: self.storage.nodes.page_count() * NODE_PAGE_LEN * size_of::<Node>()
-                + self.storage.words.page_count() * WORD_PAGE_LEN * size_of::<u32>(),
+            bytes: self.storage.nodes.held_len() * size_of::<Node>()
+                + self.storage.words.held_len() * size_of::<u32>(),
         }
     }
 }
