@@ -137,6 +137,19 @@ and tests stay deterministic.
   frame mean fell from 29.7-31.1 to 24.8-24.9 ms in three alternating
   pairs, run while the CPU was held at 73% of its speed. At 4 m/s the
   pairs differ by -1.7 to +3 ms, within the noise of that run.
+- **A level-3 node judges its level-2 children as it visits them.** Two
+  thirds of a pass's pops were level-2 nodes with nothing to do:
+  expanded, with every brick resident or too far to want (a brick is no
+  nearer the eye than its level-2 node, so if level 1 is not wanted at
+  the node's distance none of its bricks is), or expansion candidates
+  past the ones the frame keeps. They are looked up next to their
+  siblings, in the same small map, and only those with work are queued.
+  Level-2 pops fell from 13.7 to 4.65 million over 2,500 frames of an
+  8 m/s walk, and the pass reaches further on the same budget (77,000
+  expanded nodes at frame 2000 against 67,000). The frame mean was 0.1
+  to 2.0 ms lower in all six alternating pairs at 4 and 8 m/s, and the
+  median 1 to 3 ms lower, with the CPU throttled to between 100% and 35%
+  of its speed during the runs.
 
 ## Alternatives considered
 
