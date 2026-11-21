@@ -126,6 +126,16 @@ pub trait NodeView: Copy {
     fn palette_block(&self) -> Option<&[u32]> {
         None
     }
+
+    /// For a level-1 node (a brick): passes its solid voxels to `each` as
+    /// (material, count) pairs, a material possibly more than once, read
+    /// from how the source stores the brick instead of leaf by leaf, and
+    /// returns true. Returns false, passing nothing, when the view is not a
+    /// level-1 node or the source has no such shortcut (the default).
+    fn brick_counts(&self, each: &mut impl FnMut(MaterialId, u32)) -> bool {
+        let _ = each;
+        false
+    }
 }
 
 /// The materials of a leaf, as [`NodeView::palette`] returns them.
@@ -397,6 +407,13 @@ impl NodeView for NodeRef<'_> {
         }
     }
 
+    fn brick_counts(&self, each: &mut impl FnMut(MaterialId, u32)) -> bool {
+        match self {
+            Self::Branch(b) => b.brick_counts(each),
+            _ => false,
+        }
+    }
+
     /// The stored palette, exactly as stored.
     fn palette(&self) -> Palette {
         match self {
@@ -460,6 +477,45 @@ impl<'a> BranchRef<'a> {
             };
             (slot, child)
         })
+    }
+
+    /// [`NodeView::brick_counts`] for a level-1 node, from its header and
+    /// stored leaves (decision 0021) without a view per leaf: the default
+    /// leaves are one count, an other full leaf one word, a leaf of one
+    /// material and air its mask's population, a packed leaf its palette
+    /// indices. False above level 1.
+    pub fn brick_counts(&self, each: &mut impl FnMut(MaterialId, u32)) -> bool {
+        if self.level != 1 {
+            return false;
+        }
+        let header = BrickHeader::read(self.block, self.info);
+        if header.full != 0 {
+            each(header.default, TREE_FANOUT * header.full.count_ones());
+        }
+        let mut at = header.len();
+        for slot in slots(self.mask & !header.full) {
+            if header.other & bit(slot) != 0 {
+                each(MaterialId(self.block[at] as u16), TREE_FANOUT);
+                at += 1;
+                continue;
+            }
+            let record = Record::read(&self.block[at..at + RECORD_WORDS]);
+            at += RECORD_WORDS;
+            let solid = record.mask.count_ones();
+            match record.palette_base() {
+                Some(base) => {
+                    let len = leaf::block_len(record.mask, self.storage.word(base));
+                    leaf::count_solid(self.storage.block(base, len), solid, each);
+                }
+                None => {
+                    if let Some(m) = record.material() {
+                        each(m, solid);
+                    }
+                }
+            }
+        }
+        debug_assert!(at <= self.block.len(), "stored leaves overrun the block");
+        true
     }
 
     /// For a level-1 node: its header and its block length in words, for

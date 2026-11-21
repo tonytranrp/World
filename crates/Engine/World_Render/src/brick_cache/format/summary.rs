@@ -114,6 +114,12 @@ pub fn count_voxels<N: NodeView>(node: N, level: u32, tally: &mut Tally) {
         Content::Uniform(m) => tally.add(m, node_volume(level)),
         Content::Leaf => count_leaf(&node, tally),
         Content::Branch => {
+            // A brick the source stores with its counts at hand (the world
+            // tree's header, records and palettes) is counted from them,
+            // without a view per leaf (decision 0024).
+            if level == 1 && node.brick_counts(&mut |m, n| tally.add(m, u64::from(n))) {
+                return;
+            }
             for (_, child) in node.children() {
                 count_voxels(child, level.saturating_sub(1), tally);
             }
