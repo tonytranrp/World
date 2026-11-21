@@ -58,3 +58,6 @@ const HIT_FLAG_RESIDENCY: u32 = 2u;
 const HIT_FLAG_FOOTPRINT: u32 = 4u;
 const HIT_FLAG_EXHAUSTED: u32 = 8u;
 const FACE_INSIDE: u32 = 6u;
+
+// passes::primary::trace
+const BEAM_TILE: u32 = 8u;

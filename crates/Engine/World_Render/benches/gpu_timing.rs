@@ -7,7 +7,8 @@
 //! overhead). Not a Criterion bench: GPU frames need their own clock.
 //!
 //! - trace: 1280 x 720 camera rays over a fully resident terrain, full
-//!   resolution and the default footprint bias.
+//!   resolution and the default footprint bias, without and with the beam
+//!   prepass (decision 0023; the prepass submitted and timed on its own).
 //! - apply: uploading N bricks through the staging belt and the apply pass.
 
 #[path = "../tests/common/mod.rs"]
@@ -15,7 +16,7 @@ mod common;
 
 use std::time::Instant;
 
-use bevy::math::{Mat4, Vec3};
+use bevy::math::Vec3;
 use common::*;
 use wgpu::util::DeviceExt;
 use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
@@ -111,30 +112,6 @@ impl Timer {
         let t1 = u64::from(w[2]) | u64::from(w[3]) << 32;
         t1.saturating_sub(t0) as f64 * f64::from(gpu.queue.get_timestamp_period()) / 1e6
     }
-}
-
-/// A right-handed view matrix looking along `dir` from `eye`.
-fn look_to(eye: Vec3, dir: Vec3, up: Vec3) -> Mat4 {
-    let f = dir.normalize();
-    let s = f.cross(up).normalize();
-    let u = s.cross(f);
-    Mat4::from_cols(
-        bevy::math::Vec4::new(s.x, u.x, -f.x, 0.0),
-        bevy::math::Vec4::new(s.y, u.y, -f.y, 0.0),
-        bevy::math::Vec4::new(s.z, u.z, -f.z, 0.0),
-        bevy::math::Vec4::new(-s.dot(eye), -u.dot(eye), f.dot(eye), 1.0),
-    )
-}
-
-/// Bevy's infinite reverse-Z perspective projection.
-fn perspective_infinite_reverse(fov_y: f32, aspect: f32, near: f32) -> Mat4 {
-    let f = 1.0 / (fov_y / 2.0).tan();
-    Mat4::from_cols(
-        bevy::math::Vec4::new(f / aspect, 0.0, 0.0, 0.0),
-        bevy::math::Vec4::new(0.0, f, 0.0, 0.0),
-        bevy::math::Vec4::new(0.0, 0.0, 0.0, -1.0),
-        bevy::math::Vec4::new(0.0, 0.0, near, 0.0),
-    )
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -254,58 +231,107 @@ fn main() {
     let proj = perspective_infinite_reverse(fov, WIDTH as f32 / HEIGHT as f32, 0.05);
     let clip_from_world = proj * view;
     let o = shape.origin;
+    let beam = trace::beam_buffer(&gpu.device, WIDTH, HEIGHT);
+    // Each submission timed alone (timestamps, or wall time with a blocking
+    // poll); the median over RUNS after 3 warm-up runs.
+    let time = |record: &dyn Fn(
+        &mut wgpu::CommandEncoder,
+        Option<wgpu::ComputePassTimestampWrites<'_>>,
+    )| {
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        record(&mut encoder, timer.writes());
+        timer.finish(&mut encoder);
+        let start = Instant::now();
+        gpu.queue.submit([encoder.finish()]);
+        wait(&gpu);
+        timer.read_ms(&gpu, start.elapsed().as_secs_f64() * 1e3)
+    };
     for (label, bias) in [("full resolution", 0.0f32), ("footprint bias 1", 1.0)] {
-        let params = TraceParams {
-            clip_from_world: clip_from_world.to_cols_array_2d(),
-            world_from_clip: clip_from_world.inverse().to_cols_array_2d(),
-            eye: [eye_m.x * 64.0, eye_m.y * 64.0, eye_m.z * 64.0, 0.0],
-            origin: [o.x, o.y, o.z, shape.root_level() as i32],
-            size: [WIDTH, HEIGHT, 2, MODE_CAMERA],
-            lod: [2.0 * (fov / 2.0).tan() / HEIGHT as f32, bias, 64.0, 0.0],
-            limits: [
-                cache.pools.layout.request_capacity,
-                cache.pools.layout.stamps_offset(),
-                trace::DEFAULT_MAX_ITERATIONS,
-                0,
-            ],
-        };
-        let params_buf = gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bench params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let bind_group = trace::trace_bind_group(
-            &gpu.device,
-            &pipelines.trace_layout,
-            &cache.pools,
-            &hits,
-            &params_buf,
-        );
-        let mut times = Vec::new();
-        for run in 0..RUNS + 3 {
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            trace::record_trace(
-                &mut encoder,
-                &pipelines.trace,
-                &bind_group,
-                WIDTH,
-                HEIGHT,
-                timer.writes(),
+        for beam_iterations in [trace::BEAM_OFF, 16, 64] {
+            let params = TraceParams {
+                clip_from_world: clip_from_world.to_cols_array_2d(),
+                world_from_clip: clip_from_world.inverse().to_cols_array_2d(),
+                eye: [eye_m.x * 64.0, eye_m.y * 64.0, eye_m.z * 64.0, 0.0],
+                origin: [o.x, o.y, o.z, shape.root_level() as i32],
+                size: [WIDTH, HEIGHT, 2, MODE_CAMERA],
+                lod: [2.0 * (fov / 2.0).tan() / HEIGHT as f32, bias, 64.0, 0.0],
+                limits: [
+                    cache.pools.layout.request_capacity,
+                    cache.pools.layout.stamps_offset(),
+                    trace::DEFAULT_MAX_ITERATIONS,
+                    beam_iterations,
+                ],
+            };
+            let params_buf = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("bench params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind_group = trace::trace_bind_group(
+                &gpu.device,
+                &pipelines.trace_layout,
+                &cache.pools,
+                &hits,
+                &params_buf,
+                &beam,
             );
-            timer.finish(&mut encoder);
-            let start = Instant::now();
-            gpu.queue.submit([encoder.finish()]);
-            wait(&gpu);
-            let wall = start.elapsed().as_secs_f64() * 1e3;
-            if run >= 3 {
-                times.push(timer.read_ms(&gpu, wall));
+            let (mut beam_times, mut trace_times, mut both_times) =
+                (Vec::new(), Vec::new(), Vec::new());
+            for run in 0..RUNS + 3 {
+                let b = time(&|encoder, writes| {
+                    trace::record_beam(encoder, &pipelines.beam, &bind_group, WIDTH, HEIGHT, writes)
+                });
+                let t = time(&|encoder, writes| {
+                    trace::record_trace(
+                        encoder,
+                        &pipelines.trace,
+                        &bind_group,
+                        WIDTH,
+                        HEIGHT,
+                        writes,
+                    )
+                });
+                // Both in one submission, as the game records them: wall
+                // time, since one timestamp pair spans a single pass.
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                trace::record_beam(
+                    &mut encoder,
+                    &pipelines.beam,
+                    &bind_group,
+                    WIDTH,
+                    HEIGHT,
+                    None,
+                );
+                trace::record_trace(
+                    &mut encoder,
+                    &pipelines.trace,
+                    &bind_group,
+                    WIDTH,
+                    HEIGHT,
+                    None,
+                );
+                let start = Instant::now();
+                gpu.queue.submit([encoder.finish()]);
+                wait(&gpu);
+                if run >= 3 {
+                    beam_times.push(b);
+                    trace_times.push(t);
+                    both_times.push(start.elapsed().as_secs_f64() * 1e3);
+                }
             }
+            let prepass = if beam_iterations == trace::BEAM_OFF {
+                "no beam".to_string()
+            } else {
+                format!("beam {beam_iterations} steps {:.3} ms", median(beam_times))
+            };
+            println!(
+                "trace {WIDTH}x{HEIGHT} ({label}, {prepass}): {:.3} ms; beam and trace in one \
+                 submission {:.3} ms wall; medians over {RUNS} runs",
+                median(trace_times),
+                median(both_times)
+            );
         }
-        println!(
-            "trace {WIDTH}x{HEIGHT} ({label}): {:.3} ms median over {RUNS} runs",
-            median(times)
-        );
     }
 }

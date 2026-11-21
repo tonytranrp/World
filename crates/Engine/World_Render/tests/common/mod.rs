@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use bevy::math::{Mat4, Vec3};
 use wgpu::{BindGroupLayout, Buffer, ComputePipeline, Device, Queue};
 use world_core::tree::VoxelSource;
 use world_render::internals::batch::{CpuPools, UploadBatch};
@@ -226,6 +227,8 @@ pub fn gpu() -> Option<Gpu> {
 pub struct Pipelines {
     pub trace_layout: BindGroupLayout,
     pub trace: ComputePipeline,
+    /// The trace's beam prepass, on the trace's layout.
+    pub beam: ComputePipeline,
     pub apply_layout: BindGroupLayout,
     pub apply: Vec<ComputePipeline>,
     pub evict_layout: BindGroupLayout,
@@ -274,6 +277,7 @@ impl Pipelines {
         let apply_layout = layout("apply", upload::apply_layout_entries());
         let evict_layout = layout("evict", evict::pass::evict_layout_entries());
         let trace_src = compile_wesl("shaders/passes/primary/trace.wesl");
+        let beam_src = compile_wesl("shaders/passes/primary/beam.wesl");
         let apply_src = compile_wesl("shaders/brick_cache/apply.wesl");
         let evict_src = compile_wesl("shaders/brick_cache/evict.wesl");
         Self {
@@ -285,6 +289,7 @@ impl Pipelines {
                 "trace",
                 trace::ZERO_INIT_WORKGROUP_MEMORY,
             ),
+            beam: compute(device, "beam", &beam_src, &trace_layout, "beam", false),
             apply: upload::APPLY_ENTRY_POINTS
                 .iter()
                 .map(|e| compute(device, e, &apply_src, &apply_layout, e, true))
@@ -346,7 +351,7 @@ pub fn wait(gpu: &Gpu) {
 use world_render::internals::GpuNode;
 use world_render::internals::GpuPools;
 use world_render::internals::gbuffer::{GpuHit, HIT_WORDS, encode_rays};
-use world_render::internals::trace::{MODE_RAYS, TraceParams};
+use world_render::internals::trace::{BEAM_OFF, MODE_CAMERA, MODE_RAYS, TraceParams};
 
 /// The pools on the GPU with an upload path, as the plugin drives them.
 pub struct GpuCache {
@@ -455,7 +460,7 @@ pub fn gpu_trace(
             layout.request_capacity,
             layout.stamps_offset(),
             trace::DEFAULT_MAX_ITERATIONS,
-            0,
+            BEAM_OFF,
         ],
         clip_from_world: identity(),
         world_from_clip: identity(),
@@ -468,12 +473,14 @@ pub fn gpu_trace(
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+    let beam = trace::beam_buffer(&gpu.device, width, height);
     let bind_group = trace::trace_bind_group(
         &gpu.device,
         &pipelines.trace_layout,
         &cache.pools,
         &hits,
         &params_buf,
+        &beam,
     );
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     trace::record_trace(
@@ -491,6 +498,142 @@ pub fn gpu_trace(
         .take(rays.len())
         .filter_map(GpuHit::decode)
         .collect()
+}
+
+/// A pinhole camera for camera-mode traces, in metres (64 voxels each).
+#[derive(Clone, Copy, Debug)]
+pub struct ViewSetup {
+    pub eye_m: Vec3,
+    pub forward: Vec3,
+    pub vertical_fov_radians: f32,
+}
+
+impl ViewSetup {
+    /// Clip from world (metres), Bevy's reverse-Z infinite projection.
+    pub fn clip_from_world(&self, width: u32, height: u32) -> Mat4 {
+        let view = look_to(self.eye_m, self.forward, Vec3::Y);
+        let aspect = width as f32 / height as f32;
+        perspective_infinite_reverse(self.vertical_fov_radians, aspect, 0.05) * view
+    }
+
+    /// Radians per pixel at the image centre, as the game computes it.
+    pub fn pixel_angle(&self, height: u32) -> f32 {
+        2.0 * (self.vertical_fov_radians / 2.0).tan() / height as f32
+    }
+}
+
+/// One camera-mode trace: the raw hit records and the beam's start
+/// distance per tile (all 0 with `beam_iterations` [`BEAM_OFF`]).
+pub struct CameraTrace {
+    pub records: Vec<u32>,
+    pub beam: Vec<f32>,
+}
+
+impl CameraTrace {
+    /// Record `i`'s words.
+    pub fn record(&self, i: usize) -> &[u32] {
+        &self.records[i * HIT_WORDS as usize..(i + 1) * HIT_WORDS as usize]
+    }
+}
+
+/// Traces a `width x height` image from `view` in camera mode, with the
+/// beam prepass when `beam_iterations` is not [`BEAM_OFF`].
+pub fn camera_trace(
+    gpu: &Gpu,
+    pipelines: &Pipelines,
+    cache: &GpuCache,
+    view: ViewSetup,
+    (width, height): (u32, u32),
+    setup: TraceSetup,
+    beam_iterations: u32,
+) -> CameraTrace {
+    use wgpu::util::DeviceExt;
+    let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test camera hits"),
+        size: u64::from(width * height * HIT_WORDS) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let clip_from_world = view.clip_from_world(width, height);
+    let layout = &cache.pools.layout;
+    let o = setup.shape.origin;
+    let eye = view.eye_m * 64.0;
+    let params = TraceParams {
+        clip_from_world: clip_from_world.to_cols_array_2d(),
+        world_from_clip: clip_from_world.inverse().to_cols_array_2d(),
+        eye: [eye.x, eye.y, eye.z, 0.0],
+        origin: [o.x, o.y, o.z, setup.shape.root_level() as i32],
+        size: [width, height, setup.frame, MODE_CAMERA],
+        lod: [setup.pixel_angle, setup.footprint_bias, 64.0, 0.0],
+        limits: [
+            layout.request_capacity,
+            layout.stamps_offset(),
+            trace::DEFAULT_MAX_ITERATIONS,
+            beam_iterations,
+        ],
+    };
+    let params_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test camera params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let beam = trace::beam_buffer(&gpu.device, width, height);
+    let bind_group = trace::trace_bind_group(
+        &gpu.device,
+        &pipelines.trace_layout,
+        &cache.pools,
+        &hits,
+        &params_buf,
+        &beam,
+    );
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    trace::record_beam(
+        &mut encoder,
+        &pipelines.beam,
+        &bind_group,
+        width,
+        height,
+        None,
+    );
+    trace::record_trace(
+        &mut encoder,
+        &pipelines.trace,
+        &bind_group,
+        width,
+        height,
+        None,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    CameraTrace {
+        records: read_words(gpu, &hits),
+        beam: bytemuck::cast_slice(&read_words(gpu, &beam)).to_vec(),
+    }
+}
+
+/// A right-handed view matrix looking along `dir`.
+pub fn look_to(eye: Vec3, dir: Vec3, up: Vec3) -> Mat4 {
+    let f = dir.normalize();
+    let s = f.cross(up).normalize();
+    let u = s.cross(f);
+    Mat4::from_cols(
+        bevy::math::Vec4::new(s.x, u.x, -f.x, 0.0),
+        bevy::math::Vec4::new(s.y, u.y, -f.y, 0.0),
+        bevy::math::Vec4::new(s.z, u.z, -f.z, 0.0),
+        bevy::math::Vec4::new(-s.dot(eye), -u.dot(eye), f.dot(eye), 1.0),
+    )
+}
+
+/// Bevy's infinite reverse-Z perspective projection.
+pub fn perspective_infinite_reverse(fov_y: f32, aspect: f32, near: f32) -> Mat4 {
+    let f = 1.0 / (fov_y / 2.0).tan();
+    Mat4::from_cols(
+        bevy::math::Vec4::new(f / aspect, 0.0, 0.0, 0.0),
+        bevy::math::Vec4::new(0.0, f, 0.0, 0.0),
+        bevy::math::Vec4::new(0.0, 0.0, 0.0, -1.0),
+        bevy::math::Vec4::new(0.0, 0.0, near, 0.0),
+    )
 }
 
 pub fn identity() -> [[f32; 4]; 4] {

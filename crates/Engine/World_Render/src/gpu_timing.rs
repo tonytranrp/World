@@ -37,6 +37,8 @@ use world_reload::Config;
 /// The passes that are timed, in the order the log line lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimedPass {
+    /// The primary pass's beam prepass (decision 0023), with the trace.
+    Beam,
     /// Primary rays (once per frame: the first 3D view that traces).
     Trace,
     /// Hits to the lit target, at the trace's size.
@@ -50,10 +52,11 @@ pub enum TimedPass {
 }
 
 /// Number of [`TimedPass`] variants.
-pub const TIMED_PASSES: usize = 5;
+pub const TIMED_PASSES: usize = 6;
 
 impl TimedPass {
     pub const ALL: [Self; TIMED_PASSES] = [
+        Self::Beam,
         Self::Trace,
         Self::Shade,
         Self::Composite,
@@ -63,6 +66,7 @@ impl TimedPass {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Beam => "beam",
             Self::Trace => "trace",
             Self::Shade => "shade",
             Self::Composite => "composite",
@@ -720,8 +724,8 @@ mod tests {
     fn frames_add_up_per_pass_and_in_sum() {
         let mut t = GpuTimes::default();
         assert!(t.is_empty());
-        t.add_frame([Some(4.0), None, Some(0.5), None, None]);
-        t.add_frame([Some(6.0), None, Some(0.5), Some(1.0), None]);
+        t.add_frame([None, Some(4.0), None, Some(0.5), None, None]);
+        t.add_frame([None, Some(6.0), None, Some(0.5), Some(1.0), None]);
         t.add_frame([None; TIMED_PASSES]);
         assert_eq!(t.sum.frames, 2);
         assert_eq!(t.sum.mean_ms(), 6.0);
@@ -735,7 +739,8 @@ mod tests {
         assert_eq!(t.passes[TimedPass::Evict.index()].mean_ms(), 0.0);
         assert_eq!(
             t.to_string(),
-            "2 frames timed, ms mean / min / max (frames): trace 5.00 / 4.00 / 6.00 (2), \
+            "2 frames timed, ms mean / min / max (frames): beam 0.00 / 0.00 / 0.00 (0), \
+             trace 5.00 / 4.00 / 6.00 (2), \
              shade 0.00 / 0.00 / 0.00 (0), composite 0.50 / 0.50 / 0.50 (2), apply 1.00 / 1.00 / 1.00 (1), \
              evict 0.00 / 0.00 / 0.00 (0), sum 6.00 / 4.50 / 7.50"
         );
