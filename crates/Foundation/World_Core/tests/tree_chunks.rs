@@ -31,7 +31,9 @@ fn tree_of(world: &DenseWorld) -> VoxelTree {
 fn breakdown_words(b: &MemoryBreakdown) -> usize {
     b.child_words
         + 3 * b.bricks
-        + 3 * (b.full_records + b.single_records + b.palette_records)
+        + 2 * b.long_headers
+        + b.full_records
+        + 3 * (b.single_records + b.palette_records)
         + b.palette_words.iter().sum::<usize>()
 }
 

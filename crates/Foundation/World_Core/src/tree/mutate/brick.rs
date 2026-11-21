@@ -6,8 +6,8 @@ use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
 use crate::tree::node::leaf::{self, PackedLeaf, Record, Voxels};
 use crate::tree::node::{
-    BRICK_HEADER_WORDS, BrickHeader, Child, MAX_BLOCK_LEN, Node, Packed, PackedNode, RECORD_WORDS,
-    bit, slots,
+    BRICK_HEADER_MAX_WORDS, BrickHeader, Child, MAX_BLOCK_LEN, Node, Packed, PackedNode,
+    RECORD_WORDS, bit, slots,
 };
 
 /// The leaves of one level-1 node in slot order, air included.
@@ -26,14 +26,18 @@ impl Writer<'_> {
         };
         let node = self.store().node(index);
         let block = self.store().block(node.base, node.block_len(1));
-        let header = BrickHeader::read(block);
+        let header = BrickHeader::read(block, node.info);
         let mut records = [Record::AIR; TREE_FANOUT as usize];
-        let mut stored = block[BRICK_HEADER_WORDS..].chunks_exact(RECORD_WORDS);
+        let mut at = header.len();
         for slot in slots(node.mask) {
             records[slot as usize] = if header.full & bit(slot) != 0 {
                 Record::filled(header.default)
+            } else if header.other & bit(slot) != 0 {
+                at += 1;
+                Record::filled(MaterialId(block[at - 1] as u16))
             } else {
-                stored.next().map_or(Record::AIR, Record::read)
+                at += RECORD_WORDS;
+                Record::read(&block[at - RECORD_WORDS..at])
             };
         }
         records
@@ -44,12 +48,12 @@ impl Writer<'_> {
         match (child, node) {
             (_, Some(node)) if node.mask & bit(slot) == 0 => Record::AIR,
             (_, Some(node)) => {
-                let header = self.header(node);
+                let block = self.store().block(node.base, node.block_len(1));
+                let header = BrickHeader::read(block, node.info);
                 if header.full & bit(slot) != 0 {
                     return Record::filled(header.default);
                 }
-                let at = node.base + header.record_offset(node.mask, slot) as u32;
-                Record::read(self.store().block(at, RECORD_WORDS))
+                header.stored(block, node.mask, slot)
             }
             (Child::Uniform(m), None) => Record::filled(m),
             _ => Record::AIR,
@@ -58,7 +62,8 @@ impl Writer<'_> {
 
     /// The header of a stored level-1 node.
     fn header(&self, node: Node) -> BrickHeader {
-        BrickHeader::read(self.store().block(node.base, BRICK_HEADER_WORDS))
+        let len = node.block_len(1).min(BRICK_HEADER_MAX_WORDS);
+        BrickHeader::read(self.store().block(node.base, len), node.info)
     }
 
     /// Overwrites leaf `slot` of a stored level-1 node with `new` where that
@@ -73,16 +78,10 @@ impl Writer<'_> {
             return false;
         }
         let header = self.header(node);
-        if header.full & bit(slot) != 0 {
+        if (header.full | header.other) & bit(slot) != 0 {
             return false;
         }
         let at = node.base + header.record_offset(node.mask, slot) as u32;
-        if Record::read(self.store().block(at, RECORD_WORDS))
-            .uniform()
-            .is_some()
-        {
-            return false;
-        }
         self.store_mut().write_block(at, &new.words());
         true
     }
@@ -161,7 +160,7 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
     // leaves are noted, and when they are all one material (the usual case)
     // that material is the default and they need no records.
     let mut words = [0; MAX_BLOCK_LEN];
-    let mut len = BRICK_HEADER_WORDS;
+    let mut len = BrickHeader::default().len();
     let mut mask = 0u64;
     let mut full = 0u64;
     let mut first: Option<MaterialId> = None;
@@ -190,32 +189,37 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
     }
     let header = match first {
         Some(material) if !mixed && full == u64::MAX => return Packed::Filled(material),
-        Some(default) if !mixed => BrickHeader { full, default },
+        Some(default) if !mixed => BrickHeader {
+            full,
+            default,
+            other: 0,
+        },
         // Full leaves of several materials: the most common is the default.
         Some(_) => return pack_counted(mask, records),
         None => BrickHeader::default(),
     };
-    words[..BRICK_HEADER_WORDS].copy_from_slice(&header.words());
-    let stored = ((len - BRICK_HEADER_WORDS) / RECORD_WORDS) as u32;
-    Packed::Node(PackedNode::from_array(mask, stored, words, len))
+    words[..header.len()].copy_from_slice(&header.words()[..header.len()]);
+    Packed::Node(PackedNode::from_array(mask, header.info(len), words, len))
 }
 
 /// [`pack`] for a brick whose full leaves are of several materials: counts
-/// them for the default, then stores every other non-air leaf.
+/// them for the default, then stores every other non-air leaf, the other
+/// full ones as one word each.
 fn pack_counted(mask: u64, records: &Records) -> Packed<MAX_BLOCK_LEN> {
     let header = default_leaves(records);
     let mut words = [0; MAX_BLOCK_LEN];
-    words[..BRICK_HEADER_WORDS].copy_from_slice(&header.words());
-    let mut len = BRICK_HEADER_WORDS;
-    let mut stored = 0u32;
+    let mut len = header.len();
+    words[..len].copy_from_slice(&header.words()[..len]);
     for (slot, record) in (0..).zip(records) {
-        if record.mask != 0 && header.full & bit(slot) == 0 {
+        if header.other & bit(slot) != 0 {
+            words[len] = record.payload;
+            len += 1;
+        } else if record.mask != 0 && header.full & bit(slot) == 0 {
             words[len..len + RECORD_WORDS].copy_from_slice(&record.words());
             len += RECORD_WORDS;
-            stored += 1;
         }
     }
-    Packed::Node(PackedNode::from_array(mask, stored, words, len))
+    Packed::Node(PackedNode::from_array(mask, header.info(len), words, len))
 }
 
 /// The default material of a brick and the leaves it stands for.
@@ -241,6 +245,7 @@ fn default_leaves(records: &Records) -> BrickHeader {
         return first.map_or_else(BrickHeader::default, |default| BrickHeader {
             full,
             default,
+            other: 0,
         });
     }
     let mut counts: [(MaterialId, u32); TREE_FANOUT as usize] =
@@ -261,11 +266,19 @@ fn default_leaves(records: &Records) -> BrickHeader {
     else {
         return BrickHeader::default();
     };
-    let full = (0..)
-        .zip(records)
-        .filter(|(_, r)| r.uniform() == Some(default))
-        .fold(0u64, |m, (slot, _)| m | bit(slot));
-    BrickHeader { full, default }
+    let (mut full, mut other) = (0u64, 0u64);
+    for (slot, r) in (0..).zip(records) {
+        match r.uniform() {
+            Some(m) if m == default => full |= bit(slot),
+            Some(_) => other |= bit(slot),
+            None => {}
+        }
+    }
+    BrickHeader {
+        full,
+        default,
+        other,
+    }
 }
 
 #[cfg(test)]
@@ -294,7 +307,7 @@ mod tests {
         };
         assert_eq!(p.mask, bit(3) | bit(40) | bit(63));
         // The full leaf of 5 is the default: in the header, with no record.
-        assert_eq!(p.info, 2);
+        assert_eq!(p.info, 9, "a header and two records");
         assert_eq!(
             p.words(),
             [0, 1 << 8, 5, 0b1010, 0, UNIFORM_BIT | 9, 0, 1 << 8, 1234,]
@@ -306,10 +319,18 @@ mod tests {
         let stone = Record::filled(MaterialId(2));
         let mut records = [stone; 64];
         records[7] = Record::single(!1, MaterialId(2));
-        assert!(matches!(pack(&records), Packed::Node(p) if p.mask == u64::MAX && p.info == 1));
-        // A second full material is stored; the more common one is default.
+        assert!(matches!(pack(&records), Packed::Node(p) if p.mask == u64::MAX && p.info == 6));
+        // A second full material is stored as one word after a header with
+        // its mask; the more common one is default.
         records[7] = Record::filled(MaterialId(3));
-        assert!(matches!(pack(&records), Packed::Node(p) if p.words().len() == 6));
+        let Packed::Node(p) = pack(&records) else {
+            panic!("two full materials need a node");
+        };
+        assert_eq!(p.info, 6 | crate::tree::node::BRICK_OTHER_FULL);
+        assert_eq!(
+            p.words(),
+            [!(1 << 7), u32::MAX, 2, 1 << 7, 0, UNIFORM_BIT | 3]
+        );
     }
 
     #[test]
@@ -325,6 +346,7 @@ mod tests {
         let h = default_leaves(&records);
         assert_eq!(h.default, MaterialId(3), "a tie goes to the lower id");
         assert_eq!(h.full, bit(4) | bit(5) | bit(6));
+        assert_eq!(h.other, bit(1) | bit(2) | bit(9));
         records[10] = Record::filled(MaterialId(7));
         assert_eq!(default_leaves(&records).default, MaterialId(7));
         let one = default_leaves(&{

@@ -239,9 +239,25 @@ fn slab() -> VoxelTree {
     tree
 }
 
+/// [`slab`] with every other plane of voxels across x of a second material,
+/// so every leaf is a two-material palette leaf and a brick's block is large
+/// next to the fixed cost of a node or table write (since decision 0021 a
+/// brick of full leaves is a few words).
+fn striped_slab() -> VoxelTree {
+    let mut tree = slab();
+    for x in (-64..64).step_by(2) {
+        tree.fill_box(
+            VoxelBox::new(VoxelPos::new(x, -16, -64), VoxelPos::new(x + 1, -1, 64)),
+            MaterialId(3),
+        )
+        .unwrap();
+    }
+    tree
+}
+
 #[test]
 fn edited_bricks_go_first_and_get_at_least_a_quarter_of_the_budget() {
-    let mut tree = slab();
+    let mut tree = striped_slab();
     let snap = tree.snapshot();
     let shape = Shape::of(&snap);
     let (mut res, mut pools) = cpu_cache(shape);
