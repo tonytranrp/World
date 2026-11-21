@@ -123,6 +123,20 @@ and tests stay deterministic.
   frames 3145 and 3201 of two 6,000-frame 8 m/s walks). Growing or
   rehashing one small map costs at most its own few thousand entries.
   `stats` counts node groups and brick ids instead of scanning.
+- **Stage 1 keeps a few frames' worth of candidates.** A growth pass
+  found 6,000 to 21,000 nodes to expand a frame on an 8 m/s walk, every
+  one carried to the next frame, looked up again and sorted twice, while
+  128 could be expanded. Now only the most important
+  `4 * max_expansions_per_frame` expansions and four frames of the upload
+  budget's bricks are kept, chosen by a partial selection (ties to the
+  lower key, so it is deterministic) with only that head sorted. The
+  ones left out are found again by the next pass: expansions schedule
+  one, and a finished pass that left candidates out schedules one too,
+  since loads do not. Sampled over 20 s of an 8 m/s walk, `select_split`
+  fell from 3,970 to 2,486 samples and sorting from 1,030 to 68; the
+  frame mean fell from 29.7-31.1 to 24.8-24.9 ms in three alternating
+  pairs, run while the CPU was held at 73% of its speed. At 4 m/s the
+  pairs differ by -1.7 to +3 ms, within the noise of that run.
 
 ## Alternatives considered
 

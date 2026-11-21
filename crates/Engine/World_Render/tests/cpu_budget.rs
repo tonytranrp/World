@@ -513,6 +513,55 @@ fn a_frame_never_expands_more_than_its_budget() {
     assert_eq!((tight.2, tight.3), (roomy.2, roomy.3));
 }
 
+/// Stage 1 keeps only a few frames' worth of load candidates. Under a
+/// still camera and an upload budget of a few bricks a frame, the ones it
+/// left out are found by a later pass, so the cache loads exactly what a
+/// roomy budget loads.
+#[test]
+fn bricks_left_out_of_a_frame_are_loaded_by_a_later_pass() {
+    let tree = world_render::internals::scene::build();
+    let snap = tree.snapshot();
+    let shape = Shape::of(&snap);
+    let view = ViewPoint {
+        eye: [0.0, 0.0, 0.0],
+        pixel_angle: 2.0 * (22.5f32.to_radians()).tan() / 720.0,
+    };
+    let config = BrickCacheConfig::default();
+    let run = |budget: u64, frames: u32| {
+        let (mut res, mut pools) = roomy_cache(shape);
+        let mut batch = UploadBatch::default();
+        let mut late = 0;
+        for frame in 1..=frames {
+            let input = FrameInput {
+                source: &snap,
+                frame,
+                refresh: frame == 1,
+                dirty: &[],
+                chunks: &[],
+                view: Some(view),
+                requests: &[],
+                victims: &[],
+                config: &config,
+                budget,
+                victim_capacity: 64,
+            };
+            let r = run_frame(&mut res, &input, &mut batch);
+            apply_cpu(&mut pools, &batch);
+            if frame > frames - 5 {
+                late += r.expanded + r.loaded;
+            }
+        }
+        verify(&mut res, &snap, &pools);
+        let s = res.stats();
+        (late, s.expanded, s.bricks)
+    };
+    let roomy = run(64 << 20, 60);
+    let tight = run(u64::from(config.mean_brick_bytes) * 2, 3000);
+    assert!(roomy.2 > 100, "enough bricks to leave some out: {roomy:?}");
+    assert_eq!((roomy.0, tight.0), (0, 0), "both settled");
+    assert_eq!((tight.1, tight.2), (roomy.1, roomy.2));
+}
+
 /// A growth step makes at most `max_visits` queue pops and pushes, plus
 /// the pushes of the one node that crossed the limit.
 #[test]

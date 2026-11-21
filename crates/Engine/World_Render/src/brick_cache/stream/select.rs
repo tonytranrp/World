@@ -353,17 +353,49 @@ pub struct Budgets {
     /// Collapses the shrink walk may find; it stops at the last one and
     /// resumes there, since releasing a subtree costs per record.
     pub collapses: u32,
+    /// Expansion candidates kept, the most important first. A pass finds
+    /// far more than a frame can expand; the rest are found again by the
+    /// next pass, which every expansion schedules.
+    pub keep_expand: usize,
+    /// Brick load candidates kept, the most important first.
+    pub keep_load: usize,
 }
 
 impl Budgets {
-    /// Both walks at `visits`, collapses unbounded.
+    /// Both walks at `visits`, collapses and candidates unbounded.
     pub fn visits(visits: u32) -> Self {
         Self {
             growth_visits: visits,
             shrink_visits: visits,
             collapses: u32::MAX,
+            keep_expand: usize::MAX,
+            keep_load: usize::MAX,
         }
     }
+}
+
+/// Orders candidates by descending priority, ties to the lower key.
+fn by_priority(a: &(f32, NodeKey), b: &(f32, NodeKey)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// The `keep` most important distinct candidates of `list`, in priority
+/// order, and whether any were left out. Only the head is sorted: a pass
+/// can find tens of thousands.
+fn most_important(mut list: Vec<(f32, NodeKey)>, keep: usize) -> (Vec<NodeKey>, bool) {
+    // A key found twice (carried and found again) has the same priority
+    // both times, so twice `keep` holds at least `keep` distinct keys.
+    let head = keep.saturating_mul(2);
+    if list.len() > head {
+        list.select_nth_unstable_by(head, by_priority);
+        list.truncate(head);
+    }
+    list.sort_unstable_by_key(|&(_, k)| k);
+    list.dedup_by_key(|&mut (_, k)| k);
+    list.sort_unstable_by(by_priority);
+    let cut = list.len() > keep;
+    list.truncate(keep);
+    (list.into_iter().map(|(_, k)| k).collect(), cut)
 }
 
 /// [`select_budgeted`] with separate budgets for growth and shrink.
@@ -524,10 +556,6 @@ pub fn select_split(
             load.push((projected_pixels(shape.origin, key, view), key));
         }
     }
-    for list in [&mut expand, &mut load] {
-        list.sort_unstable_by_key(|&(_, k)| k);
-        list.dedup_by_key(|&mut (_, k)| k);
-    }
 
     // Shrink: everything, resumably.
     if walk.is_empty() && growth.shrink_due(view, lod.regrow_voxels) {
@@ -572,14 +600,17 @@ pub fn select_split(
         }
     }
     growth.shrink_visits = visits;
-    let by_priority =
-        |a: &(f32, NodeKey), b: &(f32, NodeKey)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
-    expand.sort_by(by_priority);
-    load.sort_by(by_priority);
     out.collapse.sort_unstable();
     out.evict.sort_unstable();
-    out.expand = expand.into_iter().map(|(_, k)| k).collect();
-    out.load = load.into_iter().map(|(_, k)| k).collect();
+    let (cut_expand, cut_load);
+    (out.expand, cut_expand) = most_important(expand, budgets.keep_expand);
+    (out.load, cut_load) = most_important(load, budgets.keep_load);
+    // Candidates left out are found again by the next pass. Expansions
+    // schedule one, loads do not, so a finished pass that left some out
+    // schedules it here.
+    if (cut_expand || cut_load) && !growth.active {
+        growth.changed = true;
+    }
     out
 }
 

@@ -102,6 +102,9 @@ pub struct FrameReport {
     pub evict_target: Option<u32>,
 }
 
+/// Frames of expansion and load candidates stage 1 keeps.
+const KEEP_FRAMES: usize = 4;
+
 /// Runs one frame of streaming into `batch` (cleared first).
 pub fn run_frame<S: VoxelSource + Sync>(
     res: &mut Residency,
@@ -159,6 +162,10 @@ pub fn run_frame<S: VoxelSource + Sync>(
                     growth_visits: lod.max_visits_per_frame,
                     shrink_visits,
                     collapses: lod.max_collapses_per_frame,
+                    // A few frames' worth: more are never reached before
+                    // the next pass finds them again.
+                    keep_expand: lod.max_expansions_per_frame as usize * KEEP_FRAMES,
+                    keep_load: (budget / mean.max(1) + 1) as usize * KEEP_FRAMES,
                 },
             );
             if settling && walk.is_empty() {
