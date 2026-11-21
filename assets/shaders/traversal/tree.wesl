@@ -35,7 +35,8 @@ import package::shaders::common::format::{
 };
 import package::shaders::common::constants::{
     KIND_UNIFORM, KIND_NOT_RESIDENT, KIND_BRICK, ROOT_NODE,
-    BLOCK_HEADER_WORDS, BLOCK_COUNT_MASK, LEAF_MASK_WORDS, PAYLOAD_UNIFORM_BIT,
+    BLOCK_HEADER_WORDS, BLOCK_COUNT_MASK, BLOCK_DEFAULT_WORD, BLOCK_DEFAULT_MASK_WORD,
+    BLOCK_FULL_MASK_WORD, LEAF_MASK_WORDS, PAYLOAD_UNIFORM_BIT,
     PALETTE_LEN_MASK, PALETTE_BITS_SHIFT, BRICK_TABLE_WORDS,
     FEEDBACK_HEADER_WORDS, REQUEST_WORDS, REQUEST_LEVEL_SHIFT,
     REQUEST_PRIORITY_SHIFT, REQUEST_PRIORITY_MAX,
@@ -161,11 +162,12 @@ fn request_node(index: u32, local: vec3<u32>, level: u32, t: f32, s: TraceSettin
     );
 }
 
-// The material of solid voxel `vslot` of leaf `k` of a block with `n` leaves.
+// The material of solid voxel `vslot` of a partial leaf of the block at
+// `base`, whose payload is the word at `payload_at` (decision 0021).
 fn leaf_material(
-    segment: u32, base: u32, n: u32, k: u32, leaf_lo: u32, leaf_hi: u32, vslot: u32,
+    segment: u32, base: u32, payload_at: u32, leaf_lo: u32, leaf_hi: u32, vslot: u32,
 ) -> u32 {
-    let payload = brick_word(segment, base + BLOCK_HEADER_WORDS + n * LEAF_MASK_WORDS + k);
+    let payload = brick_word(segment, payload_at);
     if (payload & PAYLOAD_UNIFORM_BIT) != 0u {
         return payload & 0xFFFFu;
     }
@@ -365,8 +367,26 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
                 let seg = block_segment(node.reference);
                 let base = block_base(node.reference);
                 stamp_brick(seg, base, s.frame);
-                let n = brick_word(seg, base + 1u) & BLOCK_COUNT_MASK;
-                let k = mask_rank(node.mask_lo, node.mask_hi, slot);
+                // Full leaves of the brick's default material have no words.
+                let d_lo = brick_word(seg, base + BLOCK_DEFAULT_MASK_WORD);
+                let d_hi = brick_word(seg, base + BLOCK_DEFAULT_MASK_WORD + 1u);
+                if mask_bit(d_lo, d_hi, slot) {
+                    let material = brick_word(seg, base + BLOCK_DEFAULT_WORD) & 0xFFFFu;
+                    return trace_hit(v, m, material, 0u, face_axis, HIT_FLAG_HIT, t, steps);
+                }
+                // Every other leaf has a payload; full ones have no leaf mask.
+                let s_lo = node.mask_lo & ~d_lo;
+                let s_hi = node.mask_hi & ~d_hi;
+                let p = brick_word(seg, base + 1u) & BLOCK_COUNT_MASK;
+                let payload_at = base + BLOCK_HEADER_WORDS + p * LEAF_MASK_WORDS
+                    + mask_rank(s_lo, s_hi, slot);
+                let f_lo = brick_word(seg, base + BLOCK_FULL_MASK_WORD);
+                let f_hi = brick_word(seg, base + BLOCK_FULL_MASK_WORD + 1u);
+                if mask_bit(f_lo, f_hi, slot) {
+                    let material = brick_word(seg, payload_at) & 0xFFFFu;
+                    return trace_hit(v, m, material, 0u, face_axis, HIT_FLAG_HIT, t, steps);
+                }
+                let k = mask_rank(s_lo & ~f_lo, s_hi & ~f_hi, slot);
                 let at = base + BLOCK_HEADER_WORDS + k * LEAF_MASK_WORDS;
                 let leaf_lo = brick_word(seg, at);
                 let leaf_hi = brick_word(seg, at + 1u);
@@ -378,7 +398,7 @@ fn cast_ray(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32) -> Hit {
                     }
                     break;
                 }
-                let material = leaf_material(seg, base, n, k, leaf_lo, leaf_hi, vslot);
+                let material = leaf_material(seg, base, payload_at, leaf_lo, leaf_hi, vslot);
                 return trace_hit(v, m, material, 0u, face_axis, HIT_FLAG_HIT, t, steps);
             }
             // Internal: one dependent load per level.

@@ -153,20 +153,25 @@ impl Walk {
         }
         self.counts.branches += 1;
         if level == 1 {
-            // A three-word header, then a three-word record per leaf except
-            // the full leaves of the default material: the most common
-            // material among full leaves, ties to the lower id.
+            // A header, one word per full leaf of another material and a
+            // three-word record per partial leaf; the full leaves of the
+            // default material (the most common material among full leaves,
+            // ties to the lower id) have no words. The header is three
+            // words, five with the other full leaves' mask (decision 0021).
             let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
             for (_, n) in &listed {
                 if let NodeKind::Uniform(m) = n.kind() {
                     *counts.entry(m.0).or_default() += 1;
                 }
             }
+            let full: usize = counts.values().sum();
             let defaults = counts
                 .iter()
                 .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
                 .map_or(0, |(_, &n)| n);
-            self.counts.words += 3 + 3 * (listed.len() - defaults);
+            let others = full - defaults;
+            let header = if others == 0 { 3 } else { 5 };
+            self.counts.words += header + others + 3 * (listed.len() - full);
         } else {
             self.counts.words += listed.len();
         }

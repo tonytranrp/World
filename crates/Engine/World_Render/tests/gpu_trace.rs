@@ -81,6 +81,10 @@ fn tree_scene() -> (VoxelTree, Bounds) {
     fill(&mut t, [-40, -16, 30], [40, 20, 34], 2);
     fill(&mut t, [-10, -16, -10], [10, 4, 10], 3);
     fill(&mut t, [-8, -14, -8], [8, 2, 8], 0);
+    // One brick with full leaves of two materials: 7 is its default (no
+    // words), 8 its other full leaves (one payload each, decision 0021).
+    fill(&mut t, [16, -16, 16], [32, -8, 28], 7);
+    fill(&mut t, [16, -8, 16], [24, 0, 28], 8);
     for i in 0..20 {
         fill(&mut t, [20 + i, -16, -30], [21 + i, -16 + i, -10], 4);
         t.set(

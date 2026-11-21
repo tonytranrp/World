@@ -81,12 +81,14 @@ pub struct MemoryBreakdown {
     pub upper_nodes: usize,
     /// Level-1 nodes (bricks), 16 bytes each plus a 12-byte header.
     pub bricks: usize,
+    /// Bricks whose header also holds an other-full mask: 8 more bytes.
+    pub long_headers: usize,
     /// Full leaves of their brick's default material: no bytes of their own.
     pub default_leaves: usize,
     /// Child words of level-2-and-up nodes, 4 bytes each.
     pub child_words: usize,
-    /// Leaf records that are full and one material but not their brick's
-    /// default (12 bytes each).
+    /// Leaves that are full and one material but not their brick's default
+    /// (one 4-byte word each, decision 0021).
     pub full_records: usize,
     /// Leaf records of one material with some air (12 bytes each).
     pub single_records: usize,
@@ -105,8 +107,10 @@ impl MemoryBreakdown {
     pub fn live_bytes(&self) -> usize {
         16 * (self.upper_nodes + self.bricks)
             + 12 * self.bricks
+            + 8 * self.long_headers
             + 4 * self.child_words
-            + 12 * (self.full_records + self.single_records + self.palette_records)
+            + 4 * self.full_records
+            + 12 * (self.single_records + self.palette_records)
             + 4 * self.palette_words.iter().sum::<usize>()
     }
 }
@@ -625,6 +629,7 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
     };
     if let Some((header, _)) = b.brick_layout() {
         out.bricks += 1;
+        out.long_headers += usize::from(header.other != 0);
         out.default_leaves += header.full.count_ones() as usize;
         for (slot, leaf) in b.children() {
             match leaf {

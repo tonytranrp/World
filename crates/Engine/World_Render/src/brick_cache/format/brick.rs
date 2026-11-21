@@ -10,9 +10,9 @@ use super::{
     PAYLOAD_UNIFORM_BIT,
 };
 
-/// The largest block a brick can need, in words: header, 64 leaves with a
-/// mask and payload each, and 64 palette blocks of up to 64 materials with
-/// 8-bit indices (1 + 32 + 16 words).
+/// The largest block a brick can need, in words: header, 64 partial leaves
+/// with a mask and payload each, and 64 palette blocks of up to 64 materials
+/// with 8-bit indices (1 + 32 + 16 words).
 pub const MAX_BLOCK_WORDS: u32 = BLOCK_HEADER_WORDS + 64 * 3 + 64 * 49;
 
 /// What encoding a brick reported besides its words.
@@ -92,7 +92,9 @@ impl LeafScan {
 /// `node` must be a branch whose children are leaves (a level-1 node of a
 /// `VoxelSource`); air and uniform level-1 nodes have no block, their record
 /// says everything. `scratch` is reused between calls. Every voxel is read
-/// once; the representative material is counted from the same reads.
+/// at most once; the representative material is counted from the same
+/// reads. Full one-material leaves are not read at all: they are in the
+/// default mask, or in the full mask with a payload.
 pub fn encode_brick<N: NodeView>(
     node: N,
     brick_id: u32,
@@ -103,62 +105,90 @@ pub fn encode_brick<N: NodeView>(
     debug_assert_eq!(content(&node), Content::Branch);
     let start = out.len();
     let mask = node.mask();
-    let n = mask.count_ones();
     scratch.clear();
 
+    // The leaves, once, and the full ones' default: the most common
+    // material among them, ties to the lower id.
+    let mut leaves = [None; 64];
+    let mut full = [(MaterialId::AIR, 0u64); 64];
+    let mut materials = 0;
+    for (slot, leaf) in node.children() {
+        let c = content(&leaf);
+        if let Content::Uniform(m) = c {
+            let bit = 1u64 << slot;
+            match full[..materials].iter_mut().find(|(f, _)| *f == m) {
+                Some(entry) => entry.1 |= bit,
+                None => {
+                    full[materials] = (m, bit);
+                    materials += 1;
+                }
+            }
+        }
+        leaves[slot as usize] = Some((leaf, c));
+    }
+    let (default, default_mask) = full[..materials]
+        .iter()
+        .copied()
+        .max_by(|a, b| a.1.count_ones().cmp(&b.1.count_ones()).then(b.0.cmp(&a.0)))
+        .unwrap_or((MaterialId::AIR, 0));
+    let full_mask = full[..materials].iter().fold(0, |m, f| m | f.1) & !default_mask;
+    let stored = mask & !default_mask;
+    let partial = stored & !full_mask;
+    let p = partial.count_ones();
+    let s = stored.count_ones();
+
     // Header, then room for masks and payloads, filled below.
-    out.extend_from_slice(&[brick_id, 0, 0, 0]);
+    out.extend_from_slice(&[
+        brick_id,
+        0,
+        0,
+        u32::from(default.0),
+        default_mask as u32,
+        (default_mask >> 32) as u32,
+        full_mask as u32,
+        (full_mask >> 32) as u32,
+    ]);
     out.resize(
-        start + (BLOCK_HEADER_WORDS + n * (LEAF_MASK_WORDS + 1)) as usize,
+        start + (BLOCK_HEADER_WORDS + p * LEAF_MASK_WORDS + s) as usize,
         0,
     );
     let masks_at = start + BLOCK_HEADER_WORDS as usize;
-    let payloads_at = masks_at + (n * LEAF_MASK_WORDS) as usize;
+    let payloads_at = masks_at + (p * LEAF_MASK_WORDS) as usize;
 
-    for (k, (_, leaf)) in node.children().enumerate() {
-        let leaf_mask = leaf.mask();
-        out[masks_at + 2 * k] = leaf_mask as u32;
-        out[masks_at + 2 * k + 1] = (leaf_mask >> 32) as u32;
-        out[payloads_at + k] = match content(&leaf) {
+    if default_mask != 0 {
+        scratch.add(default, 64 * u64::from(default_mask.count_ones()));
+    }
+    let (mut kp, mut ks) = (0, 0);
+    let mut rest = stored;
+    while rest != 0 {
+        let slot = rest.trailing_zeros();
+        rest &= rest - 1;
+        let Some((leaf, c)) = leaves[slot as usize] else {
+            continue;
+        };
+        let payload = match c {
             Content::Uniform(m) => {
                 scratch.add(m, 64);
                 PAYLOAD_UNIFORM_BIT | u32::from(m.0)
             }
-            // Most surface leaves hold one material: the stored palette says
-            // so without reading voxels (the world tree keeps it exact).
-            _ if let [m] = leaf.palette().as_slice() => {
-                scratch.add(*m, u64::from(leaf_mask.count_ones()));
-                PAYLOAD_UNIFORM_BIT | u32::from(m.0)
-            }
-            // A leaf stored packed already has the GPU's palette block
-            // layout (decision 0005): copy it and count from its indices.
-            _ if let Some(block) = leaf.palette_block() => {
-                count_palette_block(block, leaf_mask, scratch);
-                let offset = (out.len() - start) as u32;
-                out.extend_from_slice(block);
-                offset
-            }
             _ => {
-                let scan = LeafScan::of(&leaf, leaf_mask);
-                for i in 0..scan.len {
-                    scratch.add(scan.palette[i], scan.counts[i]);
-                }
-                if scan.len == 1 {
-                    PAYLOAD_UNIFORM_BIT | u32::from(scan.palette[0].0)
-                } else {
-                    let offset = (out.len() - start) as u32;
-                    append_palette_block(&scan, out);
-                    offset
-                }
+                let leaf_mask = leaf.mask();
+                out[masks_at + 2 * kp] = leaf_mask as u32;
+                out[masks_at + 2 * kp + 1] = (leaf_mask >> 32) as u32;
+                kp += 1;
+                leaf_payload(&leaf, leaf_mask, start, out, scratch)
             }
         };
+        out[payloads_at + ks] = payload;
+        ks += 1;
     }
+    debug_assert_eq!((kp, ks), (p as usize, s as usize));
 
     let summary = scratch.summary();
     out[start + 2] = u32::from(summary.material.0);
-    let palette_words = (out.len() - payloads_at - n as usize) as u32;
+    let palette_words = (out.len() - payloads_at - s as usize) as u32;
     let flags = if edited { BLOCK_FLAG_EDITED } else { 0 };
-    out[start + 1] = n | palette_words << BLOCK_PALETTE_WORDS_SHIFT | flags << BLOCK_FLAGS_SHIFT;
+    out[start + 1] = p | palette_words << BLOCK_PALETTE_WORDS_SHIFT | flags << BLOCK_FLAGS_SHIFT;
 
     let padded = (out.len() - start).next_multiple_of(BLOCK_ALIGN_WORDS as usize);
     out.resize(start + padded, 0);
@@ -166,6 +196,42 @@ pub fn encode_brick<N: NodeView>(
         mask,
         summary,
         words: padded as u32,
+    }
+}
+
+/// The payload of a leaf that is not full of one material, appending its
+/// palette block to `out` when it has one.
+fn leaf_payload<N: NodeView>(
+    leaf: &N,
+    leaf_mask: u64,
+    start: usize,
+    out: &mut Vec<u32>,
+    scratch: &mut Tally,
+) -> u32 {
+    // Most surface leaves hold one material: the stored palette says
+    // so without reading voxels (the world tree keeps it exact).
+    if let [m] = leaf.palette().as_slice() {
+        scratch.add(*m, u64::from(leaf_mask.count_ones()));
+        return PAYLOAD_UNIFORM_BIT | u32::from(m.0);
+    }
+    // A leaf stored packed already has the GPU's palette block layout
+    // (decision 0005): copy it and count from its indices.
+    if let Some(block) = leaf.palette_block() {
+        count_palette_block(block, leaf_mask, scratch);
+        let offset = (out.len() - start) as u32;
+        out.extend_from_slice(block);
+        return offset;
+    }
+    let scan = LeafScan::of(leaf, leaf_mask);
+    for i in 0..scan.len {
+        scratch.add(scan.palette[i], scan.counts[i]);
+    }
+    if scan.len == 1 {
+        PAYLOAD_UNIFORM_BIT | u32::from(scan.palette[0].0)
+    } else {
+        let offset = (out.len() - start) as u32;
+        append_palette_block(&scan, out);
+        offset
     }
 }
 
@@ -199,6 +265,7 @@ fn append_palette_block(scan: &LeafScan, out: &mut Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brick_cache::format::{BLOCK_COUNT_MASK, BLOCK_DEFAULT_WORD};
     use world_core::{DenseGrid, VoxelPos, VoxelSource};
 
     fn brick() -> DenseGrid {
@@ -225,9 +292,11 @@ mod tests {
         assert_eq!(out[1] & 0xFF, 2);
         assert_eq!(out[1] >> BLOCK_FLAGS_SHIFT, BLOCK_FLAG_EDITED);
         assert_eq!(out[2], 4);
+        // No full leaves: no default and empty masks.
+        assert_eq!(out[3..8], [0; 5]);
         // Two payloads after two masks, both inline.
-        assert_eq!(out[8], PAYLOAD_UNIFORM_BIT | 4);
-        assert_eq!(out[9], PAYLOAD_UNIFORM_BIT | 4);
+        assert_eq!(out[12], PAYLOAD_UNIFORM_BIT | 4);
+        assert_eq!(out[13], PAYLOAD_UNIFORM_BIT | 4);
         assert_eq!(out.len() % 4, 0);
         assert_eq!(e.words as usize, out.len());
     }
@@ -240,7 +309,7 @@ mod tests {
         g.set(VoxelPos::new(2, 0, 0), MaterialId(9));
         let mut out = Vec::new();
         encode_brick(g.root(), 0, false, &mut out, &mut Tally::default());
-        let payload = out[6];
+        let payload = out[10];
         assert_eq!(payload & PAYLOAD_UNIFORM_BIT, 0);
         let p = payload as usize;
         assert_eq!(out[p], 2 | 1 << PALETTE_BITS_SHIFT);
@@ -248,6 +317,37 @@ mod tests {
         // Indices of 9, 3, 9 at one bit each: 1, 0, 1.
         assert_eq!(out[p + 2], 0b101);
         assert_eq!((out[1] >> BLOCK_PALETTE_WORDS_SHIFT) & 0xFFFF, 3);
+    }
+
+    #[test]
+    fn full_leaves_are_a_default_mask_and_payloads() {
+        let mut g = brick();
+        // Leaves 0 and 2 full of 5, leaf 1 full of 6, leaf 3 one voxel of 5.
+        for (leaf, m) in [(0, 5), (1, 6), (2, 5)] {
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        g.set(VoxelPos::new(4 * leaf + x, y, z), MaterialId(m));
+                    }
+                }
+            }
+        }
+        g.set(VoxelPos::new(12, 0, 0), MaterialId(5));
+        let mut out = Vec::new();
+        let e = encode_brick(g.root(), 0, false, &mut out, &mut Tally::default());
+        assert_eq!(e.mask, 0b1111);
+        assert_eq!(out[1] & BLOCK_COUNT_MASK, 1, "one partial leaf");
+        assert_eq!(out[2], 5, "the representative material");
+        assert_eq!(out[BLOCK_DEFAULT_WORD as usize], 5);
+        assert_eq!(out[4..8], [0b101, 0, 0b10, 0]);
+        // The partial leaf's mask, then payloads of leaves 1 and 3.
+        assert_eq!(out[8..10], [1, 0]);
+        assert_eq!(
+            out[10..12],
+            [PAYLOAD_UNIFORM_BIT | 6, PAYLOAD_UNIFORM_BIT | 5]
+        );
+        assert_eq!(e.words, 12);
+        assert_eq!(e.summary.solid, 3 * 64 + 1);
     }
 
     #[test]
