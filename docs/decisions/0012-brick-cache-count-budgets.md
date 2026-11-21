@@ -162,10 +162,13 @@ and tests stay deterministic.
   the table until they are freed, and their parent's key may meanwhile
   hold a new, unexpanded entry (the burial stress test found this).
   `verify` recomputes both. They cost 16 bytes an entry, about 21 MiB at
-  1.3 million entries. In a 20 s profile of an 8 m/s walk,
-  `select_split` fell from 2,295 to 1,138 samples and its table lookups
-  from 1,126 to 290; its share of the brick cache's frame work fell from
-  37% to 22%.
+  1.3 million entries. Timed directly over 2,000 frames of an 8 m/s
+  walk, three alternating runs each with the CPU held at 48 to 53% of its
+  speed, `select_split` took 9.0 to 9.5 ms a frame before the level-2
+  changes (the candidate cap alone) and 2.9 to 3.0 ms with them and the
+  masks; the steady frame mean went from 34 to 43 ms to 32 ms. Sampling
+  profiles were too noisy for this: two 20 s samples of the same build
+  differed by a factor of two in `select_split`.
 
 ## Alternatives considered
 
