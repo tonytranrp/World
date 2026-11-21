@@ -1,8 +1,10 @@
-//! `cargo xtask`: the single entry point for tests, goldens, benchmarks, checks,
-//! fuzzing, mutation testing and running the game with live reloading.
+//! `cargo xtask`: the single entry point for tests, goldens, shader codegen,
+//! benchmarks, checks, fuzzing, mutation testing and running the game with
+//! live reloading.
 
 mod bench;
 mod check;
+mod codegen;
 mod golden;
 mod hot;
 mod process;
@@ -36,6 +38,12 @@ enum Command {
     Golden {
         #[arg(long)]
         update: bool,
+    },
+    /// Generate the WESL shader constants from World_Render's Rust constants
+    /// and show what changed. --check writes nothing and fails if they are stale.
+    Codegen {
+        #[arg(long)]
+        check: bool,
     },
     /// Run benchmarks. --save stores a baseline; --check compares against one
     /// and fails when anything got slower than the threshold.
@@ -102,6 +110,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Test { profile, extra } => testing::run(profile, &extra),
         Command::Golden { update } => golden::run(update),
+        Command::Codegen { check } => codegen::run(check),
         Command::Bench {
             save,
             check,
