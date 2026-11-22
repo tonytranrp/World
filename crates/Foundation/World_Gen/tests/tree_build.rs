@@ -95,7 +95,10 @@ fn a_coarse_chunk_is_uniform_cells_matching_its_samples() {
         for k in 0..64 {
             let y = min.y + k * cell;
             let p = VoxelPos::new(min.x + i as i32 * cell, y, min.z + j as i32 * cell);
-            let want = column.material_at(y + cell / 2, &source.columns().layers());
+            // Buried cells take the column's top material (decision 0029).
+            let want = source
+                .buried(i, y, j)
+                .unwrap_or_else(|| column.material_at(y + cell / 2, &source.columns().layers()));
             // Every voxel of the cell has the cell's material.
             for d in [0, 5, 15] {
                 let q = VoxelPos::new(p.x + d, p.y + 15 - d, p.z + d);
@@ -108,6 +111,62 @@ fn a_coarse_chunk_is_uniform_cells_matching_its_samples() {
     full.build_region(CHUNK_LEVEL, min, &g.chunk_source(coord))
         .unwrap();
     assert!(tree.stats().bytes * 8 < full.stats().bytes);
+}
+
+#[test]
+fn coarse_cells_that_differ_from_their_sample_are_never_seen() {
+    use world_gen::CoarseSource;
+    let g = generator();
+    let coord = surface_chunk(&g, 520, 505);
+    let source = CoarseSource::new(g.coarse_columns(coord, 2).unwrap());
+    let min = coord.min_voxel();
+    let mut tree = VoxelTree::new();
+    tree.build_region(CHUNK_LEVEL, min, &source).unwrap();
+    let cell = 16;
+    let n = 64;
+    let at = |i: i32, k: i32, j: i32| {
+        let (i, j) = (i.clamp(0, n - 1), j.clamp(0, n - 1));
+        tree.get(VoxelPos::new(
+            min.x + i * cell,
+            min.y + k * cell,
+            min.z + j * cell,
+        ))
+    };
+    // Whether a cell's sample is solid, from the columns (the cell above
+    // the chunk's top row is in the next chunk, which is not built).
+    let solid = |i: i32, k: i32, j: i32| {
+        let (i, j) = (i.clamp(0, n - 1), j.clamp(0, n - 1));
+        let column = source.columns().column(i as u32, j as u32).unwrap();
+        let y = min.y + k * cell + cell / 2;
+        !column.material_at(y, &source.columns().layers()).is_air()
+    };
+    let (mut buried, mut collapsed) = (0, 0);
+    for j in 0..n {
+        for i in 0..n {
+            let column = *source.columns().column(i as u32, j as u32).unwrap();
+            for k in 0..n {
+                let y = min.y + k * cell;
+                let sample = column.material_at(y + cell / 2, &source.columns().layers());
+                let got = at(i, k, j);
+                if source.buried(i as u32, y, j as u32).is_some() {
+                    buried += 1;
+                    collapsed += usize::from(got != sample);
+                    // Solid above and on every side (outside the footprint,
+                    // the nearest sample stands in), so no ray reaches it.
+                    for (di, dk, dj) in [(0, 1, 0), (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)] {
+                        assert!(solid(i + di, k + dk, j + dj), "cell {i},{k},{j}");
+                    }
+                    assert!(!got.is_air());
+                } else {
+                    assert_eq!(got, sample, "visible cell {i},{k},{j}");
+                }
+            }
+        }
+    }
+    assert!(
+        buried > 0 && collapsed > 0,
+        "{buried} buried, {collapsed} changed"
+    );
 }
 
 /// Builds `coord` with caves and checks columns of voxels against the
