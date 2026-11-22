@@ -58,17 +58,19 @@
 //! shared top. Node indices and word offsets inside a chunk refer to that
 //! chunk's arenas.
 //!
-//! # Bricks, level 1: a header, then the stored leaves (decisions 0021, 0025)
+//! # Bricks, level 1: a header, then the stored leaves (decisions 0021, 0025, 0031)
 //!
 //! A level-1 node covers one brick (16x16x16 voxels). Its `info` holds the
-//! block's length in words (bits 0 to 7, [`BRICK_LEN_MASK`]) and
-//! [`BRICK_FULL_MASK`] (bit 8). Its block starts with a header:
+//! block's length in words (bits 0 to 8, [`BRICK_LEN_MASK`]),
+//! [`BRICK_FULL_MASK`] (bit 9) and [`BRICK_PAIR_MASK`] (bit 10). Its block
+//! starts with a header:
 //!
 //! | Word | Meaning                                                    |
 //! | ---- | ---------------------------------------------------------- |
 //! | 0, 1 | *default mask* `A`, low word first                         |
 //! | 2    | *default material*                                         |
-//! | 3, 4 | *full mask* `B`, low word first; only with `BRICK_FULL_MASK` |
+//! | next 2 | *full mask* `B`, low word first; only with `BRICK_FULL_MASK` |
+//! | next 2 | *pair mask* `P`, low word first; only with `BRICK_PAIR_MASK` |
 //!
 //! The default material is the most common material among the brick's full
 //! single-material leaves (ties to the lower id); a brick without such
@@ -79,22 +81,27 @@
 //!
 //! The header stores the full mask only when it differs from the default
 //! mask, that is when the brick has a full leaf of another material or a
-//! default partial leaf. Otherwise the header is three words and every
-//! stored leaf is a record, as before decision 0025.
+//! default partial leaf, and the pair mask only when it is not zero: the
+//! leaves of exactly two materials. Without either the header is three
+//! words and every stored leaf is a record, as before decision 0025.
 //!
-//! Each non-air leaf is stored after the header, in slot order, by its two
+//! Each non-air leaf is stored after the header, in slot order, by its
 //! mask bits:
 //!
-//! | In `A` | In `B` | Leaf                          | Words                     |
-//! | ------ | ------ | ----------------------------- | ------------------------- |
-//! | yes    | yes    | full of the default           | none                      |
-//! | no     | yes    | full of another material      | [`UNIFORM_BIT`] and it    |
-//! | yes    | no     | default partial               | its leaf mask, lo and hi  |
-//! | no     | no     | anything else                 | a [`RECORD_WORDS`]-word record |
+//! | In `A` | In `B` | In `P` | Leaf                     | Words                     |
+//! | ------ | ------ | ------ | ------------------------ | ------------------------- |
+//! | yes    | yes    | no     | full of the default      | none                      |
+//! | no     | yes    | no     | full of another material | [`UNIFORM_BIT`] and it    |
+//! | yes    | no     | no     | default partial          | its leaf mask, lo and hi  |
+//! | no     | no     | yes    | two materials            | [`PAIR_WORDS`]: leaf mask, palette word, indices lo and hi |
+//! | no     | no     | no     | anything else            | a [`RECORD_WORDS`]-word record |
 //!
-//! So a leaf's word count is `[it is not in A] + 2 * [it is not in B]`, and
+//! So a leaf's word count is `[not in A] + 2 * [not in B] + 2 * [in P]`, and
 //! stored leaf `i` starts at `base + header + rank(mask & !A, i) + 2 *
-//! rank(mask & !B, i)`.
+//! rank(mask & !B, i) + 2 * rank(P, i)`. A two-material leaf's last three
+//! words are its palette block exactly as a block stored apart would start
+//! (the palette word, then the indices, one bit per solid voxel); the
+//! second index word is zero when it has 32 solid voxels or fewer.
 //!
 //! A record is:
 //!
@@ -111,11 +118,14 @@
 //! - bit 31 set: all of them are the material in the low 16 bits (bits 16 to
 //!   30 zero).
 //! - bit 31 clear: the word offset of the leaf's palette block; the leaf has
-//!   two or more materials.
+//!   three or more materials (two-material leaves are stored inline, above).
 //!
 //! # Palette block
 //!
-//! For a palette of `p` materials (2 to 64), `s = popcount(leaf mask)` solid
+//! Leaves of three or more materials keep their palette block apart in the
+//! word arena; a two-material leaf's block is inline in its brick (above),
+//! laid out the same way. For a palette of `p` materials (2 to 64), `s =
+//! popcount(leaf mask)` solid
 //! voxels and an index width of `b` bits, the smallest of 1, 2, 4 or 8 that
 //! indexes `p` entries:
 //!
@@ -138,6 +148,7 @@
 //! voxels are all one material is a uniform child word, a default leaf or an
 //! other-full word, never a node, a record or a palette. A partial leaf of
 //! one material is a record only when that material is not the default. A
+//! leaf of exactly two materials is always inline, in the pair mask. A
 //! palette holds exactly the
 //! materials present, sorted, at the minimal width. So equal content has equal
 //! masks, records, palettes and child words everywhere; only node indices and
@@ -188,15 +199,23 @@ pub const RECORD_WORDS: usize = 3;
 /// default mask and the default material.
 pub const BRICK_HEADER_WORDS: usize = 3;
 
-/// Words in the header of a level-1 node's block with a full mask.
-pub const BRICK_HEADER_MAX_WORDS: usize = BRICK_HEADER_WORDS + 2;
+/// Words of a two-material leaf stored inline (decision 0031): its leaf
+/// mask, palette word and two index words.
+pub const PAIR_WORDS: usize = 5;
+
+/// Words in the header of a level-1 node's block with both a full mask and
+/// a pair mask.
+pub const BRICK_HEADER_MAX_WORDS: usize = BRICK_HEADER_WORDS + 4;
 
 /// Level-1 `info` bits holding the block's length in words.
-pub const BRICK_LEN_MASK: u32 = 0xFF;
+pub const BRICK_LEN_MASK: u32 = 0x1FF;
 
 /// Level-1 `info` flag: the header has a full mask (decision 0025; 0021
 /// called it the other-full flag).
-pub const BRICK_FULL_MASK: u32 = 1 << 8;
+pub const BRICK_FULL_MASK: u32 = 1 << 9;
+
+/// Level-1 `info` flag: the header has a pair mask (decision 0031).
+pub const BRICK_PAIR_MASK: u32 = 1 << 10;
 
 /// The header of a level-1 node's block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -206,19 +225,23 @@ pub(crate) struct BrickHeader {
     pub defaults: u64,
     pub default: MaterialId,
     /// Leaves full of one material: those in `defaults` have no words, the
-    /// others one word. Equal to `defaults` in a three-word header.
+    /// others one word. Equal to `defaults` when the header has no full mask.
     pub full: u64,
+    /// Leaves of exactly two materials, stored inline in [`PAIR_WORDS`]
+    /// words each.
+    pub pairs: u64,
 }
 
 impl BrickHeader {
     /// The header of a brick whose leaves stored as defaults are `defaults`,
-    /// all full: no full mask.
+    /// all full: no full mask, no pairs.
     #[cfg(test)]
     pub const fn short(defaults: u64, default: MaterialId) -> Self {
         Self {
             defaults,
             default,
             full: defaults,
+            pairs: 0,
         }
     }
 
@@ -227,13 +250,19 @@ impl BrickHeader {
     #[inline]
     pub fn read(words: &[u32], info: u32) -> Self {
         let defaults = u64::from(words[0]) | u64::from(words[1]) << 32;
+        let (full, next) = if info & BRICK_FULL_MASK != 0 {
+            (u64::from(words[3]) | u64::from(words[4]) << 32, 5)
+        } else {
+            (defaults, 3)
+        };
         Self {
             defaults,
             default: MaterialId(words[2] as u16),
-            full: if info & BRICK_FULL_MASK != 0 {
-                u64::from(words[3]) | u64::from(words[4]) << 32
+            full,
+            pairs: if info & BRICK_PAIR_MASK != 0 {
+                u64::from(words[next]) | u64::from(words[next + 1]) << 32
             } else {
-                defaults
+                0
             },
         }
     }
@@ -243,24 +272,30 @@ impl BrickHeader {
         self.full != self.defaults
     }
 
-    /// Words in this header: 3, or 5 with a full mask.
+    /// Words in this header: 3, 2 more with a full mask, 2 more with pairs.
     pub const fn len(self) -> usize {
-        if self.has_full_mask() {
-            BRICK_HEADER_MAX_WORDS
-        } else {
-            BRICK_HEADER_WORDS
-        }
+        BRICK_HEADER_WORDS
+            + if self.has_full_mask() { 2 } else { 0 }
+            + if self.pairs != 0 { 2 } else { 0 }
     }
 
     /// The header's words, of which the first [`len`](Self::len) are stored.
     pub const fn words(self) -> [u32; BRICK_HEADER_MAX_WORDS] {
-        [
-            self.defaults as u32,
-            (self.defaults >> 32) as u32,
-            self.default.0 as u32,
-            self.full as u32,
-            (self.full >> 32) as u32,
-        ]
+        let mut words = [0; BRICK_HEADER_MAX_WORDS];
+        words[0] = self.defaults as u32;
+        words[1] = (self.defaults >> 32) as u32;
+        words[2] = self.default.0 as u32;
+        let mut at = BRICK_HEADER_WORDS;
+        if self.has_full_mask() {
+            words[at] = self.full as u32;
+            words[at + 1] = (self.full >> 32) as u32;
+            at += 2;
+        }
+        if self.pairs != 0 {
+            words[at] = self.pairs as u32;
+            words[at + 1] = (self.pairs >> 32) as u32;
+        }
+        words
     }
 
     /// The level-1 `info` of a block with this header and `len` words.
@@ -271,6 +306,7 @@ impl BrickHeader {
             } else {
                 0
             }
+            | if self.pairs != 0 { BRICK_PAIR_MASK } else { 0 }
     }
 
     /// The full leaves of the default material: no words.
@@ -280,10 +316,14 @@ impl BrickHeader {
 
     /// The word offset, from the block start, of leaf `slot`'s stored words
     /// in a node with `mask`: one word for each earlier leaf outside the
-    /// default mask and two for each outside the full mask.
+    /// default mask, two for each outside the full mask and two more for
+    /// each two-material leaf.
     #[inline]
     pub const fn record_offset(self, mask: u64, slot: u32) -> usize {
-        self.len() + rank(mask & !self.defaults, slot) + 2 * rank(mask & !self.full, slot)
+        self.len()
+            + rank(mask & !self.defaults, slot)
+            + 2 * rank(mask & !self.full, slot)
+            + 2 * rank(self.pairs, slot)
     }
 
     /// Leaf `slot` (set in `mask`) of a node with `mask`, read from `block`,
@@ -302,6 +342,8 @@ impl BrickHeader {
                 u64::from(block[at]) | u64::from(block[at + 1]) << 32,
                 self.default,
             )
+        } else if self.pairs & b != 0 {
+            Record::read_pair(&block[at..at + PAIR_WORDS])
         } else {
             Record::read(&block[at..at + RECORD_WORDS])
         }
@@ -311,11 +353,10 @@ impl BrickHeader {
 /// Node indices are below this, so they never collide with uniform words.
 pub(crate) const MAX_NODES: u32 = UNIFORM_BIT;
 
-/// The longest node block: a level-1 node with a long header and 64 records
-/// (one more than any brick needs: a full mask replaces some record by one
-/// or two words, or there would be none).
-pub(crate) const MAX_BLOCK_LEN: usize =
-    BRICK_HEADER_MAX_WORDS + RECORD_WORDS * TREE_FANOUT as usize;
+/// The longest node block: a level-1 node with the longest header and 64
+/// two-material leaves (more than any brick needs: a pair mask leaves no
+/// room for a full mask's leaves).
+pub(crate) const MAX_BLOCK_LEN: usize = BRICK_HEADER_MAX_WORDS + PAIR_WORDS * TREE_FANOUT as usize;
 
 // The longest block fits the length bits of a level-1 `info`.
 const _: () = assert!(MAX_BLOCK_LEN <= BRICK_LEN_MASK as usize);
@@ -563,6 +604,7 @@ mod tests {
             defaults: bit(2) | bit(3),
             default: MaterialId(7),
             full: bit(2) | bit(5) | bit(40),
+            pairs: 0,
         };
         assert_eq!(h.len(), 5);
         assert_eq!(h.info(15), 15 | BRICK_FULL_MASK);
@@ -597,13 +639,37 @@ mod tests {
         assert_eq!(h.leaf(&block, mask, 5), Record::filled(MaterialId(4)));
         assert_eq!(h.leaf(&block, mask, 40), Record::filled(MaterialId(9)));
         assert_eq!(h.leaf(&block, mask, 0), Record::single(1, MaterialId(3)));
+        assert_eq!(h.leaf(&block, mask, 9), Record::palette(6, 1234));
+    }
+
+    #[test]
+    fn two_material_leaves_are_five_words_after_a_pair_mask() {
+        // Slot 1: full of the default; 4: a record; 6 and 9: pairs; 7:
+        // full of another material.
+        let h = BrickHeader {
+            defaults: bit(1),
+            default: MaterialId(2),
+            full: bit(1) | bit(7),
+            pairs: bit(6) | bit(9),
+        };
+        assert_eq!(h.len(), 7);
+        assert_eq!(h.info(30), 30 | BRICK_FULL_MASK | BRICK_PAIR_MASK);
+        assert_eq!(BrickHeader::read(&h.words(), h.info(30)), h);
+        let mask = bit(1) | bit(4) | bit(6) | bit(7) | bit(9);
         assert_eq!(
-            h.leaf(&block, mask, 9),
-            Record {
-                mask: 6,
-                payload: 1234
-            }
+            [4, 6, 7, 9].map(|s| h.record_offset(mask, s)),
+            [7, 10, 15, 16]
         );
+        let mut block = [0u32; 21];
+        block[15] = UNIFORM_BIT | 5;
+        let pair = Record::pair(0xFF00, 2 | 3 << 16, 0b1010);
+        block[16..21].copy_from_slice(&pair.pair_words());
+        assert_eq!(h.leaf(&block, mask, 9), pair);
+        assert_eq!(h.leaf(&block, mask, 7), Record::filled(MaterialId(5)));
+        // Without the full mask, the pair mask follows the default.
+        let h = BrickHeader { full: bit(1), ..h };
+        assert_eq!((h.len(), h.words()[3]), (5, bit(6) as u32 | bit(9) as u32));
+        assert_eq!(BrickHeader::read(&h.words(), h.info(9)), h);
     }
 
     #[test]
