@@ -1,4 +1,5 @@
-//! Word block allocation: blocks of 1 to 192 words, recycled by exact size.
+//! Word block allocation: blocks of 1 to `MAX_BLOCK_LEN` words, recycled by
+//! exact size first, else cut from the shortest longer free block.
 
 use std::sync::Arc;
 
@@ -10,8 +11,14 @@ use super::pages::Pages;
 /// New blocks are cut from the end of the last page. A block never straddles
 /// a page, so when the next block does not fit, the rest of the page (always
 /// shorter than the block, so under 192 words) becomes a free block of its own
-/// size and the new block starts the next page. Freed blocks go on a LIFO
-/// list per size and are reused only by a request of exactly that size.
+/// size and the new block starts the next page. Freed blocks go on a list
+/// per size; a request takes a block of exactly its size if there is one
+/// (the lowest of a short list, the last freed of a long one), else the
+/// front of the shortest longer one, whose rest stays free, and only then
+/// cuts from the end. So edits fill holes from the front of the arena
+/// instead of growing it, and the small blocks every lookup reads (child
+/// words of the upper levels) do not drift to the last pages (decision
+/// 0035).
 #[derive(Clone, Default)]
 pub(super) struct WordBlocks {
     /// One past the highest word ever handed out.
@@ -25,13 +32,25 @@ pub(super) struct WordBlocks {
     /// are its page tails) does not hold a slot for each of the
     /// `MAX_BLOCK_LEN` lengths, and a lookup is one index, not a search.
     free: Vec<Option<Arc<Vec<u32>>>>,
+    /// Bit `len - 1` is set when `free[len - 1]` holds a block.
+    nonempty: [u64; FREE_BITS],
     live_words: usize,
     free_words: usize,
 }
 
+/// Free lists up to this long hand out their lowest block; longer ones the
+/// last freed.
+const LOWEST_FIRST_MAX: usize = 16;
+
+/// Words of the bitmap of lengths with free blocks.
+const FREE_BITS: usize = MAX_BLOCK_LEN.div_ceil(64);
+
 impl WordBlocks {
-    /// The base of a block of `len` words, 1 to 192, inside one page. Panics
-    /// on any other length or when word offsets would overflow `u32`.
+    /// The base of a block of `len` words, 1 to `MAX_BLOCK_LEN`, inside one
+    /// page: a free block of exactly that length, else the front of the
+    /// shortest longer free block (the rest stays free), else a new block at
+    /// the end. Panics on any other length or when word offsets would
+    /// overflow `u32`.
     pub fn alloc<const N: usize>(&mut self, len: usize, pages: &mut Pages<u32, N>) -> u32 {
         assert!(
             (1..=MAX_BLOCK_LEN).contains(&len),
@@ -42,10 +61,42 @@ impl WordBlocks {
                 self.free_words -= len;
                 base
             }
-            None => self.cut(len, pages),
+            None => match self.shortest_free_above(len) {
+                // Splitting a longer block keeps the arena from growing
+                // while holes it could fill wait (decision 0035).
+                Some(longer) => {
+                    let base = self
+                        .take_free(longer)
+                        .expect("the bitmap names a free block");
+                    self.push_free(longer - len, base + len as u32);
+                    self.free_words -= len;
+                    base
+                }
+                None => self.cut(len, pages),
+            },
         };
         self.live_words += len;
         base
+    }
+
+    /// The shortest length above `len` with a free block.
+    fn shortest_free_above(&self, len: usize) -> Option<usize> {
+        // Bit `len` stands for length `len + 1`.
+        let (mut word, bit) = (len / 64, len % 64);
+        if word >= FREE_BITS {
+            return None;
+        }
+        let mut bits = self.nonempty[word] & (u64::MAX << bit);
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize + 1);
+            }
+            word += 1;
+            if word == FREE_BITS {
+                return None;
+            }
+            bits = self.nonempty[word];
+        }
     }
 
     /// A free block of exactly `len` words, if there is one; the last freed
@@ -56,7 +107,45 @@ impl WordBlocks {
         if list.is_empty() {
             return None;
         }
-        Arc::make_mut(list).pop()
+        let list = Arc::make_mut(list);
+        // The lowest of a short list, so blocks fill the arena from its
+        // front and blocks read together stay on few pages; the last freed
+        // of a long one, which costs no search.
+        let base = if list.len() <= LOWEST_FIRST_MAX {
+            let (at, _) = list
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, base)| *base)
+                .expect("the list is not empty");
+            Some(list.swap_remove(at))
+        } else {
+            list.pop()
+        };
+        if list.is_empty() {
+            self.nonempty[(len - 1) / 64] &= !(1 << ((len - 1) % 64));
+        }
+        base
+    }
+
+    /// Changes the length of the block at `base` from `old_len` to
+    /// `new_len` words in place when it is the last block cut from the arena
+    /// and the new length still fits its page, and returns whether it did.
+    /// A block that grows edit after edit (a brick being built voxel by
+    /// voxel) then keeps its place instead of leaving a free block of every
+    /// length it had and scattering over the pages.
+    pub fn resize_last<const N: usize>(
+        &mut self,
+        base: u32,
+        old_len: usize,
+        new_len: usize,
+    ) -> bool {
+        let fits = (base as usize % N) + new_len <= N;
+        if base as usize + old_len != self.end as usize || !fits || new_len == 0 {
+            return false;
+        }
+        self.end = base + new_len as u32;
+        self.live_words = self.live_words + new_len - old_len;
+        true
     }
 
     /// Returns a block for reuse. Its page is not written.
@@ -75,6 +164,7 @@ impl WordBlocks {
             self.free.resize(len, None);
         }
         Arc::make_mut(self.free[len - 1].get_or_insert_with(Default::default)).push(base);
+        self.nonempty[(len - 1) / 64] |= 1 << ((len - 1) % 64);
     }
 
     /// One past the highest word ever handed out.
@@ -122,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn freed_blocks_are_reused_by_exact_size_only() {
+    fn freed_blocks_are_reused_by_exact_size_then_split() {
         let (mut blocks, mut pages) = arena();
         let a = blocks.alloc(3, &mut pages);
         let b = blocks.alloc(5, &mut pages);
@@ -132,20 +222,38 @@ mod tests {
             b + 5,
             "a 3-word hole does not fit 4"
         );
-        assert_eq!(blocks.alloc(3, &mut pages), a);
+        assert_eq!(blocks.alloc(3, &mut pages), a, "an exact fit");
+        blocks.free(b, 5);
+        // No 2-word hole: the front of the 5-word one; its rest stays free.
+        assert_eq!(blocks.alloc(2, &mut pages), b);
+        assert_eq!(blocks.free_words(), 3);
+        assert_eq!(blocks.alloc(3, &mut pages), b + 2);
         assert_eq!(blocks.live_words(), 12);
         assert_eq!(blocks.free_words(), 0);
     }
 
     #[test]
-    fn reuse_is_last_in_first_out() {
+    fn reuse_takes_the_lowest_free_block_of_a_size_first() {
         let (mut blocks, mut pages) = arena();
         let a = blocks.alloc(2, &mut pages);
         let b = blocks.alloc(2, &mut pages);
         blocks.free(a, 2);
         blocks.free(b, 2);
-        assert_eq!(blocks.alloc(2, &mut pages), b);
         assert_eq!(blocks.alloc(2, &mut pages), a);
+        assert_eq!(blocks.alloc(2, &mut pages), b);
+    }
+
+    #[test]
+    fn the_last_block_resizes_in_place() {
+        let (mut blocks, mut pages) = arena();
+        let a = blocks.alloc(4, &mut pages);
+        let b = blocks.alloc(4, &mut pages);
+        assert!(!blocks.resize_last::<PAGE>(a, 4, 6), "not the last block");
+        assert!(blocks.resize_last::<PAGE>(b, 4, 9));
+        assert_eq!(blocks.end(), b as usize + 9);
+        assert!(blocks.resize_last::<PAGE>(b, 9, 2));
+        assert_eq!((blocks.end(), blocks.live_words()), (b as usize + 2, 6));
+        assert!(!blocks.resize_last::<PAGE>(b, 2, PAGE), "past its page");
     }
 
     #[test]

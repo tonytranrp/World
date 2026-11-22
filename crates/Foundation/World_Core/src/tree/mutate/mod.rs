@@ -339,9 +339,7 @@ impl Writer<'_> {
             }
             old.base
         } else {
-            let base = self.store_mut().alloc_block(words);
-            self.store_mut().free_block(old.base, old_len);
-            base
+            self.store_mut().realloc_block(old.base, old_len, words)
         };
         let node = Node { mask, base, info };
         if node != old {
