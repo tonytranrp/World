@@ -5,7 +5,6 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use super::node::PAIR_WORDS;
 use super::node::leaf::{index_words, palette_words, width_for};
 use super::*;
 use crate::BrickPos;
@@ -89,36 +88,20 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                             matches!(c, NodeRef::Uniform(x) if *x == m) || single(c) == Some(m)
                         })
                     });
-                    // Two-material leaves are inline, after a pair mask
-                    // (decision 0031).
-                    let pairs = mask_of(&|c| {
-                        matches!(c, NodeRef::Leaf(_)) && c.palette().as_slice().len() == 2
-                    });
-                    assert_eq!(header.pairs, pairs, "every two-material leaf");
                     match best {
                         Some(m) => assert_eq!(header.default, m, "the most common full leaf"),
-                        None => assert_eq!(
-                            (header.defaults, header.default, header.full),
-                            (0, MaterialId::AIR, 0)
-                        ),
+                        None => assert_eq!(header, Default::default()),
                     }
                     assert_eq!(header.full, full, "every full leaf");
                     assert_eq!(header.defaults, defaults, "every leaf of the default");
                     let others = (full & !defaults).count_ones() as usize;
                     let masks = (defaults & !full).count_ones() as usize;
-                    let pair_count = pairs.count_ones() as usize;
-                    let records =
-                        children.len() - (full | defaults).count_ones() as usize - pair_count;
-                    let header_len =
-                        3 + if full == defaults { 0 } else { 2 } + if pairs == 0 { 0 } else { 2 };
+                    let records = children.len() - (full | defaults).count_ones() as usize;
+                    let header_len = if full == defaults { 3 } else { 5 };
                     assert_eq!(header.len(), header_len);
                     assert_eq!(
                         len,
-                        header_len
-                            + others
-                            + 2 * masks
-                            + PAIR_WORDS * pair_count
-                            + RECORD_WORDS * records
+                        header_len + others + 2 * masks + RECORD_WORDS * records
                     );
                     found.2 += len;
                 } else {
@@ -149,14 +132,11 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                 let indices = index_words(solid, l.index_bits());
                 assert_eq!(l.index_words().len(), indices);
                 found.1 += 1;
-                // One material lives in the record and two inline in the
-                // brick (counted there); more need a palette block, with a
-                // header.
+                // One material lives in the record; more need a palette
+                // block, with a header from three materials on.
                 if palette.len() > 1 {
                     let header = usize::from(palette.len() > 2);
-                    if palette.len() > 2 {
-                        found.2 += header + palette_words(palette.len()) + indices;
-                    }
+                    found.2 += header + palette_words(palette.len()) + indices;
                     assert_eq!(
                         NodeRef::Leaf(l).palette_block().map(<[u32]>::len),
                         Some(header + palette_words(palette.len()) + indices)
@@ -508,18 +488,17 @@ fn a_single_material_leaf_is_one_three_word_record() {
 }
 
 #[test]
-fn a_two_material_leaf_is_stored_inline_after_a_pair_mask() {
+fn a_two_material_leaf_adds_a_palette_block() {
     let mut tree = VoxelTree::new();
     tree.set(pos(0, 0, 0), STONE).unwrap();
     let one = live_bytes(&tree);
-    // 32 solid voxels of two materials: five words in the brick (leaf mask,
-    // palette word, two index words) and the pair mask in its header; no
-    // palette block apart (decision 0031).
+    // 32 solid voxels of two materials: a record plus one palette word and
+    // one word of 1-bit indices; two materials have no palette header.
     for i in 0..32 {
         let m = if i % 3 == 0 { DIRT } else { STONE };
         tree.set(pos(4 + i % 4, i / 4 % 4, i / 16), m).unwrap();
     }
-    assert_eq!(live_bytes(&tree) - one, 4 * (PAIR_WORDS + 2));
+    assert_eq!(live_bytes(&tree) - one, 4 * (RECORD_WORDS + 2));
     let NodeRef::Leaf(l) = brick_child(&tree, pos(4, 0, 0)) else {
         panic!("a mixed leaf");
     };
@@ -553,10 +532,10 @@ fn default_partial_leaves_store_their_leaf_mask_alone() {
     let stats = tree.stats();
     tree.set(pos(9, 15, 1), MaterialId::AIR).unwrap();
     assert_eq!(tree.stats(), stats);
-    // Dirt in one makes it an inline two-material leaf: five words instead
-    // of two, and the pair mask in the header.
+    // Dirt in one makes it a record with a palette block (no header: a
+    // palette word and two words of indices for 63 voxels).
     tree.set(pos(4, 14, 0), DIRT).unwrap();
-    assert_eq!(live_bytes(&tree) - three, 4 * (PAIR_WORDS + 2 - 2));
+    assert_eq!(live_bytes(&tree) - three, 4 * (3 + 3 - 2));
     assert_sound(&tree);
     let mut cursor = tree.cursor();
     for z in 0..16 {

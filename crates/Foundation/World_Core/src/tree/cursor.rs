@@ -6,14 +6,10 @@ use super::ROOT_LEVEL;
 use super::alloc::StorageReader;
 use super::forest::{Chunks, chunk_root};
 use super::node::{CHUNK_LEVEL, Child, slot_at};
-use super::read::{Step, TreeView, pair_voxel, record_voxel, step};
+use super::read::{Step, TreeView, record_voxel, step};
 use crate::consts::TREE_DEPTH;
 use crate::coords::{VoxelPos, path};
 use crate::material::MaterialId;
-
-/// Set in a cached leaf offset (`path[0]`) when the leaf is an inline
-/// two-material leaf. Word offsets of a chunk stay far below it.
-const PAIR_AT: u32 = 1 << 31;
 
 /// Point lookups on a tree or snapshot that remember the path to the last
 /// voxel, like OpenVDB's value accessor.
@@ -35,8 +31,7 @@ pub struct TreeCursor<'a> {
     last: [u32; 3],
     /// `path[level]` is the node at that level on the path to `last`, for
     /// levels `bottom` up to the root; when `bottom` is 0, `path[0]` is the
-    /// word offset of the last leaf's record, with [`PAIR_AT`] for an inline
-    /// two-material leaf. Levels up to the chunk level
+    /// word offset of the last leaf's record. Levels up to the chunk level
     /// index the chunk's arenas.
     path: [u32; TREE_DEPTH as usize],
     /// The lowest level whose `path` entry is valid.
@@ -96,12 +91,7 @@ impl<'a> TreeCursor<'a> {
                     .expect("a cached path below the chunk level has a chunk")
             };
             if level == 0 {
-                let at = self.path[0];
-                return Some(if at & PAIR_AT != 0 {
-                    pair_voxel(reader, at & !PAIR_AT, slot_at(local, 0))
-                } else {
-                    record_voxel(reader, at, slot_at(local, 0))
-                });
+                return Some(record_voxel(reader, self.path[0], slot_at(local, 0)));
             }
             // One inlined copy of the step serves both sides of the chunk
             // level; two cost more than the check they save.
@@ -125,11 +115,6 @@ impl<'a> TreeCursor<'a> {
                 }
                 Step::Record(at) => {
                     self.path[0] = at;
-                    self.bottom = 0;
-                    level = 0;
-                }
-                Step::Pair(at) => {
-                    self.path[0] = at | PAIR_AT;
                     self.bottom = 0;
                     level = 0;
                 }

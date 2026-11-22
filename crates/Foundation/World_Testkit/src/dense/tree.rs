@@ -1,4 +1,4 @@
-//! The production 64-tree and dense object grids seen through the oracle's
+﻿//! The production 64-tree and dense object grids seen through the oracle's
 //! eyes: adapters so they can be compared with [`DenseWorld`](super::DenseWorld),
 //! a comparison for any voxel source (live tree, snapshot or dense grid), and
 //! a walk that checks the canonical form of decision 0004 node by node.
@@ -185,13 +185,9 @@ impl Walk {
             let full = count(&|n| uniform(n).is_some());
             let default_full = count(&|n| default.is_some() && uniform(n) == default);
             let masks = count(&|n| default.is_some() && single(n) == default);
-            // Two-material leaves are five words inline, after a pair mask
-            // in the header (decision 0031).
-            let pairs = count(&|n| n.kind() == NodeKind::Leaf && n.palette().as_slice().len() == 2);
             let others = full - default_full;
-            let header = 3 + if others + masks > 0 { 2 } else { 0 } + if pairs > 0 { 2 } else { 0 };
-            self.counts.words +=
-                header + others + 2 * masks + 5 * pairs + 3 * (listed.len() - full - masks - pairs);
+            let header = if others + masks > 0 { 5 } else { 3 };
+            self.counts.words += header + others + 2 * masks + 3 * (listed.len() - full - masks);
         } else {
             self.counts.words += listed.len();
         }
@@ -241,10 +237,10 @@ impl Walk {
         }
         let solids = mask.count_ones() as usize;
         self.counts.leaves += 1;
-        // One material fits in the record and two inline in the brick
-        // (decision 0031); more need a palette block: a header, two ids per
-        // word, then the packed indices.
-        if palette.len() > 2 {
+        // One material fits in the record; more need a palette block: a
+        // header from three materials on (decision 0025), two ids per word,
+        // then the packed indices.
+        if palette.len() > 1 {
             self.counts.words += usize::from(palette.len() > 2)
                 + palette.len().div_ceil(2)
                 + (solids * index_bits(palette.len())).div_ceil(32);

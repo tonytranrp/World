@@ -6,8 +6,8 @@ use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
 use crate::tree::node::leaf::{self, PackedLeaf, Record, Voxels};
 use crate::tree::node::{
-    BRICK_HEADER_MAX_WORDS, BrickHeader, Child, MAX_BLOCK_LEN, Node, PAIR_WORDS, Packed,
-    PackedNode, RECORD_WORDS, UNIFORM_BIT, bit, slots,
+    BRICK_HEADER_MAX_WORDS, BrickHeader, Child, MAX_BLOCK_LEN, Node, Packed, PackedNode,
+    RECORD_WORDS, UNIFORM_BIT, bit, slots,
 };
 
 /// The leaves of one level-1 node in slot order, air included.
@@ -40,9 +40,6 @@ impl Writer<'_> {
                 at += 2;
                 let mask = u64::from(block[at - 2]) | u64::from(block[at - 1]) << 32;
                 Record::single(mask, header.default)
-            } else if header.pairs & b != 0 {
-                at += PAIR_WORDS;
-                Record::read_pair(&block[at - PAIR_WORDS..at])
             } else {
                 at += RECORD_WORDS;
                 Record::read(&block[at - RECORD_WORDS..at])
@@ -65,7 +62,7 @@ impl Writer<'_> {
     }
 
     /// The header of a stored level-1 node.
-    pub(super) fn header(&self, node: Node) -> BrickHeader {
+    fn header(&self, node: Node) -> BrickHeader {
         let len = node.block_len(1).min(BRICK_HEADER_MAX_WORDS);
         BrickHeader::read(self.store().block(node.base, len), node.info)
     }
@@ -73,13 +70,12 @@ impl Writer<'_> {
     /// Overwrites leaf `slot` of a stored level-1 node with `new` where that
     /// keeps the node canonical without repacking: the slot holds a partial
     /// leaf and `new` is a partial leaf stored the same way. A default
-    /// partial leaf (a leaf mask) takes another default partial leaf, a
-    /// two-material leaf another two-material leaf, and a record any other
-    /// partial leaf but one of the default material, which would join the
-    /// default mask. Full single-material leaves decide the default and the
-    /// masks, and only they can make the node collapse, so those always
-    /// repack; a full leaf of several materials is an ordinary record (or a
-    /// pair). Returns whether it wrote.
+    /// partial leaf (a leaf mask) takes another default partial leaf; a
+    /// record takes any partial leaf but one of the default material, which
+    /// would join the default mask. Full single-material leaves decide the
+    /// default and the masks, and only they can make the node collapse, so
+    /// those always repack; a full leaf of several materials is an ordinary
+    /// record. Returns whether it wrote.
     pub(super) fn patch_record(&mut self, node: Node, slot: u32, new: Record) -> bool {
         if new.mask == 0 || new.uniform().is_some() || node.mask & bit(slot) == 0 {
             return false;
@@ -93,14 +89,7 @@ impl Writer<'_> {
         if default_partial != (new.material() == Some(header.default)) {
             return false;
         }
-        if (header.pairs & b != 0) != new.is_pair() {
-            return false;
-        }
         let at = node.base + header.record_offset(node.mask, slot) as u32;
-        if new.is_pair() {
-            self.store_mut().write_block(at, &new.pair_words());
-            return true;
-        }
         let words = new.words();
         let len = if default_partial { 2 } else { RECORD_WORDS };
         self.store_mut().write_block(at, &words[..len]);
@@ -124,11 +113,6 @@ impl Writer<'_> {
                 self.free_palette(old);
                 record
             }
-            // Two materials: stored inline in the brick (decision 0031).
-            PackedLeaf::Palette { mask, block } if leaf::is_pair(block.words()[0]) => {
-                self.free_palette(old);
-                Record::pair(mask, block.words()[0], block.pair_indices())
-            }
             PackedLeaf::Palette { mask, block } => {
                 let words = block.words();
                 let base = match old.palette_base() {
@@ -146,7 +130,10 @@ impl Writer<'_> {
                     }
                     None => self.store_mut().alloc_block(words),
                 };
-                Record::palette(mask, base)
+                Record {
+                    mask,
+                    payload: base,
+                }
             }
         };
         self.store_mut().count_leaf(old.is_leaf(), record.is_leaf());
@@ -185,15 +172,12 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
     let mut mask = 0u64;
     let mut full = 0u64;
     let mut singles = 0u64;
-    let mut pairs = 0u64;
     for (slot, r) in (0..).zip(records) {
         if r.mask == 0 {
             continue;
         }
         mask |= bit(slot);
-        if r.indices != 0 {
-            pairs |= bit(slot);
-        } else if r.payload & UNIFORM_BIT != 0 {
+        if r.payload & UNIFORM_BIT != 0 {
             if r.mask == u64::MAX {
                 full |= bit(slot);
             } else {
@@ -233,7 +217,6 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
         defaults: default_full | partial,
         default,
         full,
-        pairs,
     };
     let mut words = [0; MAX_BLOCK_LEN];
     let mut len = header.len();
@@ -248,9 +231,6 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
             words[len] = r.mask as u32;
             words[len + 1] = (r.mask >> 32) as u32;
             len += 2;
-        } else if pairs & b != 0 {
-            words[len..len + PAIR_WORDS].copy_from_slice(&r.pair_words());
-            len += PAIR_WORDS;
         } else {
             words[len..len + RECORD_WORDS].copy_from_slice(&r.words());
             len += RECORD_WORDS;
@@ -311,7 +291,10 @@ mod tests {
         let mut records = [Record::AIR; 64];
         records[3] = Record::single(0b1010, MaterialId(9));
         records[40] = Record::filled(MaterialId(5));
-        records[63] = Record::palette(1 << 40, 1234);
+        records[63] = Record {
+            mask: 1 << 40,
+            payload: 1234,
+        };
         let Packed::Node(p) = pack(&records) else {
             panic!("mixed leaves need a node");
         };
@@ -389,39 +372,6 @@ mod tests {
         }
         let h = header_of(&records);
         assert_eq!((h.len(), h.defaults, h.full), (3, bit(0), bit(0)));
-    }
-
-    #[test]
-    fn two_material_leaves_pack_inline_after_a_pair_mask() {
-        let mut records = [Record::AIR; 64];
-        records[0] = Record::filled(MaterialId(4));
-        records[3] = Record::pair(u64::MAX, 4 | 6 << 16, 0b110);
-        records[8] = Record::single(0b1, MaterialId(9));
-        let Packed::Node(p) = pack(&records) else {
-            panic!("mixed leaves need a node");
-        };
-        assert_eq!(p.info, (5 + 5 + 3) | crate::tree::node::BRICK_PAIR_MASK);
-        assert_eq!(
-            p.words(),
-            [
-                1,
-                0,
-                4,
-                bit(3) as u32,
-                0,
-                u32::MAX,
-                u32::MAX,
-                4 | 6 << 16,
-                0b110,
-                0,
-                1,
-                0,
-                UNIFORM_BIT | 9,
-            ]
-        );
-        let h = header_of(&records);
-        assert_eq!(h.leaf(p.words(), p.mask, 3), records[3]);
-        assert_eq!(h.leaf(p.words(), p.mask, 8), records[8]);
     }
 
     #[test]
