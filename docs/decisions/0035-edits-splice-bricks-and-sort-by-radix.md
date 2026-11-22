@@ -168,6 +168,21 @@ still has to be run (the lead offered a throwaway PR).
   first and reads the mixed mask only after the default test (so a default
   leaf costs what it did on main), and a record (now always one material)
   is read without a palette test. `TreeCursor` keeps `step`.
+- **Gate, second run**: `get_10k` unchanged (+8.6%). Callgrind's per-file
+  breakdown put the excess in the page reader on every probe, and counting
+  page-cache misses in the scene (a counter in copies of both builds) gave
+  27,816 over the 10,000 probes against main's 22,340. The scene is built
+  by box fills, so its blocks sit where the edits left them: the upper
+  chunk's level-2 block (41 child words, read by every probe that reaches
+  it) had drifted to page 2 or 4, away from its parents on page 0, because
+  bricks change length more often since 0031 and every growth moved blocks
+  to the arena's end. The word allocator now takes the lowest block of a
+  short free list (the last freed of a long one), cuts a request from the
+  shortest longer free block when no block of its length is free, and
+  grows or shrinks the arena's last block in place. The scene then has
+  21,886 misses (main 22,340), 18,937 free words instead of 37,862 (main
+  21,919) and 10 pages instead of 15 (main 11). Built chunks, which free
+  nothing, do not change.
 - Next: big craters are now about half sorting and half tree writes; a
   ball fill that replaces covered nodes without listing their voxels
   (like `fill_box`) would make a crater cost its surface instead of its

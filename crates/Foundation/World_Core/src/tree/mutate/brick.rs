@@ -282,8 +282,7 @@ impl Writer<'_> {
                             }
                             base
                         } else {
-                            self.store_mut().free_block(base, old_len);
-                            self.store_mut().alloc_block(words)
+                            self.store_mut().realloc_block(base, old_len, words)
                         }
                     }
                     None => self.store_mut().alloc_block(words),
