@@ -110,6 +110,16 @@ jobs:
         if: github.event_name != 'push'
         run: cargo xtask bench --instructions --check main --threshold 5
 
+      # TEMPORARY diagnostic on the perf/core-gate branch only: never merge.
+      - name: Annotate get_10k profiles (diagnostic)
+        if: always() && github.event_name != 'push'
+        run: |
+          find gungraun -path '*get_10k*' -type f | sort
+          for f in $(find gungraun -path '*get_10k*' -type f -name 'callgrind*.out*' | sort); do
+            echo "==================== $f"
+            callgrind_annotate --threshold=99.5 "$f" | head -60 || true
+          done
+
       - name: Save the main baseline
         if: github.event_name == 'push'
         uses: actions/cache/save@v4
