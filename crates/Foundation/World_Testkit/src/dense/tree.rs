@@ -190,8 +190,12 @@ impl Walk {
             let pairs = count(&|n| n.kind() == NodeKind::Leaf && n.palette().as_slice().len() == 2);
             let others = full - default_full;
             let header = 3 + if others + masks > 0 { 2 } else { 0 } + if pairs > 0 { 2 } else { 0 };
-            self.counts.words +=
-                header + others + 2 * masks + 5 * pairs + 3 * (listed.len() - full - masks - pairs);
+            // Other full leaves are 16-bit halves, two a word (decision 0033).
+            self.counts.words += header
+                + others.div_ceil(2)
+                + 2 * masks
+                + 5 * pairs
+                + 3 * (listed.len() - full - masks - pairs);
         } else {
             self.counts.words += listed.len();
         }
