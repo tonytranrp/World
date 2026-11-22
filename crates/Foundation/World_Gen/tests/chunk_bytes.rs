@@ -7,8 +7,11 @@
 //! Run with
 //! `cargo test --release -p world_gen --test chunk_bytes -- --ignored --nocapture`.
 
-use world_core::tree::{CHUNK_LEVEL, MemoryBreakdown};
-use world_core::{VoxelPos, VoxelTree};
+use std::collections::{BTreeMap, BTreeSet};
+
+use world_core::consts::TREE_DEPTH;
+use world_core::tree::{CHUNK_LEVEL, MemoryBreakdown, NodeRef};
+use world_core::{MaterialId, VoxelPos, VoxelTree};
 use world_gen::{CHUNK_SIZE, ChunkCoord, CoarseSource, Generator, GeneratorVersion, TerrainConfig};
 
 /// The chunks of every footprint whose centre lies within `(inner, outer]`
@@ -100,6 +103,98 @@ fn report<S: world_core::RegionSource>(
         pct(90)
     );
     println!("  {total:?}");
+}
+
+/// Leaf masks of every brick under `node` (a child at `level`): those of the
+/// partial leaves of the brick's default material (the most common full
+/// leaf material, ties to the lower id) into `defaults`, every partial
+/// leaf's into `all`.
+fn leaf_masks(node: NodeRef<'_>, level: u32, defaults: &mut Vec<u64>, all: &mut Vec<u64>) {
+    let NodeRef::Branch(b) = node else {
+        return;
+    };
+    if level > 1 {
+        for (_, child) in b.children() {
+            leaf_masks(child, level - 1, defaults, all);
+        }
+        return;
+    }
+    let mut counts = BTreeMap::<MaterialId, u32>::new();
+    for (_, leaf) in b.children() {
+        if let NodeRef::Uniform(m) = leaf {
+            *counts.entry(m).or_default() += 1;
+        }
+    }
+    let default = counts
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(m, _)| *m);
+    for (_, leaf) in b.children() {
+        if let NodeRef::Leaf(l) = leaf {
+            all.push(l.mask());
+            if let Some(d) = default
+                && l.palette().collect::<Vec<_>>() == [d]
+            {
+                defaults.push(l.mask());
+            }
+        }
+    }
+}
+
+/// Distinct values per chunk and over all chunks, and how many of the
+/// values the most common 256, 4,096 and 65,536 masks of all chunks cover.
+fn census(name: &str, per_chunk: &[Vec<u64>]) {
+    let mut distinct: Vec<usize> = per_chunk
+        .iter()
+        .map(|masks| masks.iter().collect::<BTreeSet<_>>().len())
+        .collect();
+    distinct.sort_unstable();
+    let total: usize = per_chunk.iter().map(Vec::len).sum();
+    let mut counts = BTreeMap::<u64, usize>::new();
+    for &m in per_chunk.iter().flatten() {
+        *counts.entry(m).or_default() += 1;
+    }
+    let mut by_count: Vec<usize> = counts.values().copied().collect();
+    by_count.sort_unstable_by(|a, b| b.cmp(a));
+    let cover = |n: usize| by_count.iter().take(n).sum::<usize>() as f64 / total as f64 * 100.0;
+    let pct = |p: usize| distinct[(distinct.len() - 1) * p / 100];
+    let sum_distinct: usize = distinct.iter().sum();
+    println!(
+        "{name}: {total} masks, {} distinct over all chunks; per chunk distinct median {} p90 {} max {} (sum {sum_distinct}); \
+         the most common 256 / 4,096 / 65,536 cover {:.1}% / {:.1}% / {:.1}%",
+        counts.len(),
+        pct(50),
+        pct(90),
+        distinct[distinct.len() - 1],
+        cover(256),
+        cover(4096),
+        cover(65536)
+    );
+}
+
+/// How repetitive leaf masks are, for a dictionary of masks (decision
+/// 0031's next step).
+#[test]
+#[ignore = "prints figures; run by hand"]
+fn leaf_mask_census() {
+    let generator = Generator::new(0x5EED, GeneratorVersion::CURRENT, TerrainConfig::default())
+        .expect("the default config is valid");
+    let (mut defaults, mut all) = (Vec::new(), Vec::new());
+    for coord in chunks(&generator, 0, 64) {
+        let mut tree = VoxelTree::new();
+        tree.build_region(
+            CHUNK_LEVEL,
+            coord.min_voxel(),
+            &generator.chunk_source(coord),
+        )
+        .expect("an aligned chunk");
+        let (mut d, mut a) = (Vec::new(), Vec::new());
+        leaf_masks(tree.root(), TREE_DEPTH - 1, &mut d, &mut a);
+        defaults.push(d);
+        all.push(a);
+    }
+    census("default partial leaves", &defaults);
+    census("all partial leaves", &all);
 }
 
 #[test]
