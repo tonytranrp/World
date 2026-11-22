@@ -15,7 +15,7 @@ use bevy::render::renderer::{FlushCommands, RenderContext, RenderDevice, RenderQ
 use bevy::render::view::ExtractedView;
 
 use crate::brick_cache::render::{BrickCacheState, ExtractedCacheConfig, VOXELS_PER_METER};
-use crate::gbuffer::HIT_WORDS;
+use crate::gbuffer::camera_buffer_bytes;
 use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::tier::RenderTier;
 use trace::{
@@ -85,7 +85,7 @@ pub fn trace_size(viewport: UVec2, internal: Option<UVec2>) -> UVec2 {
 /// One view's hit records, parameters and bind group.
 #[derive(Component)]
 pub struct VoxelViewTargets {
-    /// The G-buffer: [`HIT_WORDS`] words per traced pixel.
+    /// The G-buffer: [`HIT_WORDS`](crate::gbuffer::HIT_WORDS) words per traced\n    /// pixel, in two planes.
     pub hits: wgpu::Buffer,
     pub params: wgpu::Buffer,
     /// The traced size (see [`trace_size`]).
@@ -102,7 +102,7 @@ pub struct VoxelViewTargets {
 fn hits_buffer(device: &wgpu::Device, size: UVec2) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("primary.hits"),
-        size: u64::from(size.x.max(1)) * u64::from(size.y.max(1)) * u64::from(HIT_WORDS) * 4,
+        size: camera_buffer_bytes(u64::from(size.x.max(1)) * u64::from(size.y.max(1))),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })

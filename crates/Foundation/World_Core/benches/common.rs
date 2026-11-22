@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use world_core::{Edit, MaterialId, VoxelBox, VoxelPos, VoxelTree};
+use world_core::{Edit, MaterialId, RegionSource, VoxelBox, VoxelPos, VoxelTree};
 
 /// A tiny deterministic generator (Knuth's MMIX LCG, upper bits).
 pub struct Lcg(pub u64);
@@ -157,6 +157,31 @@ impl Terrain {
         tree
     }
 
+    /// Builds the same terrain bottom-up through a [`RegionSource`], as
+    /// World_Gen's chunks are built (decision 0006): same content, the
+    /// builder's storage layout and no free words.
+    pub fn build_bottom_up(&self) -> VoxelTree {
+        VoxelTree::from_source(&TerrainSource(self))
+    }
+
+    /// The material of voxel `(x, y, z)`: what [`build`](Self::build) writes.
+    pub fn material(&self, x: i32, y: i32, z: i32) -> MaterialId {
+        let w = self.width as i32;
+        if !(0..w).contains(&x) || !(0..w).contains(&z) || y < TERRAIN_FLOOR {
+            return MaterialId::AIR;
+        }
+        let h = self.height(x, z);
+        if y < h - 3 {
+            STONE
+        } else if y < h {
+            DIRT
+        } else if y == h {
+            GRASS
+        } else {
+            MaterialId::AIR
+        }
+    }
+
     /// Solid voxels with at least one air neighbour among the four sides and
     /// the top, ignoring the outer edge and the flat floor: what a player
     /// sees and digs into.
@@ -186,6 +211,44 @@ impl Terrain {
         let z = rng.below(self.width) as i32;
         let y = self.height(x, z) - rng.below(8) as i32;
         VoxelPos::new(x, y, z)
+    }
+}
+
+/// A [`Terrain`] as a region source.
+struct TerrainSource<'a>(&'a Terrain);
+
+impl RegionSource for TerrainSource<'_> {
+    fn uniform(&self, min: VoxelPos, size: u32) -> Option<MaterialId> {
+        let t = self.0;
+        let w = i64::from(t.width);
+        let (lo, hi) = (i64::from(min.y), i64::from(min.y) + i64::from(size));
+        let [x0, z0] = [min.x, min.z].map(i64::from);
+        let (x1, z1) = (x0 + i64::from(size), z0 + i64::from(size));
+        let (cx0, cx1, cz0, cz1) = (x0.max(0), x1.min(w), z0.max(0), z1.min(w));
+        if cx0 >= cx1 || cz0 >= cz1 || hi <= i64::from(TERRAIN_FLOOR) {
+            return Some(MaterialId::AIR);
+        }
+        let (mut low, mut high) = (i64::MAX, i64::MIN);
+        for z in cz0..cz1 {
+            for x in cx0..cx1 {
+                let h = i64::from(t.height(x as i32, z as i32));
+                low = low.min(h);
+                high = high.max(h);
+            }
+        }
+        if lo > high {
+            return Some(MaterialId::AIR);
+        }
+        let inside = cx0 == x0 && cx1 == x1 && cz0 == z0 && cz1 == z1;
+        (inside && lo >= i64::from(TERRAIN_FLOOR) && hi <= low - 3).then_some(STONE)
+    }
+
+    fn leaf(&self, min: VoxelPos, voxels: &mut [MaterialId; 64]) {
+        for (slot, voxel) in (0..).zip(voxels.iter_mut()) {
+            *voxel = self
+                .0
+                .material(min.x + slot % 4, min.y + slot / 4 % 4, min.z + slot / 16);
+        }
     }
 }
 

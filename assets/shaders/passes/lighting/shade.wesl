@@ -6,7 +6,7 @@
 // hit's depth (reverse Z, as Bevy's depth texture stores it) in alpha; a
 // miss is alpha -1. The voxel composite stretches it over the viewport.
 
-import package::shaders::common::constants::{HIT_WORDS, HIT_FLAG_HIT};
+import package::shaders::common::constants::{HIT_PLANE_WORDS, HIT_FLAG_HIT};
 
 struct ShadeParams {
     // Traced width, height, material count, unused.
@@ -37,8 +37,9 @@ fn shade(@builtin(global_invocation_id) id: vec3<u32>) {
     if pixel.x >= params.size.x || pixel.y >= params.size.y {
         return;
     }
-    let i = (pixel.y * params.size.x + pixel.x) * HIT_WORDS;
-    let packed = hits[i + 3u];
+    // The G-buffer's shading plane: packed word, depth.
+    let i = (pixel.y * params.size.x + pixel.x) * HIT_PLANE_WORDS;
+    let packed = hits[i];
     let flags = packed >> 24u;
     if (flags & HIT_FLAG_HIT) == 0u {
         textureStore(lit, pixel, vec4<f32>(0.0, 0.0, 0.0, -1.0));
@@ -47,6 +48,6 @@ fn shade(@builtin(global_invocation_id) id: vec3<u32>) {
     let material = min(packed & 0xFFFFu, max(params.size.z, 1u) - 1u);
     let face = (packed >> 20u) & 0xFu;
     let base = colors[material].rgb;
-    let depth = bitcast<f32>(hits[i + 5u]);
+    let depth = bitcast<f32>(hits[i + 1u]);
     textureStore(lit, pixel, vec4<f32>(base * face_light(face), depth));
 }

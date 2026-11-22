@@ -1,12 +1,15 @@
-// Primary rays: one per pixel, 8x8 workgroups, written as integer hit
-// records (layout in world_render's `gbuffer` module). Camera rays start at
+// Primary rays: one per pixel, 8x8 workgroups, written as the G-buffer's two
+// planes in camera mode and as full hit records otherwise (layouts in
+// world_render's `gbuffer` module). Camera rays start at
 // their tile's beam distance when the prepass ran (`beam.wesl`), and miss at
 // once where it found the whole tile leaves the tree without stopping (a
 // negative distance). In camera mode the bottom `head_rows()` tile rows are
 // traced from the camera by the prepass's own dispatch instead, while the
 // beam's latency-bound threads would leave the GPU idle (decision 0026).
 
-import package::shaders::common::constants::{HIT_WORDS, HIT_FLAG_HIT, BEAM_TILE};
+import package::shaders::common::constants::{
+    HIT_PLANE_WORDS, HIT_RECORD_WORDS, HIT_FLAG_HIT, BEAM_TILE,
+};
 import package::shaders::traversal::tree::{TraceSettings, Hit, cast_ray_from, trace_miss};
 import package::shaders::passes::primary::view::{
     params, beam_starts, camera_dir, beam_columns, beam_rows, beam_enabled, head_rows,
@@ -34,7 +37,8 @@ fn trace_pixel(pixel: vec2<u32>, lane: u32, use_beam: bool) {
     if pixel.x >= params.size.x || pixel.y >= params.size.y {
         return;
     }
-    let i = (pixel.y * params.size.x + pixel.x) * HIT_WORDS;
+    let p = pixel.y * params.size.x + pixel.x;
+    let i = p * HIT_RECORD_WORDS;
     var o: vec3<f32>;
     var d: vec3<f32>;
     var t_start = 0.0;
@@ -72,10 +76,21 @@ fn trace_pixel(pixel: vec2<u32>, lane: u32, use_beam: bool) {
         // A hit at the eye (a ray starting inside a voxel) is as near as it gets.
         depth = select(1.0, clamp(clip.z / clip.w, 0.0, 1.0), clip.w > 1e-6);
     }
+    let packed = (h.material & 0xFFFFu) | (h.level << 16u) | (h.face << 20u) | (h.flags << 24u);
+    if params.size.w == 0u {
+        // The G-buffer's two planes: what shading reads, then the rest.
+        let s = p * HIT_PLANE_WORDS;
+        let r = (params.size.x * params.size.y + p) * HIT_PLANE_WORDS;
+        hits[s] = packed;
+        hits[s + 1u] = bitcast<u32>(depth);
+        hits[r] = bitcast<u32>(h.t);
+        hits[r + 1u] = h.steps;
+        return;
+    }
     hits[i] = bitcast<u32>(h.voxel.x);
     hits[i + 1u] = bitcast<u32>(h.voxel.y);
     hits[i + 2u] = bitcast<u32>(h.voxel.z);
-    hits[i + 3u] = (h.material & 0xFFFFu) | (h.level << 16u) | (h.face << 20u) | (h.flags << 24u);
+    hits[i + 3u] = packed;
     hits[i + 4u] = bitcast<u32>(h.t);
     hits[i + 5u] = bitcast<u32>(depth);
     hits[i + 6u] = h.steps;

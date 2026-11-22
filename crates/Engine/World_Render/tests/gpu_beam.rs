@@ -38,11 +38,11 @@ use world_core::tree::VoxelSource;
 use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_render::internals::batch::UploadBatch;
 use world_render::internals::feedback::decode_requests;
-use world_render::internals::gbuffer::{HIT_FLAG_HIT, HIT_WORDS};
+use world_render::internals::gbuffer::{HIT_FLAG_HIT, HIT_RECORD_WORDS, camera_records};
 use world_render::internals::key::{NodeKey, Shape};
 use world_render::internals::layout::PoolLayout;
 use world_render::internals::residency::Residency;
-use world_render::internals::trace::BEAM_OFF;
+use world_render::internals::trace::{BEAM_OFF, MODE_CAMERA};
 
 /// Not a multiple of the 8-pixel tile on either axis.
 const SIZE: (u32, u32) = (316, 180);
@@ -311,7 +311,7 @@ fn compare_with_and_without_beam(
             let (a, b) = (without.record(i), with.record(i));
             steps_without += u64::from(a[STEPS_WORD]);
             steps_with += u64::from(b[STEPS_WORD]);
-            let same = (0..HIT_WORDS as usize).all(|k| k == STEPS_WORD || a[k] == b[k]);
+            let same = (0..HIT_RECORD_WORDS as usize).all(|k| k == STEPS_WORD || a[k] == b[k]);
             if !same {
                 let (x, y) = (i as u32 % w, i as u32 / w);
                 let tile = (y / 8 * w.div_ceil(8) + x / 8) as usize;
@@ -402,6 +402,60 @@ fn gpu_beam_changes_no_hit_or_request_with_evicted_bricks() {
 #[test]
 fn gpu_beam_changes_no_hit_with_the_coarsest_footprints() {
     compare_with_and_without_beam(16.0, None, 0, "footprint bias 16");
+}
+
+/// The game's G-buffer (two planes, `MODE_CAMERA`) holds exactly the packed
+/// word, depth, distance and steps of the full records the tests compare,
+/// with the prepass and its head rows as the game runs them.
+#[test]
+fn gpu_camera_planes_hold_the_full_records_fields() {
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let pipelines = Pipelines::new(&gpu.device);
+    let snap = beam_scene().snapshot();
+    let shape = Shape::of(&snap);
+    let (_res, cache) = resident_cache(&gpu, &pipelines, &snap);
+    let head = world_render::internals::trace::head_rows(SIZE.1, 0.125);
+    let (mut hits, mut pixels) = (0, 0);
+    for (v, view) in views().into_iter().enumerate() {
+        let setup = TraceSetup {
+            shape,
+            frame: 3,
+            pixel_angle: view.pixel_angle(SIZE.1),
+            footprint_bias: 1.0,
+        };
+        let full = camera_trace(
+            &gpu,
+            &pipelines,
+            &cache,
+            view,
+            SIZE,
+            setup,
+            BEAM_ITERATIONS,
+            head,
+        );
+        let planes = camera_trace_in(
+            &gpu,
+            &pipelines,
+            &cache,
+            view,
+            SIZE,
+            setup,
+            (BEAM_ITERATIONS, head),
+            MODE_CAMERA,
+        );
+        assert_eq!(full.beam, planes.beam, "view {v}: beam starts differ");
+        let records: Vec<[u32; 4]> = camera_records(&planes.records).collect();
+        assert_eq!(records.len(), (SIZE.0 * SIZE.1) as usize);
+        for (i, r) in records.iter().enumerate() {
+            let f = full.record(i);
+            assert_eq!(*r, [f[3], f[5], f[4], f[6]], "view {v} pixel {i}");
+            hits += usize::from(f[3] >> 24 & HIT_FLAG_HIT != 0);
+            pixels += 1;
+        }
+    }
+    assert!(hits > pixels / 4 && hits < pixels, "{hits} of {pixels}");
 }
 
 /// The game's split: the prepass's dispatch traces the bottom rows from the

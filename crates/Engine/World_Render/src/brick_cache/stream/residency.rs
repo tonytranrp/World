@@ -311,6 +311,12 @@ impl Residency {
         self.ids.in_use() as usize
     }
 
+    /// One more than the largest brick id ever handed out: the eviction
+    /// pass scans only the table below it.
+    pub fn brick_id_high_water(&self) -> u32 {
+        self.ids.high_water()
+    }
+
     pub fn brick_fill(&self) -> f32 {
         self.bricks.fill()
     }

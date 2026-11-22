@@ -3,8 +3,9 @@
 //! against the generated terrain, and a byte breakdown of the storage.
 //!
 //! Everything here builds through the bottom-up builder, so a copy, a
-//! compaction or a merge writes each node once into fresh arenas, depth
-//! first: children end up next to their parents and the result has no holes.
+//! compaction or a merge writes each node once into fresh arenas: bricks
+//! depth first with their palette blocks, the upper nodes together after
+//! them (decision 0027), and no holes.
 
 use std::collections::BTreeMap;
 
@@ -193,8 +194,8 @@ impl VoxelTree {
         }
     }
 
-    /// Rebuilds the chunk at `min` depth first into fresh arenas: same
-    /// content, no free words, children next to their parents. Returns
+    /// Rebuilds the chunk at `min` into fresh arenas in the builder's
+    /// layout: same content, no free words. Returns
     /// whether there was a chunk to compact.
     pub fn compact_chunk(&mut self, min: VoxelPos) -> Result<bool, EditError> {
         let local = node_origin(CHUNK_LEVEL, min)?;
