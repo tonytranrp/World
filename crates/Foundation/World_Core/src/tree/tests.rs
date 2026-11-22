@@ -115,7 +115,7 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                     assert_eq!(
                         len,
                         header_len
-                            + others
+                            + others.div_ceil(2)
                             + 2 * masks
                             + PAIR_WORDS * pair_count
                             + RECORD_WORDS * records

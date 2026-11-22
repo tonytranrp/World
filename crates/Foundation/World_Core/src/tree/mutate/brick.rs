@@ -28,14 +28,16 @@ impl Writer<'_> {
         let block = self.store().block(node.base, node.block_len(1));
         let header = BrickHeader::read(block, node.info);
         let mut records = [Record::AIR; TREE_FANOUT as usize];
-        let mut at = header.len();
+        let mut half = 2 * header.len();
+        let mut at = header.leaves_start();
         for slot in slots(node.mask) {
             let b = bit(slot);
             records[slot as usize] = if header.default_full() & b != 0 {
                 Record::filled(header.default)
             } else if header.full & b != 0 {
-                at += 1;
-                Record::filled(MaterialId(block[at - 1] as u16))
+                half += 1;
+                let word = block[(half - 1) / 2];
+                Record::filled(MaterialId((word >> (16 * ((half - 1) % 2))) as u16))
             } else if header.defaults & b != 0 {
                 at += 2;
                 let mask = u64::from(block[at - 2]) | u64::from(block[at - 1]) << 32;
@@ -236,15 +238,18 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
         pairs,
     };
     let mut words = [0; MAX_BLOCK_LEN];
-    let mut len = header.len();
-    words[..len].copy_from_slice(&header.words()[..len]);
-    for slot in slots(mask & !default_full) {
+    let head = header.len();
+    words[..head].copy_from_slice(&header.words()[..head]);
+    // Other full leaves: their materials as halves, two a word (decision
+    // 0033).
+    for (k, slot) in slots(header.other_full()).enumerate() {
+        words[head + k / 2] |= (records[slot as usize].payload & 0xFFFF) << (16 * (k % 2));
+    }
+    let mut len = header.leaves_start();
+    for slot in slots(mask & !full) {
         let r = records[slot as usize];
         let b = bit(slot);
-        if full & b != 0 {
-            words[len] = r.payload;
-            len += 1;
-        } else if partial & b != 0 {
+        if partial & b != 0 {
             words[len] = r.mask as u32;
             words[len + 1] = (r.mask >> 32) as u32;
             len += 2;
@@ -338,16 +343,25 @@ mod tests {
             p.words(),
             [u32::MAX, u32::MAX, 2, !(1 << 7), u32::MAX, !1, u32::MAX]
         );
-        // A second full material is stored as one word after a header with
-        // the full mask; the more common one is default.
+        // A second full material is stored as a half word after a header
+        // with the full mask; the more common one is default.
         records[7] = Record::filled(MaterialId(3));
         let Packed::Node(p) = pack(&records) else {
             panic!("two full materials need a node");
         };
         assert_eq!(p.info, 6 | BRICK_FULL_MASK);
+        assert_eq!(p.words(), [!(1 << 7), u32::MAX, 2, u32::MAX, u32::MAX, 3]);
+        // Three of them share two words, the last high half zero.
+        records[9] = Record::filled(MaterialId(5));
+        records[60] = Record::filled(MaterialId(4));
+        let Packed::Node(p) = pack(&records) else {
+            panic!("full materials need a node");
+        };
+        assert_eq!(p.words()[5..], [3 | 5 << 16, 4]);
+        let h = header_of(&records);
         assert_eq!(
-            p.words(),
-            [!(1 << 7), u32::MAX, 2, u32::MAX, u32::MAX, UNIFORM_BIT | 3]
+            [7, 9, 60].map(|s| h.leaf(p.words(), p.mask, s)),
+            [3, 5, 4].map(|m| Record::filled(MaterialId(m)))
         );
     }
 

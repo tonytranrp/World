@@ -47,6 +47,7 @@ fn add(total: &mut MemoryBreakdown, b: &MemoryBreakdown) {
     total.default_leaves += b.default_leaves;
     total.child_words += b.child_words;
     total.full_records += b.full_records;
+    total.full_words += b.full_words;
     total.default_partial_leaves += b.default_partial_leaves;
     total.single_records += b.single_records;
     total.palette_records += b.palette_records;
