@@ -19,7 +19,9 @@
 // - Whole-node skips: in an empty cell, if the box of cells between it and
 //   the node's exit holds no set bit, the ray jumps to the node's exit at
 //   once instead of crossing up to ten empty cells one by one (decision
-//   0015: steps per ray fell from about 55 to 21 on the floor walk).
+//   0015: steps per ray fell from about 55 to 21 on the floor walk). Where
+//   that box is not clear, the aligned 2x2x2 block of cells around the
+//   current one is tested the same way and jumped when clear (decision 0034).
 // - Ancestor stack: after a jump, descent restarts at the deepest node that
 //   still contains the new voxel instead of at the root.
 //
@@ -252,6 +254,22 @@ fn rest_of_node_empty(
     return ((mask_lo & box_xy & z_lo) | (mask_hi & box_xy & z_hi)) == 0u;
 }
 
+// Whether the 2x2x2 block of cells holding cell `ml >> 2 level` (mirrored
+// local voxel coordinates), aligned to two cells in the node, holds no set
+// bit of the node's mask. Aligned blocks stay aligned under mirroring (the
+// tree's size is a multiple of every block), so its exit is computed exactly
+// as an empty cell's, two cells wide; like the whole-node skip it has no side
+// effects (decision 0034).
+fn half_node_empty(mask_lo: u32, mask_hi: u32, ml: vec3<u32>, level: u32, m: vec3<bool>) -> bool {
+    // The block's lower cell, 0 or 2 on each axis, in the mask's own order.
+    let c = (ml >> vec3<u32>(2u * level)) & vec3<u32>(2u);
+    let lo = select(c, vec3<u32>(2u) - c, m);
+    let rx = (3u << lo.x) * 0x11111111u;
+    let ry = (0xFFu << (4u * lo.y)) * 0x00010001u;
+    let word = select(mask_lo, mask_hi, lo.z == 2u);
+    return (word & rx & ry) == 0u;
+}
+
 // Levels of the ancestor stack: enough for the world tree (TREE_DEPTH).
 const STACK_LEVELS: u32 = 10u;
 // Threads per tracing workgroup (8x8).
@@ -376,7 +394,8 @@ fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_star
         var level = top;
         var index = trace_stack[row + level];
         var node = load_node(index);
-        var cell_level = 0u;
+        // The empty region to jump: 2^jump voxels wide on each axis.
+        var jump = 0u;
         loop {
             let kind = node_kind(node);
             if kind == KIND_UNIFORM {
@@ -384,10 +403,12 @@ fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_star
             }
             let slot = child_slot(local, level);
             if !mask_bit(node.mask_lo, node.mask_hi, slot) {
-                cell_level = level;
+                jump = 2u * level;
                 if level < s.root_level
                     && rest_of_node_empty(node.mask_lo, node.mask_hi, ml, level, m, mo, od, dd) {
-                    cell_level = level + 1u;
+                    jump += 2u;
+                } else if half_node_empty(node.mask_lo, node.mask_hi, ml, level, m) {
+                    jump += 1u;
                 }
                 break;
             }
@@ -438,9 +459,11 @@ fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_star
                 let leaf_hi = brick_word(seg, at + 1u);
                 let vslot = child_slot(local, 0u);
                 if !mask_bit(leaf_lo, leaf_hi, vslot) {
-                    cell_level = 0u;
+                    jump = 0u;
                     if rest_of_node_empty(leaf_lo, leaf_hi, ml, 0u, m, mo, od, dd) {
-                        cell_level = 1u;
+                        jump = 2u;
+                    } else if half_node_empty(leaf_lo, leaf_hi, ml, 0u, m) {
+                        jump = 1u;
                     }
                     break;
                 }
@@ -470,8 +493,9 @@ fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_star
             trace_stack[row + level] = index;
         }
 
-        // Jump over the empty cell of 4^cell_level voxels containing v.
-        let span = 1u << (2u * cell_level);
+        // Jump over the empty region of 2^jump voxels containing v: a cell,
+        // a 2x2x2 block of cells or the rest of a node.
+        let span = 1u << jump;
         let cell_end = (ml | vec3<u32>(span - 1u)) + vec3<u32>(1u);
         let b = vec3<i32>(cell_end) + mo;
         let tn = select(vec3<f32>(T_FAR), (vec3<f32>(b) - od) / dd, dd > vec3<f32>(0.0));
@@ -493,7 +517,7 @@ fn cast_ray_from(o: vec3<f32>, d: vec3<f32>, s: TraceSettings, lane: u32, t_star
         }
         let diff = ml ^ vec3<u32>(nrel);
         let any_diff = diff.x | diff.y | diff.z;
-        var shared_level = max(cell_level, 1u);
+        var shared_level = max(jump / 2u, 1u);
         while shared_level < s.root_level && (any_diff >> (2u * (shared_level + 1u))) != 0u {
             shared_level += 1u;
         }
