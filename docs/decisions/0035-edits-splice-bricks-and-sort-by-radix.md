@@ -154,6 +154,20 @@ still has to be run (the lead offered a throwaway PR).
   do not change; `WORLD_TEST_REQUIRE_GPU=1 cargo xtask test gpu` passes
   (26 tests), with World_Render's `gpu_trace` world-tree test asserting
   `pair_leaves > 0` (the lead's fix on the integration branch).
+- **Gate, first run** (PR #11, 0031 + 0033 + this): 9 of 10 under the
+  limit (`apply_1k` -1.9%, `set_1k` +0.6% and +2.1%, `snapshot_then_edit`
+  +3.0%, `decode_tree terrain` -3.4%), but `get_10k/terrain` +8.65%. A
+  census of its 10,000 probes: 63% end above level 1 (identical code), the
+  rest all in bricks with a mixed mask and no full mask (1,847 default
+  leaves, 771 two-material, 375 three-material, 83 records, 658 air
+  slots); main read those bricks on its one-rank path. The generated code
+  of `TreeView::lookup` built a `Step` value for the brick and matched it
+  again (an unreachable arm's compare included) and computed the leaf slot
+  before knowing it was needed. Point lookups now end in `brick_voxel`,
+  which returns the material from every branch, tests the full-mask flag
+  first and reads the mixed mask only after the default test (so a default
+  leaf costs what it did on main), and a record (now always one material)
+  is read without a palette test. `TreeCursor` keeps `step`.
 - Next: big craters are now about half sorting and half tree writes; a
   ball fill that replaces covered nodes without listing their voxels
   (like `fill_box`) would make a crater cost its surface instead of its
