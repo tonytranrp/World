@@ -186,8 +186,12 @@ impl BrickRef {
     }
 }
 
-/// One node record exactly as the GPU reads it.
-#[repr(C, align(16))]
+/// One node record exactly as the GPU reads it. The pool's records are 16
+/// bytes apart and the buffer is aligned, so every record is 16-byte aligned
+/// on the GPU; the Rust type only needs word alignment, which keeps the CPU
+/// structures that hold a record (residency entries, upload batches) from
+/// padding to 16 (decision 0032).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
 pub struct GpuNode {
     pub mask_lo: u32,
@@ -345,8 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn nodes_are_sixteen_bytes_aligned_to_sixteen() {
-        assert_eq!(align_of::<GpuNode>(), 16);
+    fn nodes_are_sixteen_bytes_without_padding() {
+        assert_eq!(align_of::<GpuNode>(), 4);
         assert_eq!(size_of::<GpuNode>(), 16);
     }
 }
