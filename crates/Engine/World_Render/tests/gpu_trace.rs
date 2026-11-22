@@ -418,7 +418,7 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
     let shape = Shape::of(&snap);
     let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("timing hits"),
-        size: u64::from(256 * 144 * world_render::internals::gbuffer::HIT_WORDS) * 4,
+        size: world_render::internals::gbuffer::camera_buffer_bytes(256 * 144),
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });

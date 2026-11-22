@@ -11,7 +11,9 @@ struct TraceParams {
     eye: vec4<f32>,
     // Tree origin; w is the root level.
     origin: vec4<i32>,
-    // Width, height, frame, mode (0 camera rays, 1 rays read from `hits`).
+    // Width, height, frame, mode (0 camera rays written as the G-buffer's
+    // two planes, 1 rays read from `hits`, 2 camera rays written as full
+    // records).
     size: vec4<u32>,
     // Pixel angle, footprint bias, voxels per metre, unused.
     lod: vec4<f32>,
@@ -52,10 +54,15 @@ fn beam_rows() -> u32 {
 // Tile rows at the bottom traced from the camera by the prepass's dispatch:
 // camera mode only, and never every row.
 fn head_rows() -> u32 {
-    return select(0u, min(params.head.x, beam_rows() - 1u), params.size.w == 0u);
+    return select(0u, min(params.head.x, beam_rows() - 1u), camera_mode());
+}
+
+// Whether rays come from the camera (not from the hit buffer).
+fn camera_mode() -> bool {
+    return params.size.w != 1u;
 }
 
 // Whether camera rays start at their tile's beam distance.
 fn beam_enabled() -> bool {
-    return params.size.w == 0u && params.limits.w != 0u;
+    return camera_mode() && params.limits.w != 0u;
 }

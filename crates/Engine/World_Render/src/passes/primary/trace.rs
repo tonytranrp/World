@@ -26,10 +26,14 @@ pub const BEAM_OFF: u32 = 0;
 pub const SHADER_CONSTANTS: &[(&str, u32)] = &[("BEAM_TILE", BEAM_TILE)];
 /// Traversal iterations before a ray gives up (flagged exhausted).
 pub const DEFAULT_MAX_ITERATIONS: u32 = 4096;
-/// `mode`: rays from the camera matrices.
+/// `mode`: rays from the camera matrices, written as the G-buffer's two
+/// planes (`gbuffer`).
 pub const MODE_CAMERA: u32 = 0;
-/// `mode`: rays read from the hit buffer (tests).
+/// `mode`: rays read from the hit buffer, written as full records (tests).
 pub const MODE_RAYS: u32 = 1;
+/// `mode`: rays from the camera matrices, written as full records (tests:
+/// the same trace as [`MODE_CAMERA`], with the hit voxel kept).
+pub const MODE_CAMERA_FULL: u32 = 2;
 /// Whether the trace pipeline asks wgpu to zero its workgroup memory before
 /// each workgroup runs. It does not need to: every slot of the ancestor stack
 /// (`trace_stack` in `traversal/tree.wesl`) is written before it is read, from

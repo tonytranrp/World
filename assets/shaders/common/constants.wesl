@@ -54,7 +54,8 @@ const UPLOAD_SCATTER_WORDS: u32 = 4u;
 const UPLOAD_TABLE_WRITE_WORDS: u32 = 4u;
 
 // gbuffer
-const HIT_WORDS: u32 = 8u;
+const HIT_PLANE_WORDS: u32 = 2u;
+const HIT_RECORD_WORDS: u32 = 8u;
 const HIT_FLAG_HIT: u32 = 1u;
 const HIT_FLAG_RESIDENCY: u32 = 2u;
 const HIT_FLAG_FOOTPRINT: u32 = 4u;

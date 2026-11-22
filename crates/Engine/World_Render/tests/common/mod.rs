@@ -350,8 +350,10 @@ pub fn wait(gpu: &Gpu) {
 
 use world_render::internals::GpuNode;
 use world_render::internals::GpuPools;
-use world_render::internals::gbuffer::{GpuHit, HIT_WORDS, encode_rays};
-use world_render::internals::trace::{BEAM_OFF, MODE_CAMERA, MODE_RAYS, TraceParams};
+use world_render::internals::gbuffer::{GpuHit, HIT_RECORD_WORDS, HIT_WORDS, encode_rays};
+use world_render::internals::trace::{
+    BEAM_OFF, MODE_CAMERA, MODE_CAMERA_FULL, MODE_RAYS, TraceParams,
+};
 
 /// The pools on the GPU with an upload path, as the plugin drives them.
 pub struct GpuCache {
@@ -442,7 +444,7 @@ pub fn gpu_trace(
     use wgpu::util::DeviceExt;
     let height = (rays.len() as u32).div_ceil(width);
     let mut records = encode_rays(rays.iter().copied());
-    records.resize((width * height * HIT_WORDS) as usize, 0);
+    records.resize((width * height * HIT_RECORD_WORDS) as usize, 0);
     let hits = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -496,7 +498,7 @@ pub fn gpu_trace(
     gpu.queue.submit([encoder.finish()]);
     let words = read_words(gpu, &hits);
     words
-        .chunks_exact(HIT_WORDS as usize)
+        .chunks_exact(HIT_RECORD_WORDS as usize)
         .take(rays.len())
         .filter_map(GpuHit::decode)
         .collect()
@@ -534,28 +536,60 @@ pub struct CameraTrace {
 impl CameraTrace {
     /// Record `i`'s words.
     pub fn record(&self, i: usize) -> &[u32] {
-        &self.records[i * HIT_WORDS as usize..(i + 1) * HIT_WORDS as usize]
+        &self.records[i * HIT_RECORD_WORDS as usize..(i + 1) * HIT_RECORD_WORDS as usize]
     }
 }
 
 /// Traces a `width x height` image from `view` in camera mode, with the
-/// beam prepass when `beam_iterations` is not [`BEAM_OFF`]. The prepass's
-/// dispatch traces the bottom `head` tile rows from the camera.
+/// beam prepass when `beam_iterations` is not [`BEAM_OFF`], written as full
+/// records. The prepass's dispatch traces the bottom `head` tile rows from
+/// the camera.
 #[allow(clippy::too_many_arguments)]
 pub fn camera_trace(
     gpu: &Gpu,
     pipelines: &Pipelines,
     cache: &GpuCache,
     view: ViewSetup,
-    (width, height): (u32, u32),
+    size: (u32, u32),
     setup: TraceSetup,
     beam_iterations: u32,
     head: u32,
 ) -> CameraTrace {
+    camera_trace_in(
+        gpu,
+        pipelines,
+        cache,
+        view,
+        size,
+        setup,
+        (beam_iterations, head),
+        MODE_CAMERA_FULL,
+    )
+}
+
+/// [`camera_trace`] in trace mode `mode`: [`MODE_CAMERA_FULL`] (full
+/// records) or [`MODE_CAMERA`] (the game's two planes; `records` then holds
+/// both planes and [`CameraTrace::record`] does not apply).
+#[allow(clippy::too_many_arguments)]
+pub fn camera_trace_in(
+    gpu: &Gpu,
+    pipelines: &Pipelines,
+    cache: &GpuCache,
+    view: ViewSetup,
+    (width, height): (u32, u32),
+    setup: TraceSetup,
+    (beam_iterations, head): (u32, u32),
+    mode: u32,
+) -> CameraTrace {
     use wgpu::util::DeviceExt;
+    let words = if mode == MODE_CAMERA {
+        HIT_WORDS
+    } else {
+        HIT_RECORD_WORDS
+    };
     let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test camera hits"),
-        size: u64::from(width * height * HIT_WORDS) * 4,
+        size: u64::from(width * height * words) * 4,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -568,7 +602,7 @@ pub fn camera_trace(
         world_from_clip: clip_from_world.inverse().to_cols_array_2d(),
         eye: [eye.x, eye.y, eye.z, 0.0],
         origin: [o.x, o.y, o.z, setup.shape.root_level() as i32],
-        size: [width, height, setup.frame, MODE_CAMERA],
+        size: [width, height, setup.frame, mode],
         lod: [setup.pixel_angle, setup.footprint_bias, 64.0, 0.0],
         limits: [
             layout.request_capacity,

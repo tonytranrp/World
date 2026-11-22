@@ -23,7 +23,6 @@ use wgpu::util::DeviceExt;
 use world_core::consts::{WORLD_END_VOXEL, WORLD_MIN_VOXEL};
 use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_render::internals::batch::UploadBatch;
-use world_render::internals::gbuffer::HIT_WORDS;
 use world_render::internals::key::Shape;
 use world_render::internals::layout::PoolLayout;
 use world_render::internals::residency::Residency;
@@ -314,7 +313,7 @@ impl Bench<'_> {
         let (gpu, pipelines) = (self.gpu, self.pipelines);
         let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench hits"),
-            size: u64::from(WIDTH * HEIGHT * HIT_WORDS) * 4,
+            size: world_render::internals::gbuffer::camera_buffer_bytes(u64::from(WIDTH * HEIGHT)),
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });

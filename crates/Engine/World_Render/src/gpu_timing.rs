@@ -476,14 +476,14 @@ pub struct RayStats {
 }
 
 impl RayStats {
-    /// Adds the hit records of one traced view (`HIT_WORDS` words a pixel).
+    /// Adds the G-buffer of one traced view (both planes, `gbuffer`).
     pub fn add_records(&mut self, words: &[u32]) {
         use crate::gbuffer::{
-            HIT_FLAG_EXHAUSTED, HIT_FLAG_FOOTPRINT, HIT_FLAG_HIT, HIT_FLAG_RESIDENCY, HIT_WORDS,
+            HIT_FLAG_EXHAUSTED, HIT_FLAG_FOOTPRINT, HIT_FLAG_HIT, HIT_FLAG_RESIDENCY,
+            camera_records,
         };
-        for record in words.chunks_exact(HIT_WORDS as usize) {
-            let flags = record[3] >> 24;
-            let steps = record[6];
+        for [packed, _, _, steps] in camera_records(words) {
+            let flags = packed >> 24;
             self.rays += 1;
             self.steps += u64::from(steps);
             self.max_steps = self.max_steps.max(steps);
