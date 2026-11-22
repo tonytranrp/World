@@ -228,7 +228,7 @@ fn gpu_trace_matches_the_brute_force_dda_on_a_world_tree() {
     // palette blocks of two materials (one bit) and of three (two bits).
     let b = tree.memory_breakdown();
     assert!(b.long_headers > 0 && b.full_records > 0 && b.default_partial_leaves > 0);
-    assert!(b.palette_words[0] > 0 && b.palette_words[1] > 0, "{b:?}");
+    assert!(b.pair_leaves > 0 && b.palette_words[1] > 0, "{b:?}");
     compare_scene(&tree.snapshot(), bounds, "world tree");
 }
 

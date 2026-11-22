@@ -32,9 +32,11 @@ fn breakdown_words(b: &MemoryBreakdown) -> usize {
     b.child_words
         + 3 * b.bricks
         + 2 * b.long_headers
-        + b.full_records
+        + b.full_words
         + 2 * b.default_partial_leaves
-        + 3 * (b.single_records + b.palette_records)
+        + 3 * b.single_records
+        + 5 * (b.pair_leaves + b.palette_records)
+        + 2 * b.pair_headers
         + b.palette_words.iter().sum::<usize>()
 }
 
@@ -129,7 +131,7 @@ proptest! {
         prop_assert_eq!(b.upper_nodes + b.bricks, s.branches);
         prop_assert_eq!(breakdown_words(&b), s.words);
         prop_assert_eq!(
-            b.default_partial_leaves + b.single_records + b.palette_records,
+            b.default_partial_leaves + b.single_records + b.palette_records + b.pair_leaves,
             s.leaves
         );
         prop_assert_eq!(b.live_bytes(), 16 * s.branches + 4 * s.words);

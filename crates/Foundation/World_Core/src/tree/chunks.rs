@@ -118,7 +118,8 @@ impl std::fmt::Debug for ChunkData {
 pub struct MemoryBreakdown {
     /// Nodes of level 2 and up, 16 bytes each.
     pub upper_nodes: usize,
-    /// Level-1 nodes (bricks), 16 bytes each plus a 12-byte header.
+    /// Level-1 nodes (bricks), 16 bytes each plus a 12-byte header and 8
+    /// more for each extra mask.
     pub bricks: usize,
     /// Bricks whose header also holds the full mask: 8 more bytes.
     pub long_headers: usize,
@@ -127,15 +128,23 @@ pub struct MemoryBreakdown {
     /// Child words of level-2-and-up nodes, 4 bytes each.
     pub child_words: usize,
     /// Leaves that are full and one material but not their brick's default
-    /// (one 4-byte word each, decision 0021).
+    /// (a 16-bit half each, decision 0033).
     pub full_records: usize,
+    /// Words holding those halves, two a word in each brick.
+    pub full_words: usize,
     /// Partial leaves of their brick's default material stored as a leaf
     /// mask alone (8 bytes each, decision 0025).
     pub default_partial_leaves: usize,
     /// Leaf records of one material with some air (12 bytes each).
     pub single_records: usize,
-    /// Leaf records with a palette (12 bytes each, plus their block).
+    /// Leaves with a palette of three or more materials (20 bytes each in
+    /// their brick's mixed mask, decision 0035, plus their block).
     pub palette_records: usize,
+    /// Leaves of two materials stored inline in their brick (20 bytes each,
+    /// decision 0031).
+    pub pair_leaves: usize,
+    /// Bricks whose header also holds the mixed mask: 8 more bytes.
+    pub pair_headers: usize,
     /// Words of palette blocks, by index width 1, 2, 4 and 8 bits.
     pub palette_words: [usize; 4],
     /// Words on free lists and page tails.
@@ -151,9 +160,11 @@ impl MemoryBreakdown {
             + 12 * self.bricks
             + 8 * self.long_headers
             + 4 * self.child_words
-            + 4 * self.full_records
+            + 4 * self.full_words
             + 8 * self.default_partial_leaves
-            + 12 * (self.single_records + self.palette_records)
+            + 12 * self.single_records
+            + 20 * (self.pair_leaves + self.palette_records)
+            + 8 * self.pair_headers
             + 4 * self.palette_words.iter().sum::<usize>()
     }
 }
@@ -662,6 +673,8 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
     if let Some((header, _)) = b.brick_layout() {
         out.bricks += 1;
         out.long_headers += usize::from(header.has_full_mask());
+        out.pair_headers += usize::from(header.pairs != 0);
+        out.full_words += header.half_words();
         out.default_leaves += header.default_full().count_ones() as usize;
         for (slot, leaf) in b.children() {
             match leaf {
@@ -670,6 +683,7 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
                 NodeRef::Leaf(_) if header.defaults & (1 << slot) != 0 => {
                     out.default_partial_leaves += 1;
                 }
+                NodeRef::Leaf(l) if l.index_bits() == 1 => out.pair_leaves += 1,
                 NodeRef::Leaf(l) => match l.index_bits() {
                     0 => out.single_records += 1,
                     bits => {

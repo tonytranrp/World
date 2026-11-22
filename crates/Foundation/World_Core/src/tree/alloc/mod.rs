@@ -183,6 +183,24 @@ impl Store {
             .copy_from_slice(words);
     }
 
+    /// Replaces the block of `old_len` words at `base` with `words` and
+    /// returns the new block's base: in place when the block is the arena's
+    /// last and the new length fits its page, otherwise a new block, the old
+    /// one freed.
+    pub fn realloc_block(&mut self, base: u32, old_len: usize, words: &[u32]) -> u32 {
+        // One copy-on-write check of the allocator for the three steps.
+        let blocks = Arc::make_mut(&mut self.blocks);
+        let new = if blocks.resize_last::<WORD_PAGE_LEN>(base, old_len, words.len()) {
+            base
+        } else {
+            let new = blocks.alloc(words.len(), &mut self.storage.words);
+            blocks.free(base, old_len);
+            new
+        };
+        self.write_block(new, words);
+        new
+    }
+
     pub fn free_block(&mut self, base: u32, len: usize) {
         Arc::make_mut(&mut self.blocks).free(base, len);
     }

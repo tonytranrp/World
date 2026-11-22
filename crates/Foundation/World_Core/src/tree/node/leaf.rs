@@ -1,7 +1,7 @@
 //! Leaves: the 4x4x4-voxel children of a level-1 node, stored as inline
 //! records with an optional palette block (layout in the module above).
 
-use super::{RECORD_WORDS, UNIFORM_BIT, slots};
+use super::{PAIR_WORDS, RECORD_WORDS, UNIFORM_BIT, slots};
 use crate::consts::TREE_FANOUT;
 use crate::material::MaterialId;
 
@@ -17,21 +17,84 @@ pub(crate) const MAX_PALETTE_BLOCK: usize = 1 + palette_words(MAX_PALETTE) + ind
 const _: () = assert!(MAX_PALETTE_BLOCK == 49);
 const _: () = assert!(MAX_PALETTE_BLOCK <= super::MAX_BLOCK_LEN);
 
-/// One leaf as its level-1 parent stores it: the record's mask and payload.
-/// A zero mask is an air leaf, which has no record.
+/// One leaf as its level-1 parent stores it: the record's mask and payload,
+/// and for a two-material leaf its indices. A zero mask is an air leaf,
+/// which has no record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Record {
     /// Bit `j` is set when voxel `j` is solid.
     pub mask: u64,
-    /// [`UNIFORM_BIT`] and a material, or the offset of a palette block.
+    /// [`UNIFORM_BIT`] and a material, or the offset of a palette block; for
+    /// a two-material leaf, its palette word (decision 0031).
     pub payload: u32,
+    /// For a two-material leaf, stored inline (decision 0031): its one-bit
+    /// indices, one per solid voxel, never zero since both materials are
+    /// present. Zero for every other leaf.
+    pub indices: u64,
 }
 
 impl Record {
     pub const AIR: Self = Self {
         mask: 0,
         payload: 0,
+        indices: 0,
     };
+
+    /// The two-material leaf of solid voxels `mask`, palette word `palette`
+    /// (the lower id in the low half) and one-bit `indices`.
+    pub const fn pair(mask: u64, palette: u32, indices: u64) -> Self {
+        Self {
+            mask,
+            payload: palette,
+            indices,
+        }
+    }
+
+    /// Whether this is a two-material leaf stored inline.
+    pub const fn is_pair(self) -> bool {
+        self.indices != 0
+    }
+
+    /// Whether this is a leaf of two or more materials, which a brick
+    /// stores in [`PAIR_WORDS`] words, in its mixed mask (decision 0035).
+    pub const fn is_mixed(self) -> bool {
+        self.mask != 0 && (self.indices != 0 || self.payload & UNIFORM_BIT == 0)
+    }
+
+    /// Reads a stored leaf of the mixed mask from its [`PAIR_WORDS`] words:
+    /// a two-material leaf, or (zero indices) the record of a wider palette.
+    pub fn read_pair(words: &[u32]) -> Self {
+        Self::pair(
+            u64::from(words[0]) | u64::from(words[1]) << 32,
+            words[2],
+            u64::from(words[3]) | u64::from(words[4]) << 32,
+        )
+    }
+
+    /// The [`PAIR_WORDS`] stored words of a mixed leaf: its mask, then a
+    /// two-material leaf's palette block as the GPU lays it out (the palette
+    /// word, then the indices), or a wider palette's block offset and two
+    /// zero words.
+    pub const fn pair_words(self) -> [u32; PAIR_WORDS] {
+        [
+            self.mask as u32,
+            (self.mask >> 32) as u32,
+            self.payload,
+            self.indices as u32,
+            (self.indices >> 32) as u32,
+        ]
+    }
+
+    /// A two-material leaf's palette block, as a block stored apart would
+    /// hold it: the palette word and the index words its voxels use.
+    pub fn pair_block(self) -> ([u32; 3], usize) {
+        let words = [
+            self.payload,
+            self.indices as u32,
+            (self.indices >> 32) as u32,
+        ];
+        (words, 1 + index_words(self.mask.count_ones() as usize, 1))
+    }
 
     /// The leaf whose every voxel is `material`.
     pub const fn filled(material: MaterialId) -> Self {
@@ -47,34 +110,41 @@ impl Record {
         Self {
             mask,
             payload: UNIFORM_BIT | material.0 as u32,
+            indices: 0,
         }
     }
 
-    /// Reads a stored record from its three words.
-    pub fn read(words: &[u32]) -> Self {
+    /// The record of solid voxels `mask` whose palette block is at `base`.
+    pub const fn palette(mask: u64, base: u32) -> Self {
         Self {
-            mask: u64::from(words[0]) | u64::from(words[1]) << 32,
-            payload: words[2],
+            mask,
+            payload: base,
+            indices: 0,
         }
     }
 
-    /// The three stored words.
+    /// Reads a stored record (not a two-material leaf) from its three words.
+    pub fn read(words: &[u32]) -> Self {
+        Self::palette(u64::from(words[0]) | u64::from(words[1]) << 32, words[2])
+    }
+
+    /// The three stored words of a record that is not a two-material leaf.
     pub const fn words(self) -> [u32; RECORD_WORDS] {
         [self.mask as u32, (self.mask >> 32) as u32, self.payload]
     }
 
     /// The one material of every solid voxel, when there is no palette.
     pub const fn material(self) -> Option<MaterialId> {
-        if self.payload & UNIFORM_BIT != 0 {
+        if self.indices == 0 && self.payload & UNIFORM_BIT != 0 {
             Some(MaterialId(self.payload as u16))
         } else {
             None
         }
     }
 
-    /// The offset of the palette block, when the leaf has one.
+    /// The offset of the palette block, when the leaf has one stored apart.
     pub const fn palette_base(self) -> Option<u32> {
-        if self.mask != 0 && self.payload & UNIFORM_BIT == 0 {
+        if self.mask != 0 && self.indices == 0 && self.payload & UNIFORM_BIT == 0 {
             Some(self.payload)
         } else {
             None
@@ -256,6 +326,10 @@ pub(crate) fn count_solid(block: &[u32], solid: u32, each: &mut impl FnMut(Mater
 /// Every voxel of a leaf. `block` is its palette block, empty when the
 /// record has none.
 pub(crate) fn decode(record: Record, block: &[u32]) -> Voxels {
+    if record.is_pair() {
+        let (words, _) = record.pair_block();
+        return decode(Record::palette(record.mask, 0), &words);
+    }
     let mut voxels: Voxels = [MaterialId::AIR; TREE_FANOUT as usize];
     match record.material() {
         Some(m) => slots(record.mask).for_each(|slot| voxels[slot as usize] = m),
@@ -287,6 +361,12 @@ pub(crate) struct PaletteBlock {
 impl PaletteBlock {
     pub fn words(&self) -> &[u32] {
         &self.words[..self.len]
+    }
+
+    /// The one-bit indices of a two-material block (words past its length
+    /// are zero).
+    pub fn pair_indices(&self) -> u64 {
+        u64::from(self.words[1]) | u64::from(self.words[2]) << 32
     }
 }
 
@@ -462,9 +542,7 @@ mod tests {
     fn round_trip(voxels: &Voxels) -> Voxels {
         match encode(voxels) {
             PackedLeaf::Inline(r) => decode(r, &[]),
-            PackedLeaf::Palette { mask, block } => {
-                decode(Record { mask, payload: 0 }, block.words())
-            }
+            PackedLeaf::Palette { mask, block } => decode(Record::palette(mask, 0), block.words()),
         }
     }
 
@@ -580,7 +658,7 @@ mod tests {
             [3 | (2 << 8), 3 | (7 << 16), 9, 2 | 1 << 4 | 2 << 6]
         );
         assert_eq!(index_start(block.words()[0]), 3);
-        let r = Record { mask, payload: 40 };
+        let r = Record::palette(mask, 40);
         assert_eq!(r.palette_base(), Some(40));
         assert_eq!(r.material(), None);
     }
