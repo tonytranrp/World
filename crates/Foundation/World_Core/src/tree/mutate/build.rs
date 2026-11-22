@@ -1,8 +1,10 @@
 //! Bottom-up construction and grafting (decision 0006).
 //!
 //! The builder writes canonical content straight into a store, children
-//! before parents, and never reads back what it wrote: every leaf is packed
-//! once, every node block is allocated once at its final size. It is how
+//! before parents (in a chunk it opened, bricks as they come and the upper
+//! nodes breadth first when the chunk closes), and never reads back what it
+//! wrote: every leaf is packed once, every node block is allocated once at
+//! its final size. It is how
 //! decoding, terrain generation and compaction make subtrees without paying
 //! for one write per voxel. A graft then swaps a finished subtree into place
 //! along one path, freeing the subtree it replaces.
@@ -10,10 +12,11 @@
 use super::Writer;
 use super::branch::{self, Children};
 use super::brick::{self, Records};
+use crate::consts::TREE_FANOUT;
 use crate::tree::forest::{Forest, chunk_key};
 use crate::tree::node::CHUNK_LEVEL;
 use crate::tree::node::leaf::{self, Record, Voxels};
-use crate::tree::node::{Child, slot_at};
+use crate::tree::node::{Child, Node, Packed, UNIFORM_BIT, slot_at};
 
 /// Writes canonical subtrees into the forest, bottom-up.
 ///
@@ -21,14 +24,39 @@ use crate::tree::node::{Child, slot_at};
 /// chunk-level node from the top opens it with
 /// [`begin_chunk`](Self::begin_chunk) before building its children and
 /// closes it with [`end_chunk`](Self::end_chunk).
+///
+/// In a chunk it opened, the builder stores bricks (and their palette
+/// blocks, just before each brick's block) as they come, but holds the
+/// nodes of level 2 and up until the chunk closes and then stores them
+/// breadth first from the chunk root, nodes and blocks each in one run
+/// (decision 0027). A lookup's upper levels then share a node page and a
+/// few word pages, instead of each level-2 node sitting after its bricks.
 pub(crate) struct Builder<'a> {
     writer: Writer<'a>,
+    upper: Upper,
 }
+
+/// The nodes of level 2 and up of the chunk being built, held until it
+/// closes. A held node is named in its parent's words by [`HELD`] and its
+/// position here.
+#[derive(Default)]
+struct Upper {
+    /// Whether nodes are being held: only in a chunk the builder opened.
+    active: bool,
+    /// Mask, first word in `words` and word count of each held node.
+    nodes: Vec<(u64, u32, u32)>,
+    words: Vec<u32>,
+}
+
+/// Marks a child word that names a held node. Real node indices of a chunk
+/// stay far below it (2^30 nodes would be 16 GiB of nodes).
+const HELD: u32 = 1 << 30;
 
 impl<'a> Builder<'a> {
     pub fn new(forest: &'a mut Forest) -> Self {
         Self {
             writer: Writer::new(forest),
+            upper: Upper::default(),
         }
     }
 
@@ -49,7 +77,86 @@ impl<'a> Builder<'a> {
     /// Air, one uniform material or all not resident collapses.
     pub fn branch(&mut self, level: u32, children: &Children) -> Child {
         debug_assert!(level >= 2, "level-1 nodes are built from leaf records");
-        self.writer.write(None, level, &branch::pack(children))
+        let packed = branch::pack(children);
+        if self.upper.active
+            && level < CHUNK_LEVEL + 1
+            && let Packed::Node(node) = &packed
+        {
+            let held = self.upper.nodes.len() as u32;
+            let words = node.words();
+            self.upper
+                .nodes
+                .push((node.mask, self.upper.words.len() as u32, words.len() as u32));
+            self.upper.words.extend_from_slice(words);
+            return Child::Node(HELD | held);
+        }
+        self.writer.write(None, level, &packed)
+    }
+
+    /// Stores the held nodes under `root`, breadth first from it, and
+    /// returns the root as stored. Any other child is returned as it is.
+    fn place_upper(&mut self, root: Child) -> Child {
+        let upper = std::mem::take(&mut self.upper);
+        let child = match root {
+            Child::Node(index) if index & HELD != 0 => {
+                // Breadth first: the root, its children, their children.
+                let mut order = vec![index & !HELD];
+                let mut next = 0;
+                while let Some(&held) = order.get(next) {
+                    let (_, start, len) = upper.nodes[held as usize];
+                    let words = &upper.words[start as usize..(start + len) as usize];
+                    order.extend(
+                        words
+                            .iter()
+                            .filter(|&&w| w & UNIFORM_BIT == 0 && w & HELD != 0)
+                            .map(|&w| w & !HELD),
+                    );
+                    next += 1;
+                }
+                debug_assert_eq!(order.len(), upper.nodes.len(), "every held node is used");
+                // Nodes first, in one run, so their indices are known...
+                let store = self.writer.store_mut();
+                let mut placed = vec![0u32; upper.nodes.len()];
+                for &held in &order {
+                    placed[held as usize] = store.alloc_node(Node::default());
+                }
+                debug_assert!(placed.iter().all(|&i| i < HELD), "node indices reach HELD");
+                // ...then the blocks, in the same order, with held names
+                // replaced by those indices.
+                let mut block = [0u32; TREE_FANOUT as usize];
+                for &held in &order {
+                    let (mask, start, len) = upper.nodes[held as usize];
+                    let words = &upper.words[start as usize..(start + len) as usize];
+                    for (out, &w) in block.iter_mut().zip(words) {
+                        *out = if w & UNIFORM_BIT == 0 && w & HELD != 0 {
+                            placed[(w & !HELD) as usize]
+                        } else {
+                            w
+                        };
+                    }
+                    let base = store.alloc_block(&block[..len as usize]);
+                    store.set_node(
+                        placed[held as usize],
+                        Node {
+                            mask,
+                            base,
+                            info: 0,
+                        },
+                    );
+                }
+                Child::Node(placed[(index & !HELD) as usize])
+            }
+            other => other,
+        };
+        // Keep the buffers for the next chunk.
+        self.upper = Upper {
+            active: false,
+            nodes: upper.nodes,
+            words: upper.words,
+        };
+        self.upper.nodes.clear();
+        self.upper.words.clear();
+        child
     }
 
     /// Whether a chunk is open.
@@ -67,6 +174,8 @@ impl<'a> Builder<'a> {
     pub fn begin_chunk(&mut self) {
         debug_assert!(self.writer.chunk.is_none(), "chunks do not nest");
         self.writer.chunk = Some(self.writer.forest.alloc_chunk());
+        debug_assert!(self.upper.nodes.is_empty());
+        self.upper.active = true;
     }
 
     /// Closes the open chunk, whose content is `root`, and returns the child
@@ -84,6 +193,7 @@ impl<'a> Builder<'a> {
 
     pub fn end_chunk(&mut self, root: Child) -> Child {
         debug_assert!(self.writer.chunk.is_some(), "end_chunk without begin_chunk");
+        let root = self.place_upper(root);
         let Some(id) = self.writer.chunk.take() else {
             return root;
         };
@@ -157,6 +267,7 @@ impl Writer<'_> {
                     held: self.held.take(),
                     refused: false,
                 },
+                upper: Upper::default(),
             };
             let new = make(&mut builder);
             self.held = builder.writer.held.take();
