@@ -1,6 +1,8 @@
 //! The primary-ray pass: one compute ray per pixel through the GPU pools,
-//! written as integer hit records (`gbuffer`). `trace` records it on bare
-//! wgpu; this module runs it for every 3D camera in Bevy's render world.
+//! written as integer hit records (`gbuffer`), after a beam prepass that
+//! finds where each 8x8 tile's rays may start (decision 0023). `trace`
+//! records both on bare wgpu; this module runs them for every 3D camera in
+//! Bevy's render world.
 
 pub mod trace;
 
@@ -17,17 +19,21 @@ use crate::gbuffer::HIT_WORDS;
 use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::tier::RenderTier;
 use trace::{
-    DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, record_trace, trace_bind_group,
-    trace_layout_entries,
+    DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, beam_buffer, head_rows, record_beam,
+    record_trace, trace_bind_group, trace_layout_entries,
 };
 
 /// Asset path of the trace shader.
 pub const TRACE_SHADER_PATH: &str = "shaders/passes/primary/trace.wesl";
+/// Asset path of the beam prepass shader.
+pub const BEAM_SHADER_PATH: &str = "shaders/passes/primary/beam.wesl";
 
 #[derive(Resource)]
 pub struct TracePipeline {
     pub layout: BindGroupLayoutDescriptor,
     pub id: CachedComputePipelineId,
+    /// The beam prepass, on the same layout.
+    pub beam: CachedComputePipelineId,
 }
 
 pub fn init_trace_pipeline(
@@ -46,7 +52,17 @@ pub fn init_trace_pipeline(
         zero_initialize_workgroup_memory: trace::ZERO_INIT_WORKGROUP_MEMORY,
         constants: Vec::new(),
     });
-    commands.insert_resource(TracePipeline { layout, id });
+    let beam = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("primary.beam".into()),
+        layout: vec![layout.clone()],
+        immediate_size: 0,
+        shader: assets.load(BEAM_SHADER_PATH),
+        shader_defs: Vec::new(),
+        entry_point: Some("beam".into()),
+        zero_initialize_workgroup_memory: false,
+        constants: Vec::new(),
+    });
+    commands.insert_resource(TracePipeline { layout, id, beam });
 }
 
 /// The size a view is traced at: the viewport, scaled down (keeping its
@@ -76,6 +92,8 @@ pub struct VoxelViewTargets {
     pub size: UVec2,
     /// The viewport the trace is stretched over.
     pub viewport: UVec2,
+    /// Tile rows at the bottom the prepass's dispatch traces (`params.head`).
+    pub head: u32,
     pub bind_group: wgpu::BindGroup,
     /// Changes whenever `hits` is replaced, so dependents rebuild.
     pub generation: u64,
@@ -118,6 +136,7 @@ pub fn prepare_view_targets(
         let eye = view.world_from_view.translation() * VOXELS_PER_METER;
         let o = world_core::consts::WORLD_MIN_VOXEL;
         let layout = &state.pools.layout;
+        let head = head_rows(size.y, config.0.lod.beam_head_share);
         let params = TraceParams {
             clip_from_world: clip_from_world.to_cols_array_2d(),
             world_from_clip: Mat4::inverse(&clip_from_world).to_cols_array_2d(),
@@ -134,18 +153,24 @@ pub fn prepare_view_targets(
                 layout.request_capacity,
                 layout.stamps_offset(),
                 DEFAULT_MAX_ITERATIONS,
-                0,
+                config.0.lod.beam_iterations,
             ],
+            head: [head, 0, 0, 0],
         };
         match targets {
             Some(mut t) if t.size == size => {
                 queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&params));
+                if t.head != head {
+                    t.head = head;
+                }
                 if t.viewport != viewport {
                     t.viewport = viewport;
                 }
             }
             _ => {
                 let hits = hits_buffer(wgpu_device, size);
+                // The prepass's start distances; the bind group keeps it.
+                let beam = beam_buffer(wgpu_device, size.x, size.y);
                 let params_buf = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("primary.params"),
                     size: size_of::<TraceParams>() as u64,
@@ -154,14 +179,21 @@ pub fn prepare_view_targets(
                 });
                 queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
                 let bind_layout = cache.get_bind_group_layout(&pipeline.layout);
-                let bind_group =
-                    trace_bind_group(wgpu_device, &bind_layout, &state.pools, &hits, &params_buf);
+                let bind_group = trace_bind_group(
+                    wgpu_device,
+                    &bind_layout,
+                    &state.pools,
+                    &hits,
+                    &params_buf,
+                    &beam,
+                );
                 *generation += 1;
                 commands.entity(entity).insert(VoxelViewTargets {
                     hits,
                     params: params_buf,
                     size,
                     viewport,
+                    head,
                     bind_group,
                     generation: *generation,
                 });
@@ -170,8 +202,12 @@ pub fn prepare_view_targets(
     }
 }
 
-/// Traces the view (Core3d, after the opaque pass). The first view of a
-/// frame is timed (see `gpu_timing`).
+/// Runs the beam prepass and traces the view (Core3d, after the opaque
+/// pass). The first view of a frame is timed (see `gpu_timing`). The
+/// prepass runs whatever `beam_iterations` says (with 0 each tile writes 0
+/// at once), so a config change needs no other state. Its dispatch also
+/// traces the bottom `beam_head_share` of the tile rows from the camera
+/// (decision 0026), which the trace then skips.
 pub fn voxel_trace(
     view: ViewQuery<&VoxelViewTargets>,
     pipeline: Option<Res<TracePipeline>>,
@@ -184,37 +220,46 @@ pub fn voxel_trace(
     mut ctx: RenderContext,
 ) {
     let targets = view.into_inner();
-    let Some(pipeline) = pipeline.and_then(|p| cache.get_compute_pipeline(p.id)) else {
+    let Some(pipeline) = pipeline else {
+        return;
+    };
+    let (Some(trace), Some(beam)) = (
+        cache.get_compute_pipeline(pipeline.id),
+        cache.get_compute_pipeline(pipeline.beam),
+    ) else {
         return;
     };
     let (width, height) = (targets.size.x, targets.size.y);
+    let (size, head) = ((width, height), targets.head);
+    let bind_group = &targets.bind_group;
     match sampled {
         Some(mut sampled) if sampled.wants(TimedPass::Trace) => {
             let device = device.wgpu_device();
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("primary.trace"),
-            });
-            record_trace(
-                &mut encoder,
-                pipeline,
-                &targets.bind_group,
-                width,
-                height,
-                None,
-            );
-            sampled.time_alone(TimedPass::Trace, device, &queue, || flush.flush(), encoder);
+            let encoder_for = |label| {
+                device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+            };
+            let mut encoder = encoder_for("primary.beam");
+            record_beam(&mut encoder, beam, bind_group, size, head, None);
+            sampled.time_alone(TimedPass::Beam, device, &queue, || flush.flush(), encoder);
+            let mut encoder = encoder_for("primary.trace");
+            record_trace(&mut encoder, trace, bind_group, width, height, None);
+            sampled.time_alone(TimedPass::Trace, device, &queue, || {}, encoder);
             sampled.read_rays(device, &queue, &targets.hits);
         }
         _ => {
             let mut timer = timer;
             let writes = timer
                 .as_deref_mut()
+                .and_then(|t| t.compute_writes(TimedPass::Beam));
+            record_beam(ctx.command_encoder(), beam, bind_group, size, head, writes);
+            let writes = timer
+                .as_deref_mut()
                 .and_then(|t| t.compute_writes(TimedPass::Trace));
-            let encoder = ctx.command_encoder();
             record_trace(
-                encoder,
-                pipeline,
-                &targets.bind_group,
+                ctx.command_encoder(),
+                trace,
+                bind_group,
                 width,
                 height,
                 writes,

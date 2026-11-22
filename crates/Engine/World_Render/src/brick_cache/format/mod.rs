@@ -29,22 +29,26 @@
 //! |-------|---------|
 //! | 0 | brick id (index into the brick table) |
 //! | 1 | `p \| palette_words << 8 \| flags << 24` |
-//! | 2 | representative material |
-//! | 3 | default material: the most common material of the brick's full one-material leaves, ties to the lower id; air when it has none |
-//! | 4, 5 | default mask `D`: the leaves that are full of the default material; they have no words |
-//! | 6, 7 | full mask `F`: every other leaf that is full of one material; it has a payload and no leaf mask |
-//! | 8 .. 8+2p | `leaf_mask[p]`: lo, hi word per partial leaf (`P = mask & !D & !F`), in slot order |
-//! | 8+2p .. 8+2p+s | `payload[s]` per stored leaf (`S = mask & !D`), in slot order: bit 31 set: the leaf's solid voxels are all material `payload & 0xFFFF`; else the word offset from the block start to the leaf's palette block |
-//! | 8+2p+s .. | palette blocks (`palette_words` words), then zero padding to 16 bytes |
+//! | 2 | representative material in bits 0..15, default material in bits 16..31: the most common material of the brick's full one-material leaves, ties to the lower id; air when it has none |
+//! | 3, 4 | default mask `A`: the leaves whose solid voxels are all the default material, full or not; they have no payload |
+//! | 5, 6 | full mask `B`: every leaf that is full of one material; it has no leaf mask |
+//! | 7 .. 7+2p | `leaf_mask[p]`: lo, hi word per partial leaf (`P = mask & !B`), in slot order |
+//! | 7+2p .. 7+2p+s | `payload[s]` per leaf of `S = mask & !A`, in slot order: bit 31 set: the leaf's solid voxels are all material `payload & 0xFFFF`; else the word offset from the block start to the leaf's palette block |
+//! | 7+2p+s .. | palette blocks (`palette_words` words), then zero padding to 16 bytes |
 //!
-//! So leaf `i` of a brick is the default material when `D` has it; else its
-//! payload is `payload[rank(S, i)]`, and its leaf mask is all ones when `F`
-//! has it and `leaf_mask[rank(P, i)]` otherwise (decision 0021).
+//! So leaf `i` of a brick is the default material throughout when both
+//! masks have it; else its leaf mask is all ones when `B` has it and
+//! `leaf_mask[rank(P, i)]` otherwise, and its solid voxels are the default
+//! material when `A` has it and `payload[rank(S, i)]` says otherwise
+//! (decisions 0021 and 0025).
 //!
-//! A palette block (decision 0005): header `p | b << 8` (`p` materials, `b`
-//! bits per index, the smallest of 1, 2, 4, 8 with `2^b >= p`), then the
-//! palette ascending, two u16 per word low half first, then one index per
-//! solid voxel in slot order, `b` bits each, LSB-first in whole words.
+//! A palette block (decisions 0005 and 0025): for three or more materials a
+//! header `p | b << 8` (`p` materials, `b` bits per index, the smallest of
+//! 1, 2, 4, 8 with `2^b >= p`), then the palette ascending, two u16 per word
+//! low half first, then one index per solid voxel in slot order, `b` bits
+//! each, LSB-first in whole words. A block of two materials has no header:
+//! it starts at its palette word, whose high half (the larger id) is never
+//! zero, where a header's is ([`PALETTE_PAIR_SHIFT`]).
 //!
 //! # Brick table, 8 bytes per brick id
 //!
@@ -88,13 +92,16 @@ pub const MAX_SEGMENTS: u32 = 4;
 pub const BLOCK_ALIGN_WORDS: u32 = 4;
 
 /// Words in a brick block header.
-pub const BLOCK_HEADER_WORDS: u32 = 8;
-/// Header word holding the default material.
-pub const BLOCK_DEFAULT_WORD: u32 = 3;
+pub const BLOCK_HEADER_WORDS: u32 = 7;
+/// Header word holding the representative material (low half) and the
+/// default material (high half).
+pub const BLOCK_DEFAULT_WORD: u32 = 2;
+/// Shift of the default material in its header word.
+pub const BLOCK_DEFAULT_SHIFT: u32 = 16;
 /// First of the two header words of the default mask (low word first).
-pub const BLOCK_DEFAULT_MASK_WORD: u32 = 4;
+pub const BLOCK_DEFAULT_MASK_WORD: u32 = 3;
 /// First of the two header words of the full mask (low word first).
-pub const BLOCK_FULL_MASK_WORD: u32 = 6;
+pub const BLOCK_FULL_MASK_WORD: u32 = 5;
 /// Header word 1: mask of the partial leaf count.
 pub const BLOCK_COUNT_MASK: u32 = 0xFF;
 /// Header word 1: shift of the palette word count.
@@ -113,6 +120,10 @@ pub const PAYLOAD_UNIFORM_BIT: u32 = 1 << 31;
 pub const PALETTE_LEN_MASK: u32 = 0xFF;
 /// Palette header: shift of the index width.
 pub const PALETTE_BITS_SHIFT: u32 = 8;
+/// A palette block whose first word has bits at or above this shift set is
+/// a two-material block without a header: the word is its palette, the
+/// larger id in the high half (decision 0025).
+pub const PALETTE_PAIR_SHIFT: u32 = 16;
 
 /// Words per brick table entry: block ref, last-used frame.
 pub const BRICK_TABLE_WORDS: u32 = 2;
@@ -274,6 +285,7 @@ pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("BLOCK_ALIGN_WORDS", BLOCK_ALIGN_WORDS),
     ("BLOCK_HEADER_WORDS", BLOCK_HEADER_WORDS),
     ("BLOCK_DEFAULT_WORD", BLOCK_DEFAULT_WORD),
+    ("BLOCK_DEFAULT_SHIFT", BLOCK_DEFAULT_SHIFT),
     ("BLOCK_DEFAULT_MASK_WORD", BLOCK_DEFAULT_MASK_WORD),
     ("BLOCK_FULL_MASK_WORD", BLOCK_FULL_MASK_WORD),
     ("BLOCK_COUNT_MASK", BLOCK_COUNT_MASK),
@@ -285,6 +297,7 @@ pub const SHADER_CONSTANTS: &[(&str, u32)] = &[
     ("PAYLOAD_UNIFORM_BIT", PAYLOAD_UNIFORM_BIT),
     ("PALETTE_LEN_MASK", PALETTE_LEN_MASK),
     ("PALETTE_BITS_SHIFT", PALETTE_BITS_SHIFT),
+    ("PALETTE_PAIR_SHIFT", PALETTE_PAIR_SHIFT),
     ("BRICK_TABLE_WORDS", BRICK_TABLE_WORDS),
     ("INVALID_REF", INVALID_REF),
 ];

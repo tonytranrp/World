@@ -18,7 +18,7 @@
 use world_core::MaterialId;
 use world_core::tree::{NodeKind, NodeView};
 
-use super::{PALETTE_BITS_SHIFT, PALETTE_LEN_MASK};
+use super::{PALETTE_BITS_SHIFT, PALETTE_LEN_MASK, PALETTE_PAIR_SHIFT};
 
 /// What a source child is, as the GPU format sees it. The only place that
 /// matches World_Core's `NodeKind`, so a new kind is one line here.
@@ -147,14 +147,22 @@ pub fn count_leaf<N: NodeView>(leaf: &N, tally: &mut Tally) {
 }
 
 /// Counts a packed palette block's solid voxels per material: one index per
-/// set bit of `leaf_mask`, in the layout of decision 0005 (header
-/// `len | bits << 8`, the palette two ids per word, then the indices
-/// LSB-first).
+/// set bit of `leaf_mask`, in the layout of decisions 0005 and 0025 (header
+/// `len | bits << 8` from three materials on, the palette two ids per word,
+/// then the indices LSB-first).
 pub fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
-    let len = (block[0] & PALETTE_LEN_MASK) as usize;
-    let bits = (block[0] >> PALETTE_BITS_SHIFT) & 0xFF;
+    let first = block[0];
+    let (len, bits, palette_at) = if first >> PALETTE_PAIR_SHIFT != 0 {
+        (2, 1, 0)
+    } else {
+        (
+            (first & PALETTE_LEN_MASK) as usize,
+            (first >> PALETTE_BITS_SHIFT) & 0xFF,
+            1,
+        )
+    };
     let material = |i: usize| {
-        let word = block.get(1 + i / 2).copied().unwrap_or(0);
+        let word = block.get(palette_at + i / 2).copied().unwrap_or(0);
         MaterialId((word >> (16 * (i % 2))) as u16)
     };
     let solid = leaf_mask.count_ones();
@@ -167,7 +175,7 @@ pub fn count_palette_block(block: &[u32], leaf_mask: u64, tally: &mut Tally) {
     }
     // At most 64 voxels, so a byte per palette entry holds any count.
     let mut counts = [0u8; 64];
-    let indices = &block[1 + len.div_ceil(2)..];
+    let indices = &block[palette_at + len.div_ceil(2)..];
     let index_mask = (1u32 << bits) - 1;
     for k in 0..solid {
         let at = k * bits;

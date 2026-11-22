@@ -1,5 +1,5 @@
 //! Bytes of real terrain chunks in the CPU tree and in GPU brick blocks
-//! (decisions 0020 and 0021). Prints figures; asserts nothing beyond the
+//! (decisions 0020, 0021 and 0025). Prints figures; asserts nothing beyond the
 //! encoder agreeing with the tree.
 //!
 //! Run with
@@ -47,6 +47,11 @@ struct Census {
     /// Surface records (one material with air) of the brick's default.
     single_of_default: usize,
     single: usize,
+    /// Bricks with partial leaves of their default but no other full leaf,
+    /// by how many: one, two, three or more (decision 0025's rule).
+    default_partial_only: [usize; 3],
+    /// Surface records in bricks without any full leaf (so no default).
+    single_without_full: usize,
     two_material: usize,
 }
 
@@ -75,6 +80,7 @@ fn census(node: NodeRef<'_>, level: u32, out: &mut Census) {
     if counts.len() > 1 {
         out.bricks_with_other_full += 1;
     }
+    let mut of_default = 0;
     for (_, leaf) in b.children() {
         if let NodeRef::Leaf(l) = leaf {
             let palette: Vec<_> = l.palette().collect();
@@ -83,12 +89,19 @@ fn census(node: NodeRef<'_>, level: u32, out: &mut Census) {
                     out.single += 1;
                     if Some(palette[0]) == default {
                         out.single_of_default += 1;
+                        of_default += 1;
+                    }
+                    if counts.is_empty() {
+                        out.single_without_full += 1;
                     }
                 }
                 2 => out.two_material += 1,
                 _ => {}
             }
         }
+    }
+    if counts.len() == 1 && of_default > 0 {
+        out.default_partial_only[of_default.min(3) - 1] += 1;
     }
 }
 
@@ -150,6 +163,7 @@ fn terrain_chunk_bytes() {
         total.default_leaves += b.default_leaves;
         total.child_words += b.child_words;
         total.full_records += b.full_records;
+        total.default_partial_leaves += b.default_partial_leaves;
         total.single_records += b.single_records;
         total.palette_records += b.palette_records;
         for i in 0..4 {

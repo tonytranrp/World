@@ -85,6 +85,13 @@ fn tree_scene() -> (VoxelTree, Bounds) {
     // words), 8 its other full leaves (one payload each, decision 0021).
     fill(&mut t, [16, -16, 16], [32, -8, 28], 7);
     fill(&mut t, [16, -8, 16], [24, 0, 28], 8);
+    // A brick of 9 whose top ends halfway up a row of leaves: its partial
+    // leaves of the default are leaf masks without payloads (decision
+    // 0025). Where 10 meets 9 off the leaf grid, leaves of two materials
+    // (palette blocks without a header); where 11 joins, one of three.
+    fill(&mut t, [-32, -16, -32], [-16, -6, -16], 9);
+    fill(&mut t, [-32, -10, -24], [-26, -6, -16], 10);
+    t.set(VoxelPos::new(-27, -7, -18), MaterialId(11)).unwrap();
     for i in 0..20 {
         fill(&mut t, [20 + i, -16, -30], [21 + i, -16 + i, -10], 4);
         t.set(
@@ -216,6 +223,12 @@ fn compare_scene<S: VoxelSource>(source: &S, bounds: Bounds, label: &str) {
 #[test]
 fn gpu_trace_matches_the_brute_force_dda_on_a_world_tree() {
     let (tree, bounds) = tree_scene();
+    // The scene covers every brick and palette layout (decisions 0021 and
+    // 0025): long headers, other full leaves, default partial leaves, and
+    // palette blocks of two materials (one bit) and of three (two bits).
+    let b = tree.memory_breakdown();
+    assert!(b.long_headers > 0 && b.full_records > 0 && b.default_partial_leaves > 0);
+    assert!(b.palette_words[0] > 0 && b.palette_words[1] > 0, "{b:?}");
     compare_scene(&tree.snapshot(), bounds, "world tree");
 }
 
@@ -395,7 +408,7 @@ fn gpu_footprint_stops_at_coarse_cells_that_hold_voxels() {
 
 /// A 256 x 144 trace over the tree scene, every ray from the origin down -z
 /// (camera mode with identity matrices): GPU work to time.
-fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buffer; 2]) {
+fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buffer; 3]) {
     use wgpu::util::DeviceExt;
     use world_render::internals::trace::MODE_CAMERA;
     let pipelines = Pipelines::new(&gpu.device);
@@ -422,8 +435,9 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
             layout.request_capacity,
             layout.stamps_offset(),
             trace::DEFAULT_MAX_ITERATIONS,
-            0,
+            trace::BEAM_OFF,
         ],
+        head: [0; 4],
     };
     let params = gpu
         .device
@@ -432,14 +446,16 @@ fn timing_trace(gpu: &Gpu) -> (Pipelines, GpuCache, wgpu::BindGroup, [wgpu::Buff
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+    let beam = trace::beam_buffer(&gpu.device, 256, 144);
     let bind_group = trace::trace_bind_group(
         &gpu.device,
         &pipelines.trace_layout,
         &cache.pools,
         &hits,
         &params,
+        &beam,
     );
-    (pipelines, cache, bind_group, [hits, params])
+    (pipelines, cache, bind_group, [hits, params, beam])
 }
 
 /// The timestamp timer resolves and reads back a pass's time a few frames

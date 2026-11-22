@@ -119,7 +119,7 @@ pub struct MemoryBreakdown {
     pub upper_nodes: usize,
     /// Level-1 nodes (bricks), 16 bytes each plus a 12-byte header.
     pub bricks: usize,
-    /// Bricks whose header also holds an other-full mask: 8 more bytes.
+    /// Bricks whose header also holds the full mask: 8 more bytes.
     pub long_headers: usize,
     /// Full leaves of their brick's default material: no bytes of their own.
     pub default_leaves: usize,
@@ -128,6 +128,9 @@ pub struct MemoryBreakdown {
     /// Leaves that are full and one material but not their brick's default
     /// (one 4-byte word each, decision 0021).
     pub full_records: usize,
+    /// Partial leaves of their brick's default material stored as a leaf
+    /// mask alone (8 bytes each, decision 0025).
+    pub default_partial_leaves: usize,
     /// Leaf records of one material with some air (12 bytes each).
     pub single_records: usize,
     /// Leaf records with a palette (12 bytes each, plus their block).
@@ -148,6 +151,7 @@ impl MemoryBreakdown {
             + 8 * self.long_headers
             + 4 * self.child_words
             + 4 * self.full_records
+            + 8 * self.default_partial_leaves
             + 12 * (self.single_records + self.palette_records)
             + 4 * self.palette_words.iter().sum::<usize>()
     }
@@ -656,18 +660,20 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
     };
     if let Some((header, _)) = b.brick_layout() {
         out.bricks += 1;
-        out.long_headers += usize::from(header.other != 0);
-        out.default_leaves += header.full.count_ones() as usize;
+        out.long_headers += usize::from(header.has_full_mask());
+        out.default_leaves += header.default_full().count_ones() as usize;
         for (slot, leaf) in b.children() {
             match leaf {
-                NodeRef::Uniform(_) if header.full & (1 << slot) != 0 => {}
+                NodeRef::Uniform(_) if header.defaults & (1 << slot) != 0 => {}
                 NodeRef::Uniform(_) => out.full_records += 1,
+                NodeRef::Leaf(_) if header.defaults & (1 << slot) != 0 => {
+                    out.default_partial_leaves += 1;
+                }
                 NodeRef::Leaf(l) => match l.index_bits() {
                     0 => out.single_records += 1,
                     bits => {
                         out.palette_records += 1;
-                        let palette = l.palette().count();
-                        let words = 1 + palette.div_ceil(2) + l.index_words().len();
+                        let words = leaf.palette_block().map_or(0, <[u32]>::len);
                         let class = bits.trailing_zeros() as usize;
                         out.palette_words[class.min(3)] += words;
                     }

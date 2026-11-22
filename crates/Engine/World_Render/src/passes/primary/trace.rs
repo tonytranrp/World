@@ -1,5 +1,6 @@
-//! The primary trace pass on bare wgpu: parameters, bindings and dispatch.
-//! The Bevy node and the GPU tests both record through here.
+//! The primary trace pass on bare wgpu: parameters, bindings and dispatch,
+//! and its beam prepass (decision 0023). The Bevy node and the GPU tests
+//! both record through here.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::{
@@ -13,6 +14,16 @@ use crate::brick_cache::stream::upload::storage_entry;
 
 /// The shader's workgroup edge: 8x8 pixels.
 pub const TRACE_WORKGROUP: u32 = 8;
+/// The beam prepass's tile edge in pixels: one beam per 8x8 camera rays.
+pub const BEAM_TILE: u32 = 8;
+/// The beam shader's workgroup edge, in tiles.
+pub const BEAM_WORKGROUP: u32 = 8;
+/// `limits.w` that turns the beam prepass off.
+pub const BEAM_OFF: u32 = 0;
+
+/// The constants the primary pass's shaders share with this module
+/// (decision 0013).
+pub const SHADER_CONSTANTS: &[(&str, u32)] = &[("BEAM_TILE", BEAM_TILE)];
 /// Traversal iterations before a ray gives up (flagged exhausted).
 pub const DEFAULT_MAX_ITERATIONS: u32 = 4096;
 /// `mode`: rays from the camera matrices.
@@ -46,12 +57,26 @@ pub struct TraceParams {
     /// Pixel angle (radians), footprint bias (0 is full resolution),
     /// voxels per metre, unused.
     pub lod: [f32; 4],
-    /// Request capacity, word offset of the request stamps, iteration cap, unused.
+    /// Request capacity, word offset of the request stamps, iteration cap,
+    /// beam iteration cap ([`BEAM_OFF`]: no prepass; camera mode only).
     pub limits: [u32; 4],
+    /// Tile rows at the bottom of a camera trace that the prepass's dispatch
+    /// traces from the camera ([`head_rows`]); y to w unused.
+    pub head: [u32; 4],
+}
+
+/// The tile rows at the bottom of a `height`-pixel camera trace that the
+/// prepass's dispatch traces from the camera while its beams march (decision
+/// 0026): `share` of the rows, rounded down, never all of them. The shader
+/// clamps the same way (`head_rows` in `view.wesl`).
+pub fn head_rows(height: u32, share: f32) -> u32 {
+    let (_, rows) = beam_tiles(1, height);
+    ((rows as f32 * share.clamp(0.0, 1.0)) as u32).min(rows - 1)
 }
 
 /// Bindings: nodes, segments 0 to 3 (read), brick table and feedback
-/// (read-write), hit records (read-write), parameters (uniform).
+/// (read-write), hit records (read-write), parameters (uniform), beam start
+/// distances (read-write). The beam prepass uses the same layout.
 pub fn trace_layout_entries() -> Vec<BindGroupLayoutEntry> {
     let c = ShaderStages::COMPUTE;
     let mut v: Vec<_> = (0..5).map(|b| storage_entry(b, true, c)).collect();
@@ -68,20 +93,43 @@ pub fn trace_layout_entries() -> Vec<BindGroupLayoutEntry> {
         },
         count: None,
     });
+    v.push(storage_entry(9, false, c));
     v
 }
 
-/// The bind group of one view: pools, its hit buffer and its parameters.
+/// Beam tiles over a `width x height` trace: columns and rows.
+pub fn beam_tiles(width: u32, height: u32) -> (u32, u32) {
+    (
+        width.max(1).div_ceil(BEAM_TILE),
+        height.max(1).div_ceil(BEAM_TILE),
+    )
+}
+
+/// The beam prepass's output for a `width x height` trace: one `f32` start
+/// distance per tile.
+pub fn beam_buffer(device: &Device, width: u32, height: u32) -> Buffer {
+    let (columns, rows) = beam_tiles(width, height);
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("primary.beam"),
+        size: u64::from(columns) * u64::from(rows) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// The bind group of one view: pools, its hit buffer, its parameters and
+/// its beam start distances ([`beam_buffer`]).
 pub fn trace_bind_group(
     device: &Device,
     layout: &BindGroupLayout,
     pools: &GpuPools,
     hits: &Buffer,
     params: &Buffer,
+    beam: &Buffer,
 ) -> BindGroup {
     let mut buffers: Vec<&Buffer> = vec![&pools.nodes];
     buffers.extend(pools.segments.iter());
-    buffers.extend([&pools.table, &pools.feedback, hits, params]);
+    buffers.extend([&pools.table, &pools.feedback, hits, params, beam]);
     let entries: Vec<BindGroupEntry> = buffers
         .iter()
         .enumerate()
@@ -117,4 +165,34 @@ pub fn record_trace(
         height.div_ceil(TRACE_WORKGROUP),
         1,
     );
+}
+
+/// Workgroups of the prepass over a `width x height` camera trace whose
+/// bottom `head` tile rows ([`head_rows`], the value in `TraceParams::head`)
+/// it traces: 8x8 beam tiles over the rows above, then one per head tile.
+pub fn beam_groups(width: u32, height: u32, head: u32) -> u32 {
+    let (columns, rows) = beam_tiles(width, height);
+    let head = head.min(rows - 1);
+    columns.div_ceil(BEAM_WORKGROUP) * (rows - head).div_ceil(BEAM_WORKGROUP) + columns * head
+}
+
+/// Records the beam prepass over a `width x height` camera trace's tiles,
+/// and the trace of its bottom `head` tile rows (the value in
+/// `TraceParams::head`). The trace recorded after it reads the start
+/// distances when `limits.w` is not [`BEAM_OFF`], and skips the head rows.
+pub fn record_beam(
+    encoder: &mut CommandEncoder,
+    pipeline: &ComputePipeline,
+    bind_group: &BindGroup,
+    (width, height): (u32, u32),
+    head: u32,
+    timestamps: Option<wgpu::ComputePassTimestampWrites<'_>>,
+) {
+    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("primary.beam"),
+        timestamp_writes: timestamps,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(beam_groups(width, height, head), 1, 1);
 }

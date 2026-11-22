@@ -71,6 +71,15 @@
         // Nodes the shrink walk collapses per frame at most (each releases
         // its subtree); it resumes where it stopped. 1..=1048576
         max_collapses_per_frame: 256,
+        // Steps the beam prepass takes per 8x8 tile of camera rays to find
+        // the distance they may all start from (decision 0023); 0 turns it
+        // off and rays start at the camera. 0..=1024
+        beam_iterations: 64,
+        // Share of the 8-pixel tile rows, from the bottom of the image, that
+        // the beam prepass's dispatch traces from the camera while its
+        // beams march, so the GPU is not idle under them (decision 0026).
+        // 0.0..=0.5
+        beam_head_share: 0.125,
     ),
     // Node summaries (each over up to 64 children) that applying edits and
     // replaced chunks may compute per frame; the rest waits for later

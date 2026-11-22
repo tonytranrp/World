@@ -367,6 +367,8 @@ fn stage_one_hysteresis_keeps_nodes_between_the_thresholds() {
         max_expansion_summaries_per_frame: 2048,
         max_shrink_visits_per_frame: 4096,
         max_collapses_per_frame: 256,
+        beam_iterations: 64,
+        beam_head_share: 0.125,
     };
     let brick = res.resident_bricks()[0];
     let pixel_angle = 0.002;
@@ -436,6 +438,8 @@ fn a_budgeted_walk_over_several_frames_selects_what_one_walk_does() {
         max_expansion_summaries_per_frame: 2048,
         max_shrink_visits_per_frame: 4096,
         max_collapses_per_frame: 256,
+        beam_iterations: 64,
+        beam_head_share: 0.125,
     };
     let view = ViewPoint {
         eye: [3.0, 900.0, -5.0],
