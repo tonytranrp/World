@@ -21,6 +21,8 @@
 //! - Every expanded entry holds one node group, every resident brick one
 //!   brick id, and each entry's child masks match its children's entries.
 
+use std::num::NonZeroU32;
+
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::tasks::{TaskPool, TaskPoolBuilder};
 use world_core::MaterialId;
@@ -62,29 +64,33 @@ pub enum Refused {
 
 #[derive(Clone, Copy, Debug)]
 struct BrickSlot {
-    id: u32,
+    /// The brick id plus one, so `Option<BrickSlot>` needs no tag.
+    id1: NonZeroU32,
     alloc: BrickAlloc,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    /// Where the node's record is in the node pool.
-    index: u32,
-    /// The record as last written.
-    record: GpuNode,
-    /// The child group, when expanded (level 2 and up).
+impl BrickSlot {
+    fn new(id: u32, alloc: BrickAlloc) -> Self {
+        Self {
+            id1: NonZeroU32::new(id.wrapping_add(1)).expect("brick ids are below u32::MAX"),
+            alloc,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.id1.get() - 1
+    }
+}
+
+/// What only a node with children entries keeps (level 2 and up): its group
+/// and its children's state, by slot. Level-1 entries, most of the table,
+/// never have any (decision 0032).
+#[derive(Clone, Copy, Debug, Default)]
+struct Below {
+    /// The child group, when expanded.
     group: Option<NodeAlloc>,
-    /// The resident block, for a level-1 node.
-    brick: Option<BrickSlot>,
-    /// The frame a ray last asked for this node.
-    last_requested: u32,
-    /// Slots of the children that have entries (mixed content), when
-    /// expanded.
+    /// Slots of the children that have entries (mixed content).
     kids: u64,
-    /// The mask the group or the brick block was laid out for: the GPU
-    /// finds children and leaves by their rank in the record's mask, so a
-    /// record may only point at them with this mask.
-    layout: u64,
     /// Slots of the children whose bricks are resident (level 2).
     bricks: u64,
     /// Slots of the children that are expanded.
@@ -94,26 +100,62 @@ struct Entry {
     done: u64,
 }
 
+#[derive(Clone, Debug)]
+struct Entry {
+    /// The mask the group or the brick block was laid out for: the GPU
+    /// finds children and leaves by their rank in the record's mask, so a
+    /// record may only point at them with this mask.
+    layout: u64,
+    /// The record as last written.
+    record: GpuNode,
+    /// Where the node's record is in the node pool.
+    index: u32,
+    /// The frame a ray last asked for this node.
+    last_requested: u32,
+    /// The resident block, for a level-1 node.
+    brick: Option<BrickSlot>,
+    /// Group and children's state, once anything set them; `None` reads as
+    /// all empty.
+    below: Option<Box<Below>>,
+}
+
+/// The entry stays small: 1.2 to 1.5 million of them on the walks.
+const _: () = assert!(size_of::<Entry>() <= 64);
+
 impl Entry {
     /// Expanded, with every child that has an entry holding its brick:
     /// stage 1 finds nothing to do below it.
     fn done(&self) -> bool {
-        self.group.is_some() && self.kids & !self.bricks == 0
+        self.below
+            .as_ref()
+            .is_some_and(|b| b.group.is_some() && b.kids & !b.bricks == 0)
     }
 
     fn new(index: u32, record: GpuNode) -> Self {
         Self {
-            index,
-            record,
-            group: None,
-            brick: None,
-            last_requested: 0,
-            kids: 0,
             layout: 0,
-            bricks: 0,
-            grown: 0,
-            done: 0,
+            record,
+            index,
+            last_requested: 0,
+            brick: None,
+            below: None,
         }
+    }
+
+    fn below(&self) -> Below {
+        self.below.as_deref().copied().unwrap_or_default()
+    }
+
+    fn below_mut(&mut self) -> &mut Below {
+        self.below.get_or_insert_with(Box::default)
+    }
+
+    fn group(&self) -> Option<NodeAlloc> {
+        self.below.as_ref().and_then(|b| b.group)
+    }
+
+    fn kids(&self) -> u64 {
+        self.below.as_ref().map_or(0, |b| b.kids)
     }
 }
 
@@ -332,13 +374,13 @@ impl Residency {
     /// The node's state, or `None` when it has no record.
     pub fn node_state(&self, key: NodeKey) -> Option<NodeState> {
         self.entries.get(&key).map(|e| NodeState {
-            expanded: e.group.is_some(),
+            expanded: e.group().is_some(),
             brick_resident: e.brick.is_some(),
             mask: e.record.mask(),
-            kids: e.kids,
-            bricks: e.bricks,
-            grown: e.grown,
-            done: e.done,
+            kids: e.kids(),
+            bricks: e.below.as_ref().map_or(0, |b| b.bricks),
+            grown: e.below.as_ref().map_or(0, |b| b.grown),
+            done: e.below.as_ref().map_or(0, |b| b.done),
         })
     }
 
@@ -403,7 +445,7 @@ impl Residency {
     }
 
     pub fn is_expanded(&self, key: NodeKey) -> bool {
-        self.entries.get(&key).is_some_and(|e| e.group.is_some())
+        self.entries.get(&key).is_some_and(|e| e.group().is_some())
     }
 
     pub fn is_brick_resident(&self, key: NodeKey) -> bool {
@@ -443,7 +485,7 @@ impl Residency {
         let Some(e) = self.entries.get(&key) else {
             return Vec::new();
         };
-        if e.group.is_none() {
+        if e.group().is_none() {
             return Vec::new();
         }
         let mask = e.record.mask();
@@ -475,7 +517,7 @@ impl Residency {
     pub fn block_of_id(&self, id: u32) -> Option<BrickRef> {
         let key = self.key_of_id(id)?;
         let slot = self.entries.get(&key)?.brick?;
-        (slot.id == id).then_some(slot.alloc.block)
+        (slot.id() == id).then_some(slot.alloc.block)
     }
 
     // ----------------------------------------------------------- summaries --
@@ -613,14 +655,14 @@ impl Residency {
                 let mask = view.mask();
                 if keep
                     && let Some(e) = self.entries.get(&key)
-                    && (e.group.is_some() || e.brick.is_some())
+                    && (e.group().is_some() || e.brick.is_some())
                     && (e.layout != mask || self.in_waiting_chunk(key))
                 {
                     return Some(e.record);
                 }
                 let material = self.summary(key, view).material;
                 let e = self.entries.get(&key);
-                Some(match (e.and_then(|e| e.group), e.and_then(|e| e.brick)) {
+                Some(match (e.and_then(|e| e.group()), e.and_then(|e| e.brick)) {
                     (Some(g), _) if key.level >= 2 => {
                         GpuNode::internal(mask, g.first, material, edited)
                     }
@@ -651,7 +693,7 @@ impl Residency {
             && let Some(p) = self.entries.get_mut(&key.parent())
         {
             let was = p.done();
-            p.kids |= 1u64 << key.slot_in_parent();
+            p.below_mut().kids |= 1u64 << key.slot_in_parent();
             flip = (p.done() != was).then_some(!was);
         }
         if let Some(done) = flip {
@@ -665,7 +707,7 @@ impl Residency {
         let mut flip = None;
         if let Some(e) = self.entries.get_mut(&key) {
             let was = e.done();
-            e.kids |= kids;
+            e.below_mut().kids |= kids;
             flip = (e.done() != was).then_some(!was);
         }
         if let Some(done) = flip {
@@ -682,10 +724,12 @@ impl Residency {
         {
             let was = p.done();
             let bit = 1u64 << key.slot_in_parent();
-            p.kids &= !bit;
-            p.bricks &= !bit;
-            p.grown &= !bit;
-            p.done &= !bit;
+            if let Some(b) = p.below.as_deref_mut() {
+                b.kids &= !bit;
+                b.bricks &= !bit;
+                b.grown &= !bit;
+                b.done &= !bit;
+            }
             flip = (p.done() != was).then_some(!was);
         }
         if let Some(done) = flip {
@@ -701,13 +745,13 @@ impl Residency {
     fn set_done_bit(&mut self, key: NodeKey, done: bool) {
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
-            && p.group.is_some()
+            && p.group().is_some()
         {
             let bit = 1u64 << key.slot_in_parent();
             if done {
-                p.done |= bit;
+                p.below_mut().done |= bit;
             } else {
-                p.done &= !bit;
+                p.below_mut().done &= !bit;
             }
         }
     }
@@ -718,15 +762,16 @@ impl Residency {
         let Some(e) = self.entries.get_mut(&key) else {
             return;
         };
-        e.group = group;
+        e.below_mut().group = group;
         let (grown, done) = (group.is_some(), e.done());
         if key != self.shape.root()
             && let Some(p) = self.entries.get_mut(&key.parent())
-            && p.group.is_some()
+            && p.group().is_some()
         {
             let bit = 1u64 << key.slot_in_parent();
-            p.grown = if grown { p.grown | bit } else { p.grown & !bit };
-            p.done = if done { p.done | bit } else { p.done & !bit };
+            let b = p.below_mut();
+            b.grown = if grown { b.grown | bit } else { b.grown & !bit };
+            b.done = if done { b.done | bit } else { b.done & !bit };
         }
     }
 
@@ -744,9 +789,9 @@ impl Residency {
             let was = p.done();
             let bit = 1u64 << key.slot_in_parent();
             if slot.is_some() {
-                p.bricks |= bit;
+                p.below_mut().bricks |= bit;
             } else {
-                p.bricks &= !bit;
+                p.below_mut().bricks &= !bit;
             }
             flip = (p.done() != was).then_some(!was);
         }
@@ -773,10 +818,10 @@ impl Residency {
 
     /// Frees what an entry holds: its children (recursively), group and brick.
     fn release(&mut self, key: NodeKey, e: Entry, batch: &mut UploadBatch) {
-        if let Some(g) = e.group {
+        if let Some(g) = e.group() {
             // The entries below, not the record's mask: a record may have
             // been rewritten for content the group does not hold yet.
-            let mut kids = e.kids;
+            let mut kids = e.kids();
             while kids != 0 {
                 let slot = kids.trailing_zeros();
                 kids &= kids - 1;
@@ -791,11 +836,11 @@ impl Residency {
 
     fn free_brick(&mut self, b: BrickSlot, batch: &mut UploadBatch) {
         self.bricks.free(b.alloc);
-        self.ids.free(b.id);
-        if let Some(k) = self.id_keys.get_mut(b.id as usize) {
+        self.ids.free(b.id());
+        if let Some(k) = self.id_keys.get_mut(b.id() as usize) {
             *k = None;
         }
-        batch.write_table(b.id, None, 0);
+        batch.write_table(b.id(), None, 0);
     }
 
     fn write_record(&mut self, key: NodeKey, record: GpuNode, batch: &mut UploadBatch) {
@@ -819,7 +864,7 @@ impl Residency {
         // Children that became air or uniform lose their entries. The
         // children with entries are exactly `kids` (verify checks it), so a
         // node expanded afresh looks none up.
-        let mut kids = self.entries.get(&key).map_or(0, |e| e.kids);
+        let mut kids = self.entries.get(&key).map_or(0, |e| e.kids());
         while kids != 0 {
             let slot = kids.trailing_zeros();
             kids &= kids - 1;
@@ -829,7 +874,7 @@ impl Residency {
             }
         }
 
-        let old = self.entries.get(&key).and_then(|e| e.group);
+        let old = self.entries.get(&key).and_then(|e| e.group());
         let group = match old {
             Some(g) if g.len == n.max(1) => g,
             other => {
@@ -854,7 +899,7 @@ impl Residency {
         let fresh = match self.entries.get_mut(&key) {
             Some(e) => {
                 e.layout = mask;
-                e.kids == 0
+                e.kids() == 0
             }
             None => false,
         };
@@ -917,7 +962,7 @@ impl Residency {
         let Some(e) = self.entries.get(&key) else {
             return Ok(());
         };
-        let Some(group) = e.group else {
+        let Some(group) = e.group() else {
             return Ok(());
         };
         let mask = view.mask();
@@ -1004,7 +1049,7 @@ impl Residency {
         if key.level < 2 {
             return Err(Refused::NotApplicable);
         }
-        if e.group.is_some() {
+        if e.group().is_some() {
             return Err(Refused::AlreadyDone);
         }
         if self.is_blocked(key) {
@@ -1031,10 +1076,10 @@ impl Residency {
     /// included). Its record becomes not resident with the same mask and
     /// material.
     pub fn collapse(&mut self, key: NodeKey, batch: &mut UploadBatch) -> Result<(), Refused> {
-        let Some(&e) = self.entries.get(&key) else {
+        let Some(e) = self.entries.get(&key).cloned() else {
             return Err(Refused::NotApplicable);
         };
-        if e.group.is_none() {
+        if e.group().is_none() {
             return Err(Refused::AlreadyDone);
         }
         // A leftover of a burial is freed by the graveyard, not here.
@@ -1042,7 +1087,7 @@ impl Residency {
             return Err(Refused::Waiting);
         }
         self.bury_children(key);
-        if let Some(g) = e.group {
+        if let Some(g) = e.group() {
             self.nodes.free(g);
         }
         self.set_group(key, None);
@@ -1058,7 +1103,7 @@ impl Residency {
         let Some(e) = self.entries.get(&key) else {
             return;
         };
-        let mut kids = e.kids;
+        let mut kids = e.kids();
         while kids != 0 {
             let slot = kids.trailing_zeros();
             kids &= kids - 1;
@@ -1084,8 +1129,8 @@ impl Residency {
             let Some((tag, key, e)) = self.graveyard.pop_front() else {
                 break;
             };
-            if let Some(g) = e.group {
-                let mut kids = e.kids;
+            if let Some(g) = e.group() {
+                let mut kids = e.kids();
                 while kids != 0 {
                     let slot = kids.trailing_zeros();
                     kids &= kids - 1;
@@ -1224,7 +1269,7 @@ impl Residency {
             if let Some(k) = self.id_keys.get_mut(*id as usize) {
                 *k = Some(*key);
             }
-            let slot = BrickSlot { id: *id, alloc };
+            let slot = BrickSlot::new(*id, alloc);
             let record =
                 GpuNode::brick(encoded.mask, alloc.block, encoded.summary.material, *edited);
             self.set_brick(*key, Some(slot));
@@ -1262,7 +1307,7 @@ impl Residency {
         if let Some(k) = self.id_keys.get_mut(id as usize) {
             *k = Some(key);
         }
-        Ok(BrickSlot { id, alloc })
+        Ok(BrickSlot::new(id, alloc))
     }
 
     /// Takes the brick of `key` off the GPU; its record keeps mask and
@@ -1476,7 +1521,7 @@ impl Residency {
             let view = view_at(source, a);
             if content(&view) == Content::Branch {
                 let _ = self.rewrite_children(a, view, slots, batch);
-            } else if let Some(&e) = self.entries.get(&a) {
+            } else if let Some(e) = self.entries.get(&a).cloned() {
                 let mut cleared = e;
                 cleared.brick = None;
                 self.release(a, cleared, batch);
@@ -1642,7 +1687,7 @@ impl Residency {
         for level in c.level()..=self.shape.root_level() {
             self.forget_summary(c.ancestor(level));
         }
-        if self.entries.get(&c).is_some_and(|e| e.group.is_some()) {
+        if self.entries.get(&c).is_some_and(|e| e.group().is_some()) {
             self.bury_children(c);
         }
         let view = view_at(source, c);
@@ -1668,7 +1713,7 @@ impl Residency {
             .chain(self.graveyard.iter().map(|(_, _, e)| e));
         let (expanded, bricks) = held.fold((0, 0), |(g, b), e| {
             (
-                g + usize::from(e.group.is_some()),
+                g + usize::from(e.group().is_some()),
                 b + usize::from(e.brick.is_some()),
             )
         });
@@ -1702,8 +1747,8 @@ impl Residency {
                 continue;
             };
             reachable.insert(key);
-            if e.group.is_some() {
-                let mut kids = e.kids;
+            if e.group().is_some() {
+                let mut kids = e.kids();
                 while kids != 0 {
                     let slot = kids.trailing_zeros();
                     kids &= kids - 1;
@@ -1720,7 +1765,7 @@ impl Residency {
                 }
                 continue;
             }
-            let e = self.entries[&key];
+            let e = self.entries[&key].clone();
             let stale = affected(self, key);
             let pool = nodes.get(e.index as usize).copied();
             if pool != Some(e.record) {
@@ -1742,14 +1787,14 @@ impl Residency {
                 ));
             }
             let (mut kids, mut bricks, mut grown, mut done) = (0u64, 0u64, 0u64, 0u64);
-            if e.group.is_some() {
+            if e.group().is_some() {
                 for slot in 0..64 {
                     if let Some(c) = self.entries.get(&key.child(slot)) {
                         kids |= 1u64 << slot;
                         if c.brick.is_some() {
                             bricks |= 1u64 << slot;
                         }
-                        if c.group.is_some() {
+                        if c.group().is_some() {
                             grown |= 1u64 << slot;
                         }
                         if c.done() {
@@ -1758,33 +1803,35 @@ impl Residency {
                     }
                 }
             }
-            if (e.grown, e.done) != (grown, done) {
+            if (e.below().grown, e.below().done) != (grown, done) {
                 return Err(format!(
                     "{key:?}: expanded child masks {:#x}/{:#x}, table holds {grown:#x}/{done:#x}",
-                    e.grown, e.done
+                    e.below().grown,
+                    e.below().done
                 ));
             }
-            if (e.group.is_some() || e.brick.is_some()) && e.layout != e.record.mask() {
+            if (e.group().is_some() || e.brick.is_some()) && e.layout != e.record.mask() {
                 return Err(format!(
                     "{key:?}: record mask {:#x}, its group or block is laid out for {:#x}",
                     e.record.mask(),
                     e.layout
                 ));
             }
-            if (e.kids, e.bricks) != (kids, bricks) {
+            if (e.kids(), e.below().bricks) != (kids, bricks) {
                 return Err(format!(
                     "{key:?}: child masks {:#x}/{:#x}, table holds {kids:#x}/{bricks:#x}",
-                    e.kids, e.bricks
+                    e.kids(),
+                    e.below().bricks
                 ));
             }
             // Every child entry sits in the group at its rank in the layout.
-            if let Some(g) = e.group {
-                let mut todo = e.kids;
+            if let Some(g) = e.group() {
+                let mut todo = e.kids();
                 while todo != 0 {
                     let slot = todo.trailing_zeros();
                     todo &= todo - 1;
                     let at = g.first + (e.layout & ((1u64 << slot) - 1)).count_ones();
-                    let c = self.entries[&key.child(slot)];
+                    let c = &self.entries[&key.child(slot)];
                     if e.layout & (1u64 << slot) == 0 || c.index != at {
                         return Err(format!(
                             "{key:?} child {slot}: at {} outside layout {:#x} from {}",
@@ -1794,7 +1841,7 @@ impl Residency {
                 }
             }
             // The record points at what the entry holds.
-            let linked_right = match (e.group, e.brick) {
+            let linked_right = match (e.group(), e.brick) {
                 (Some(g), _) => e.record.kind() == Kind::Internal && e.record.reference == g.first,
                 (None, Some(b)) => {
                     e.record.kind() == Kind::Brick && e.record.reference == b.alloc.block.pack()
@@ -1808,7 +1855,7 @@ impl Residency {
                 ));
             }
             // Every record of the group, in the order of its layout.
-            if let Some(g) = e.group {
+            if let Some(g) = e.group() {
                 let mut todo = e.layout;
                 let mut at = g.first;
                 while todo != 0 {
@@ -1837,15 +1884,15 @@ impl Residency {
                 }
             }
             if let Some(b) = e.brick {
-                let t = (b.id * 2) as usize;
+                let t = (b.id() * 2) as usize;
                 if table.get(t) != Some(&b.alloc.block.pack()) || table.get(t + 1) == Some(&0) {
-                    return Err(format!("{key:?}: brick table entry {} is wrong", b.id));
+                    return Err(format!("{key:?}: brick table entry {} is wrong", b.id()));
                 }
                 if !stale {
                     let mut want = Vec::new();
                     encode_brick(
                         view,
-                        b.id,
+                        b.id(),
                         self.edited_bit(key),
                         &mut want,
                         &mut Tally::default(),
