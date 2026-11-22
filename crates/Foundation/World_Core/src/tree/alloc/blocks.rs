@@ -12,29 +12,20 @@ use super::pages::Pages;
 /// shorter than the block, so under 192 words) becomes a free block of its own
 /// size and the new block starts the next page. Freed blocks go on a LIFO
 /// list per size and are reused only by a request of exactly that size.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct WordBlocks {
     /// One past the highest word ever handed out.
     end: u32,
-    /// `free[len - 1]` holds the bases of free blocks of `len` words, or is
-    /// `None` when there are none. Each list is shared until written, so
-    /// cloning the allocator (the first write to a chunk after a snapshot)
-    /// copies reference counts, and a write then copies only the list it
-    /// takes from or adds to.
-    free: [Option<Arc<Vec<u32>>>; MAX_BLOCK_LEN],
+    /// The free blocks by length, ascending: `(len, bases)` for each length
+    /// that has any. Each list is shared until written, so cloning the
+    /// allocator (the first write to a chunk after a snapshot) copies
+    /// reference counts, and a write then copies only the list it takes
+    /// from or adds to. Sparse, so a chunk with few free sizes (a built
+    /// chunk has only its page tails) does not hold a slot for every one of
+    /// the `MAX_BLOCK_LEN` sizes.
+    free: Vec<(u32, Arc<Vec<u32>>)>,
     live_words: usize,
     free_words: usize,
-}
-
-impl Default for WordBlocks {
-    fn default() -> Self {
-        Self {
-            end: 0,
-            free: std::array::from_fn(|_| None),
-            live_words: 0,
-            free_words: 0,
-        }
-    }
 }
 
 impl WordBlocks {
@@ -45,10 +36,7 @@ impl WordBlocks {
             (1..=MAX_BLOCK_LEN).contains(&len),
             "a word block holds 1 to {MAX_BLOCK_LEN} words, not {len}"
         );
-        let base = match self.free[len - 1]
-            .as_mut()
-            .and_then(|v| Arc::make_mut(v).pop())
-        {
+        let base = match self.take_free(len) {
             Some(base) => {
                 self.free_words -= len;
                 base
@@ -57,6 +45,20 @@ impl WordBlocks {
         };
         self.live_words += len;
         base
+    }
+
+    /// A free block of exactly `len` words, if there is one; the last freed
+    /// first. A length whose list empties keeps its entry (and the list's
+    /// allocation) for the next block of that length.
+    fn take_free(&mut self, len: usize) -> Option<u32> {
+        let at = self
+            .free
+            .binary_search_by_key(&(len as u32), |&(l, _)| l)
+            .ok()?;
+        if self.free[at].1.is_empty() {
+            return None;
+        }
+        Arc::make_mut(&mut self.free[at].1).pop()
     }
 
     /// Returns a block for reuse. Its page is not written.
@@ -71,7 +73,10 @@ impl WordBlocks {
     }
 
     fn push_free(&mut self, len: usize, base: u32) {
-        Arc::make_mut(self.free[len - 1].get_or_insert_with(Default::default)).push(base);
+        match self.free.binary_search_by_key(&(len as u32), |&(l, _)| l) {
+            Ok(at) => Arc::make_mut(&mut self.free[at].1).push(base),
+            Err(at) => self.free.insert(at, (len as u32, Arc::new(vec![base]))),
+        }
     }
 
     /// One past the highest word ever handed out.
@@ -112,7 +117,7 @@ impl WordBlocks {
 mod tests {
     use super::*;
 
-    const PAGE: usize = 256;
+    const PAGE: usize = 512;
 
     fn arena() -> (WordBlocks, Pages<u32, PAGE>) {
         (WordBlocks::default(), Pages::default())
@@ -148,17 +153,17 @@ mod tests {
     #[test]
     fn blocks_never_straddle_a_page_and_the_rest_is_recycled() {
         let (mut blocks, mut pages) = arena();
-        let bases: Vec<u32> = (0..5).map(|_| blocks.alloc(60, &mut pages)).collect();
-        assert_eq!(bases[..4], [0, 60, 120, 180]);
+        let bases: Vec<u32> = (0..5).map(|_| blocks.alloc(120, &mut pages)).collect();
+        assert_eq!(bases[..4], [0, 120, 240, 360]);
         assert_eq!(
             bases[4], PAGE as u32,
             "the fifth block starts the next page"
         );
         assert_eq!(pages.page_count(), 2);
-        assert_eq!(blocks.free_words(), 16);
+        assert_eq!(blocks.free_words(), 32);
         assert_eq!(
-            blocks.alloc(16, &mut pages),
-            240,
+            blocks.alloc(32, &mut pages),
+            480,
             "the page's tail is reused"
         );
         assert_eq!(blocks.free_words(), 0);
@@ -194,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "1 to 197 words")]
+    #[should_panic(expected = "1 to 327 words")]
     fn oversized_blocks_are_refused() {
         let (mut blocks, mut pages) = arena();
         blocks.alloc(MAX_BLOCK_LEN + 1, &mut pages);
