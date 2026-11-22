@@ -206,10 +206,13 @@ impl NodeSpace {
     }
 }
 
-/// Brick ids: indices into the brick table. Lowest free id first.
+/// Brick ids: indices into the brick table. The most recently freed id
+/// first, then the lowest never used, so ids stay below the most bricks ever
+/// resident at once ([`IdSpace::high_water`]).
 pub struct IdSpace {
     free: Vec<u32>,
     capacity: u32,
+    high: u32,
 }
 
 impl IdSpace {
@@ -217,11 +220,20 @@ impl IdSpace {
         Self {
             free: (0..capacity).rev().collect(),
             capacity,
+            high: 0,
         }
     }
 
     pub fn allocate(&mut self) -> Option<u32> {
-        self.free.pop()
+        let id = self.free.pop()?;
+        self.high = self.high.max(id + 1);
+        Some(id)
+    }
+
+    /// One more than the largest id ever handed out: every id in use, and
+    /// every table entry ever written by an allocation, is below it.
+    pub fn high_water(&self) -> u32 {
+        self.high
     }
 
     pub fn free(&mut self, id: u32) {
@@ -240,6 +252,22 @@ impl IdSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_reuse_freed_ones_and_track_the_high_water() {
+        let mut ids = IdSpace::new(8);
+        assert_eq!(ids.high_water(), 0);
+        let a: Vec<u32> = (0..3).map(|_| ids.allocate().unwrap()).collect();
+        assert_eq!(a, vec![0, 1, 2]);
+        assert_eq!(ids.high_water(), 3);
+        ids.free(1);
+        assert_eq!(ids.allocate(), Some(1), "a freed id comes back first");
+        assert_eq!(ids.high_water(), 3);
+        ids.free(0);
+        ids.free(2);
+        assert_eq!(ids.in_use(), 1);
+        assert_eq!(ids.high_water(), 3, "the high water never falls");
+    }
 
     #[test]
     fn small_blocks_fill_a_segment_completely() {

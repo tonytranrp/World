@@ -479,7 +479,9 @@ pub fn run_brick_cache(
             frame: state.frame,
             min_age: config.0.min_evict_age_frames,
             target,
-            id_count: layout.brick_ids,
+            // Ids at or above the high water were never handed out: their
+            // table entries are free, and the pass would skip them anyway.
+            id_count: state.residency.brick_id_high_water().min(layout.brick_ids),
             capacity: layout.victim_capacity,
             _pad: [0; 3],
         };
