@@ -128,10 +128,8 @@ pub struct MemoryBreakdown {
     /// Child words of level-2-and-up nodes, 4 bytes each.
     pub child_words: usize,
     /// Leaves that are full and one material but not their brick's default
-    /// (a 16-bit half each, decision 0033).
+    /// (one 4-byte word each, decision 0021).
     pub full_records: usize,
-    /// Words holding those halves, two a word in each brick.
-    pub full_words: usize,
     /// Partial leaves of their brick's default material stored as a leaf
     /// mask alone (8 bytes each, decision 0025).
     pub default_partial_leaves: usize,
@@ -160,7 +158,7 @@ impl MemoryBreakdown {
             + 12 * self.bricks
             + 8 * self.long_headers
             + 4 * self.child_words
-            + 4 * self.full_words
+            + 4 * self.full_records
             + 8 * self.default_partial_leaves
             + 12 * (self.single_records + self.palette_records)
             + 20 * self.pair_leaves
@@ -674,7 +672,6 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
         out.bricks += 1;
         out.long_headers += usize::from(header.has_full_mask());
         out.pair_headers += usize::from(header.pairs != 0);
-        out.full_words += header.half_words();
         out.default_leaves += header.default_full().count_ones() as usize;
         for (slot, leaf) in b.children() {
             match leaf {

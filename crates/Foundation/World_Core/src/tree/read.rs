@@ -510,11 +510,10 @@ impl<'a> BranchRef<'a> {
         } else {
             BrickHeader::default()
         };
-        let mut at = header.leaves_start();
-        let mut half = 2 * header.len();
+        let mut at = header.len();
         slots(self.mask).enumerate().map(move |(k, slot)| {
             let child = if branch.level == 1 {
-                branch.stored_leaf(header, &mut at, &mut half, slot)
+                branch.stored_leaf(header, &mut at, slot)
             } else {
                 branch.child_at(k)
             };
@@ -523,17 +522,9 @@ impl<'a> BranchRef<'a> {
     }
 
     /// Leaf `slot` of a brick with `header`, whose stored words start at
-    /// `at` and, for a full leaf of another material, whose half is `half`
-    /// (counted in halves from the block start); each moves past what the
-    /// leaf uses.
+    /// `at`, which moves past them.
     #[inline]
-    fn stored_leaf(
-        &self,
-        header: BrickHeader,
-        at: &mut usize,
-        half: &mut usize,
-        slot: u32,
-    ) -> NodeRef<'a> {
+    fn stored_leaf(&self, header: BrickHeader, at: &mut usize, slot: u32) -> NodeRef<'a> {
         let b = bit(slot);
         let block = self.block;
         let mask_at = |i: usize| u64::from(block[i]) | u64::from(block[i + 1]) << 32;
@@ -541,9 +532,8 @@ impl<'a> BranchRef<'a> {
             return NodeRef::Uniform(header.default);
         }
         if header.full & b != 0 {
-            let word = block[*half / 2] >> (16 * (*half % 2));
-            *half += 1;
-            return NodeRef::Uniform(MaterialId(word as u16));
+            *at += 1;
+            return NodeRef::Uniform(MaterialId(block[*at - 1] as u16));
         }
         if header.defaults & b != 0 {
             *at += 2;
@@ -580,13 +570,14 @@ impl<'a> BranchRef<'a> {
         if default_full != 0 {
             each(header.default, TREE_FANOUT * default_full.count_ones());
         }
-        for (k, _) in slots(header.other_full()).enumerate() {
-            let word = self.block[header.len() + k / 2];
-            each(MaterialId((word >> (16 * (k % 2))) as u16), TREE_FANOUT);
-        }
-        let mut at = header.leaves_start();
-        for slot in slots(self.mask & !header.full) {
+        let mut at = header.len();
+        for slot in slots(self.mask & !default_full) {
             let b = bit(slot);
+            if header.full & b != 0 {
+                each(MaterialId(self.block[at] as u16), TREE_FANOUT);
+                at += 1;
+                continue;
+            }
             if header.defaults & b != 0 {
                 let mask = u64::from(self.block[at]) | u64::from(self.block[at + 1]) << 32;
                 each(header.default, mask.count_ones());
@@ -983,10 +974,9 @@ pub(crate) fn step<const UNLOADED: bool, const BRICK: bool>(
 /// Words of a brick header with the full mask and no pair mask.
 const BRICK_FULL_HEADER_WORDS: usize = BRICK_HEADER_WORDS + 2;
 
-/// [`step`] in a brick with a full mask (decisions 0025, 0031 and 0033):
-/// leaves of the default material (full, or partial with a leaf mask),
-/// other full leaves (a half each after the header), inline two-material
-/// leaves and records.
+/// [`step`] in a brick with a full mask (decisions 0025 and 0031): leaves
+/// of the default material (full, or partial with a leaf mask), other full
+/// leaves (one word), inline two-material leaves and records.
 #[inline(always)]
 fn brick_step(
     storage: &mut StorageReader<'_>,
@@ -1005,29 +995,19 @@ fn brick_step(
     if defaults & full & b != 0 {
         return Step::Filled(default);
     }
-    let mut head_len = BRICK_FULL_HEADER_WORDS;
-    let mut pairs = 0;
+    let mut at =
+        BRICK_FULL_HEADER_WORDS + rank(mask & !defaults, slot) + 2 * rank(mask & !full, slot);
     if info & BRICK_PAIR_MASK != 0 {
         let p = storage.block(base + BRICK_FULL_HEADER_WORDS as u32, 2);
-        pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
-        head_len += 2;
+        let pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
+        at += 2 + 2 * rank(pairs, slot);
+        if pairs & b != 0 {
+            return Step::Pair(base + at as u32);
+        }
     }
-    let others = full & !defaults;
-    if others & b != 0 {
-        // A full leaf of another material: a half after the header.
-        let k = rank(others, slot);
-        let word = storage.word(base + (head_len + k / 2) as u32);
-        return Step::Filled(MaterialId((word >> (16 * (k % 2))) as u16));
-    }
-    let partial = mask & !full;
-    let at = base
-        + (head_len
-            + (others.count_ones() as usize).div_ceil(2)
-            + 2 * rank(partial, slot)
-            + rank(partial & !defaults, slot)
-            + 2 * rank(pairs, slot)) as u32;
-    if pairs & b != 0 {
-        return Step::Pair(at);
+    let at = base + at as u32;
+    if full & b != 0 {
+        return Step::Filled(MaterialId(storage.word(at) as u16));
     }
     if defaults & b == 0 {
         return Step::Record(at);
