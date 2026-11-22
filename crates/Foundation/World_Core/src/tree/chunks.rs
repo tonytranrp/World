@@ -137,13 +137,13 @@ pub struct MemoryBreakdown {
     pub default_partial_leaves: usize,
     /// Leaf records of one material with some air (12 bytes each).
     pub single_records: usize,
-    /// Leaf records with a palette of three or more materials (12 bytes
-    /// each, plus their block).
+    /// Leaves with a palette of three or more materials (20 bytes each in
+    /// their brick's mixed mask, decision 0035, plus their block).
     pub palette_records: usize,
     /// Leaves of two materials stored inline in their brick (20 bytes each,
     /// decision 0031).
     pub pair_leaves: usize,
-    /// Bricks whose header also holds the pair mask: 8 more bytes.
+    /// Bricks whose header also holds the mixed mask: 8 more bytes.
     pub pair_headers: usize,
     /// Words of palette blocks, by index width 1, 2, 4 and 8 bits.
     pub palette_words: [usize; 4],
@@ -162,8 +162,8 @@ impl MemoryBreakdown {
             + 4 * self.child_words
             + 4 * self.full_words
             + 8 * self.default_partial_leaves
-            + 12 * (self.single_records + self.palette_records)
-            + 20 * self.pair_leaves
+            + 12 * self.single_records
+            + 20 * (self.pair_leaves + self.palette_records)
             + 8 * self.pair_headers
             + 4 * self.palette_words.iter().sum::<usize>()
     }
@@ -683,7 +683,7 @@ fn tally(node: NodeRef<'_>, out: &mut MemoryBreakdown) {
                 NodeRef::Leaf(_) if header.defaults & (1 << slot) != 0 => {
                     out.default_partial_leaves += 1;
                 }
-                NodeRef::Leaf(_) if header.pairs & (1 << slot) != 0 => out.pair_leaves += 1,
+                NodeRef::Leaf(l) if l.index_bits() == 1 => out.pair_leaves += 1,
                 NodeRef::Leaf(l) => match l.index_bits() {
                     0 => out.single_records += 1,
                     bits => {

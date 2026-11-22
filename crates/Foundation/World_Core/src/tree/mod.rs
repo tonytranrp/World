@@ -50,7 +50,7 @@ use alloc::Storage;
 use forest::{ChunkKeys, ChunkTable, Forest};
 pub(crate) use mutate::Builder;
 use mutate::{LocalBox, LocalEdit};
-use node::{Child, path_key};
+use node::Child;
 use read::TreeView;
 
 use crate::consts::{TREE_DEPTH, WORLD_MIN_VOXEL};
@@ -118,7 +118,7 @@ impl VoxelTree {
         let edit = LocalEdit { local, material };
         // The write walks the voxel's path anyway: one that meets an unloaded
         // region is refused there, before anything changed.
-        let refused = mutate::set_voxels(&mut self.forest, &mut self.root, &[edit], &mut |_, _| {
+        let refused = mutate::set_voxels(&mut self.forest, &mut self.root, &[edit], &mut |_| {
             changed = true;
         });
         if refused {
@@ -160,27 +160,8 @@ impl VoxelTree {
     /// so every node on its paths is rebuilt once, however many edits fall
     /// under it.
     pub fn apply(&mut self, edits: &[Edit]) -> Result<DirtyBricks, EditError> {
-        let mut sorted = Vec::with_capacity(edits.len());
-        for edit in edits {
-            let pos = edit.pos;
-            let local = path::world_local(pos).ok_or(EditError::OutOfWorld { pos })?;
-            let edit = LocalEdit {
-                local,
-                material: edit.material,
-            };
-            sorted.push((path_key(local, TREE_DEPTH), edit));
-        }
-        // A stable sort keeps the batch order among edits of one voxel; only
-        // the last of them decides the voxel's final material.
-        sorted.sort_by_key(|&(key, _)| key);
-        sorted.dedup_by(|later, kept| {
-            let same = later.0 == kept.0;
-            if same {
-                kept.1 = later.1;
-            }
-            same
-        });
-        let edits: Vec<LocalEdit> = sorted.into_iter().map(|(_, edit)| edit).collect();
+        // In tree order, one edit per voxel: the batch's last for it.
+        let edits = mutate::tree_order(edits)?;
 
         // Tree order keeps each chunk's edits together, so residency is
         // checked once per chunk.
@@ -200,13 +181,12 @@ impl VoxelTree {
         // Each voxel is written once with its final material, so a change is
         // a net change of the batch.
         let mut bricks = Vec::new();
-        let refused =
-            mutate::set_voxels(&mut self.forest, &mut self.root, &edits, &mut |edit, _| {
-                let brick = path::from_world_local(edit.local).brick();
-                if bricks.last() != Some(&brick) {
-                    bricks.push(brick);
-                }
-            });
+        let refused = mutate::set_voxels(&mut self.forest, &mut self.root, &edits, &mut |edit| {
+            let brick = path::from_world_local(edit.local).brick();
+            if bricks.last() != Some(&brick) {
+                bricks.push(brick);
+            }
+        });
         debug_assert!(!refused, "residency was checked above");
         Ok(DirtyBricks::from_unsorted(bricks))
     }
