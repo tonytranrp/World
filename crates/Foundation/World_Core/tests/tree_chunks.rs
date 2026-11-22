@@ -32,7 +32,7 @@ fn breakdown_words(b: &MemoryBreakdown) -> usize {
     b.child_words
         + 3 * b.bricks
         + 2 * b.long_headers
-        + b.full_records
+        + b.full_words
         + 2 * b.default_partial_leaves
         + 3 * (b.single_records + b.palette_records)
         + 5 * b.pair_leaves
