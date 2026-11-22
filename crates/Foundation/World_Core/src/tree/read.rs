@@ -1083,7 +1083,9 @@ pub(crate) fn brick_voxel(
     if node.mask & b == 0 {
         return MaterialId::AIR;
     }
-    if node.info & BRICK_FULL_MASK == 0 {
+    // Where the leaf's words start, and whether it is a mixed leaf; the
+    // leaf is read once, after the branches, so its code is inlined once.
+    let (at, mixed) = if node.info & BRICK_FULL_MASK == 0 {
         // No full mask: a full leaf is of the default, every other leaf a
         // record or (with a mixed mask) a mixed leaf. The default costs what
         // it did before decision 0021; the mixed mask is read only past it.
@@ -1094,55 +1096,57 @@ pub(crate) fn brick_voxel(
         }
         let records = RECORD_WORDS * rank(node.mask & !defaults, slot);
         if node.info & BRICK_PAIR_MASK == 0 {
-            let at = node.base + (BRICK_HEADER_WORDS + records) as u32;
-            return record_voxel(storage, at, slot_at(local, 0));
-        }
-        let p = storage.block(node.base + BRICK_HEADER_WORDS as u32, 2);
-        let pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
-        let at = node.base + (BRICK_HEADER_WORDS + 2 + records + 2 * rank(pairs, slot)) as u32;
-        return if pairs & b != 0 {
-            pair_voxel(storage, at, slot_at(local, 0))
+            (node.base + (BRICK_HEADER_WORDS + records) as u32, false)
         } else {
-            record_voxel(storage, at, slot_at(local, 0))
-        };
-    }
-    // A full mask: `brick_step`'s cases, each ending in the material.
-    let base = node.base;
-    let head = storage.block(base, BRICK_FULL_HEADER_WORDS);
-    let defaults = u64::from(head[0]) | u64::from(head[1]) << 32;
-    let full = u64::from(head[3]) | u64::from(head[4]) << 32;
-    let default = MaterialId(head[2] as u16);
-    if defaults & full & b != 0 {
-        return default;
-    }
-    let others = full & !defaults;
-    if others & b != 0 {
-        let k = rank(others, slot);
-        let halves = node.block_len(1) - (others.count_ones() as usize).div_ceil(2);
-        let word = storage.word(base + (halves + k / 2) as u32);
-        return MaterialId((word >> (16 * (k % 2))) as u16);
-    }
-    let partial = node.mask & !full;
-    let mut at = base
-        + (BRICK_FULL_HEADER_WORDS + 2 * rank(partial, slot) + rank(partial & !defaults, slot))
-            as u32;
-    if node.info & BRICK_PAIR_MASK != 0 {
-        let p = storage.block(base + BRICK_FULL_HEADER_WORDS as u32, 2);
-        let pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
-        at += 2 + 2 * rank(pairs, slot) as u32;
-        if pairs & b != 0 {
-            return pair_voxel(storage, at, slot_at(local, 0));
+            let p = storage.block(node.base + BRICK_HEADER_WORDS as u32, 2);
+            let pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
+            let at = BRICK_HEADER_WORDS + 2 + records + 2 * rank(pairs, slot);
+            (node.base + at as u32, pairs & b != 0)
         }
-    }
-    if defaults & b == 0 {
-        return record_voxel(storage, at, slot_at(local, 0));
-    }
-    // A default partial leaf: its leaf mask alone.
-    let words = storage.block(at, 2);
-    let leaf_mask = u64::from(words[0]) | u64::from(words[1]) << 32;
-    if leaf_mask & bit(slot_at(local, 0)) != 0 {
-        default
     } else {
-        MaterialId::AIR
+        // A full mask: `brick_step`'s cases.
+        let base = node.base;
+        let head = storage.block(base, BRICK_FULL_HEADER_WORDS);
+        let defaults = u64::from(head[0]) | u64::from(head[1]) << 32;
+        let full = u64::from(head[3]) | u64::from(head[4]) << 32;
+        let default = MaterialId(head[2] as u16);
+        if defaults & full & b != 0 {
+            return default;
+        }
+        let others = full & !defaults;
+        if others & b != 0 {
+            let k = rank(others, slot);
+            let halves = node.block_len(1) - (others.count_ones() as usize).div_ceil(2);
+            let word = storage.word(base + (halves + k / 2) as u32);
+            return MaterialId((word >> (16 * (k % 2))) as u16);
+        }
+        let partial = node.mask & !full;
+        let mut at = base
+            + (BRICK_FULL_HEADER_WORDS + 2 * rank(partial, slot) + rank(partial & !defaults, slot))
+                as u32;
+        let mut mixed = false;
+        if node.info & BRICK_PAIR_MASK != 0 {
+            let p = storage.block(base + BRICK_FULL_HEADER_WORDS as u32, 2);
+            let pairs = u64::from(p[0]) | u64::from(p[1]) << 32;
+            at += 2 + 2 * rank(pairs, slot) as u32;
+            mixed = pairs & b != 0;
+        }
+        // (A mixed leaf is never in the default mask.)
+        if defaults & b != 0 {
+            // A default partial leaf: its leaf mask alone.
+            let words = storage.block(at, 2);
+            let leaf_mask = u64::from(words[0]) | u64::from(words[1]) << 32;
+            return if leaf_mask & bit(slot_at(local, 0)) != 0 {
+                default
+            } else {
+                MaterialId::AIR
+            };
+        }
+        (at, mixed)
+    };
+    if mixed {
+        pair_voxel(storage, at, slot_at(local, 0))
+    } else {
+        record_voxel(storage, at, slot_at(local, 0))
     }
 }

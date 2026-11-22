@@ -183,6 +183,18 @@ still has to be run (the lead offered a throwaway PR).
   21,886 misses (main 22,340), 18,937 free words instead of 37,862 (main
   21,919) and 10 pages instead of 15 (main 11). Built chunks, which free
   nothing, do not change.
+- **Gate, third run**: `get_10k` +4.4% (passes), but `set_1k/empty_tree`
+  +5.4% and `snapshot_then_edit` +5.1%: the allocator's search. Splitting
+  a page's long tail cut it into ever new lengths, each a new free list
+  (two allocations), and splitting from lists a snapshot still shares
+  copied them. Now a split takes only a block at most twice the request
+  and never from a shared list, the lowest-first search covers lists of
+  up to four, `Store::realloc_block` makes the allocator unique once, and
+  the free lists stay indexed by length. The scene keeps 22,005 page
+  misses (main 22,340). Point lookups read the leaf once after the brick
+  branches (one inlined record read and one mixed read instead of three
+  each), so `TreeView::lookup` shrank from 1,026 to 858 instructions of
+  code (main 715).
 - Next: big craters are now about half sorting and half tree writes; a
   ball fill that replaces covered nodes without listing their voxels
   (like `fill_box`) would make a crater cost its surface instead of its

@@ -188,13 +188,16 @@ impl Store {
     /// last and the new length fits its page, otherwise a new block, the old
     /// one freed.
     pub fn realloc_block(&mut self, base: u32, old_len: usize, words: &[u32]) -> u32 {
-        if Arc::make_mut(&mut self.blocks).resize_last::<WORD_PAGE_LEN>(base, old_len, words.len())
-        {
-            self.write_block(base, words);
-            return base;
-        }
-        let new = self.alloc_block(words);
-        self.free_block(base, old_len);
+        // One copy-on-write check of the allocator for the three steps.
+        let blocks = Arc::make_mut(&mut self.blocks);
+        let new = if blocks.resize_last::<WORD_PAGE_LEN>(base, old_len, words.len()) {
+            base
+        } else {
+            let new = blocks.alloc(words.len(), &mut self.storage.words);
+            blocks.free(base, old_len);
+            new
+        };
+        self.write_block(new, words);
         new
     }
 
