@@ -223,12 +223,13 @@ fn compare_scene<S: VoxelSource>(source: &S, bounds: Bounds, label: &str) {
 #[test]
 fn gpu_trace_matches_the_brute_force_dda_on_a_world_tree() {
     let (tree, bounds) = tree_scene();
-    // The scene covers every brick and palette layout (decisions 0021 and
-    // 0025): long headers, other full leaves, default partial leaves, and
-    // palette blocks of two materials (one bit) and of three (two bits).
+    // The scene covers every brick and palette layout (decisions 0021, 0025
+    // and 0031): long headers, other full leaves, default partial leaves,
+    // two-material leaves stored inline in their brick, and palette blocks
+    // of three materials (two bits).
     let b = tree.memory_breakdown();
     assert!(b.long_headers > 0 && b.full_records > 0 && b.default_partial_leaves > 0);
-    assert!(b.palette_words[0] > 0 && b.palette_words[1] > 0, "{b:?}");
+    assert!(b.pair_leaves > 0 && b.palette_words[1] > 0, "{b:?}");
     compare_scene(&tree.snapshot(), bounds, "world tree");
 }
 
