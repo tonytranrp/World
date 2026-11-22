@@ -185,9 +185,9 @@ impl Walk {
             let full = count(&|n| uniform(n).is_some());
             let default_full = count(&|n| default.is_some() && uniform(n) == default);
             let masks = count(&|n| default.is_some() && single(n) == default);
-            // Two-material leaves are five words inline, after a pair mask
-            // in the header (decision 0031).
-            let pairs = count(&|n| n.kind() == NodeKind::Leaf && n.palette().as_slice().len() == 2);
+            // Leaves of two or more materials are five words, after a mixed
+            // mask in the header (decisions 0031 and 0035).
+            let pairs = count(&|n| n.kind() == NodeKind::Leaf && n.palette().as_slice().len() >= 2);
             let others = full - default_full;
             let header = 3 + if others + masks > 0 { 2 } else { 0 } + if pairs > 0 { 2 } else { 0 };
             // Other full leaves are 16-bit halves, two a word (decision 0033).

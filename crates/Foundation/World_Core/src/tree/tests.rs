@@ -89,12 +89,12 @@ fn assert_canonical(tree: &impl TreeRead) -> (usize, usize, usize) {
                             matches!(c, NodeRef::Uniform(x) if *x == m) || single(c) == Some(m)
                         })
                     });
-                    // Two-material leaves are inline, after a pair mask
-                    // (decision 0031).
+                    // Leaves of two or more materials are five words, after
+                    // a mixed mask (decisions 0031 and 0035).
                     let pairs = mask_of(&|c| {
-                        matches!(c, NodeRef::Leaf(_)) && c.palette().as_slice().len() == 2
+                        matches!(c, NodeRef::Leaf(_)) && c.palette().as_slice().len() >= 2
                     });
-                    assert_eq!(header.pairs, pairs, "every two-material leaf");
+                    assert_eq!(header.pairs, pairs, "every leaf of several materials");
                     match best {
                         Some(m) => assert_eq!(header.default, m, "the most common full leaf"),
                         None => assert_eq!(
@@ -680,6 +680,79 @@ fn apply_reports_exactly_the_bricks_whose_content_changed() {
     assert_eq!(tree.get(pos(0, -16, 0)), STONE);
     assert_eq!(tree.get(pos(16, 0, 0)), MaterialId::AIR);
     assert_sound(&tree);
+}
+
+#[test]
+fn batches_that_cover_whole_bricks_and_nodes_replace_them_and_report_their_bricks() {
+    // Mixed content over a 64^3 node at the origin and its neighbours: a
+    // uniform corner, scattered voxels, a brick already of the fill.
+    let build = || {
+        let mut tree = VoxelTree::new();
+        tree.fill_box(cube([0, 0, 0], 32), STONE).unwrap();
+        tree.fill_box(cube([48, 0, 0], 16), DIRT).unwrap();
+        for i in 0..200 {
+            let p = pos(i * 7 % 70 - 3, i * 13 % 66 - 1, i * 29 % 67 - 2);
+            tree.set(p, MaterialId(1 + (i % 5) as u16)).unwrap();
+        }
+        tree
+    };
+    let voxels = |min: [i32; 3], edge: i32, m: MaterialId| {
+        let mut out = Vec::new();
+        for z in 0..edge {
+            for y in 0..edge {
+                for x in 0..edge {
+                    out.push(Edit::new(pos(min[0] + x, min[1] + y, min[2] + z), m));
+                }
+            }
+        }
+        out
+    };
+    for (batch, fills) in [
+        // The whole 64^3 node, as air: a level-2 child replaced.
+        (
+            voxels([0, 0, 0], 64, MaterialId::AIR),
+            vec![(cube([0, 0, 0], 64), MaterialId::AIR)],
+        ),
+        // Whole bricks of dirt, one of them dirt already, and an unaligned
+        // box that covers no brick.
+        (
+            [
+                voxels([16, 16, 0], 16, DIRT),
+                voxels([48, 0, 0], 16, DIRT),
+                voxels([3, 5, 7], 9, DIRT),
+            ]
+            .concat(),
+            vec![
+                (cube([16, 16, 0], 16), DIRT),
+                (cube([48, 0, 0], 16), DIRT),
+                (cube([3, 5, 7], 9), DIRT),
+            ],
+        ),
+    ] {
+        let before = build();
+        let mut edited = build();
+        let mut want = build();
+        for (region, m) in fills {
+            want.fill_box(region, m).unwrap();
+        }
+        let dirty = edited.apply(&batch).unwrap();
+        assert!(same_content(&edited, &want));
+        assert_sound(&edited);
+        // Exactly the bricks whose voxels differ.
+        let mut changed = std::collections::BTreeSet::new();
+        for z in -16..80 {
+            for y in -16..80 {
+                for x in -16..80 {
+                    let p = pos(x, y, z);
+                    if before.get(p) != edited.get(p) {
+                        changed.insert(p.brick());
+                    }
+                }
+            }
+        }
+        let reported: std::collections::BTreeSet<_> = dirty.as_slice().iter().copied().collect();
+        assert_eq!(reported, changed);
+    }
 }
 
 // Property test against a dense model.

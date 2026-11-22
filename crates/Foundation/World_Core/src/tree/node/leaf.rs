@@ -55,7 +55,14 @@ impl Record {
         self.indices != 0
     }
 
-    /// Reads a stored two-material leaf from its [`PAIR_WORDS`] words.
+    /// Whether this is a leaf of two or more materials, which a brick
+    /// stores in [`PAIR_WORDS`] words, in its mixed mask (decision 0035).
+    pub const fn is_mixed(self) -> bool {
+        self.mask != 0 && (self.indices != 0 || self.payload & UNIFORM_BIT == 0)
+    }
+
+    /// Reads a stored leaf of the mixed mask from its [`PAIR_WORDS`] words:
+    /// a two-material leaf, or (zero indices) the record of a wider palette.
     pub fn read_pair(words: &[u32]) -> Self {
         Self::pair(
             u64::from(words[0]) | u64::from(words[1]) << 32,
@@ -64,9 +71,10 @@ impl Record {
         )
     }
 
-    /// The [`PAIR_WORDS`] stored words of a two-material leaf: its mask,
-    /// then its palette block as the GPU lays it out (the palette word, then
-    /// the indices).
+    /// The [`PAIR_WORDS`] stored words of a mixed leaf: its mask, then a
+    /// two-material leaf's palette block as the GPU lays it out (the palette
+    /// word, then the indices), or a wider palette's block offset and two
+    /// zero words.
     pub const fn pair_words(self) -> [u32; PAIR_WORDS] {
         [
             self.mask as u32,

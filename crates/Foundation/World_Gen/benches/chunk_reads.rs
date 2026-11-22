@@ -8,6 +8,7 @@
 //! Run with `cargo bench -p world_gen --bench chunk_reads`.
 
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use world_core::tree::{CHUNK_LEVEL, NodeRef, NodeView};
@@ -231,5 +232,92 @@ fn edits(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, reads, edits);
+/// Every voxel of the ball of `radius` around `centre`.
+fn ball(centre: VoxelPos, radius: i32) -> Vec<VoxelPos> {
+    let mut voxels = Vec::new();
+    for z in -radius..=radius {
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                if x * x + y * y + z * z <= radius * radius {
+                    voxels.push(VoxelPos::new(centre.x + x, centre.y + y, centre.z + z));
+                }
+            }
+        }
+    }
+    voxels
+}
+
+/// The destruction pattern: craters (a ball of air centred on the surface,
+/// one `apply`, radius 16 to 128 voxels, a quarter metre to two metres)
+/// and a tunnel walk (24 balls of radius 24, each its own `apply` as a dig
+/// per frame, stepping 12 voxels into the ground). Only the carving is
+/// timed; the restore that follows each round (one `apply` of the old
+/// materials) is not. Throughput counts the voxels the edits name.
+fn destruction(c: &mut Criterion) {
+    let mut scene = Scene::new();
+    let mut rng = Rng(0x0DDB_A11C_AFE5_EED5);
+    let surface = |scene: &Scene, rng: &mut Rng| {
+        let p = scene.near_surface(rng);
+        let columns = scene
+            .footprints
+            .iter()
+            .find(|c| {
+                let min = c.chunk().min_voxel();
+                (0..CHUNK_SIZE as i32).contains(&(p.x - min.x))
+                    && (0..CHUNK_SIZE as i32).contains(&(p.z - min.z))
+            })
+            .expect("a footprint holds the probe");
+        let min = columns.chunk().min_voxel();
+        let height = columns
+            .column((p.x - min.x) as u32, (p.z - min.z) as u32)
+            .expect("inside the footprint")
+            .height;
+        VoxelPos::new(p.x, height, p.z)
+    };
+    let mut cases: Vec<(String, Vec<Vec<VoxelPos>>)> = Vec::new();
+    for radius in [16, 32, 64, 128] {
+        let centre = surface(&scene, &mut rng);
+        cases.push((format!("crater_r{radius}"), vec![ball(centre, radius)]));
+    }
+    let start = surface(&scene, &mut rng);
+    let tunnel = (0..24)
+        .map(|i| VoxelPos::new(start.x + 12 * i, start.y - 6 * i, start.z + 4 * i))
+        .map(|centre| ball(centre, 24))
+        .collect();
+    cases.push(("tunnel_24_digs_r24".into(), tunnel));
+
+    let mut group = c.benchmark_group("destruction");
+    group.sample_size(10);
+    for (name, digs) in &cases {
+        // Overlapping digs name a voxel twice, with the same old material.
+        let restore: Vec<Edit> = digs
+            .iter()
+            .flatten()
+            .map(|&p| Edit::new(p, scene.tree.get(p)))
+            .collect();
+        let carves: Vec<Vec<Edit>> = digs
+            .iter()
+            .map(|d| d.iter().map(|&p| Edit::new(p, MaterialId::AIR)).collect())
+            .collect();
+        let voxels: usize = digs.iter().map(Vec::len).sum();
+        group.throughput(Throughput::Elements(voxels as u64));
+        group.bench_function(name.as_str(), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let started = Instant::now();
+                    for carve in &carves {
+                        black_box(scene.tree.apply(carve).unwrap());
+                    }
+                    total += started.elapsed();
+                    scene.tree.apply(&restore).unwrap();
+                }
+                total
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, reads, edits, destruction);
 criterion_main!(benches);

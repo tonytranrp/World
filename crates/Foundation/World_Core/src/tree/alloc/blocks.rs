@@ -16,14 +16,15 @@ use super::pages::Pages;
 pub(super) struct WordBlocks {
     /// One past the highest word ever handed out.
     end: u32,
-    /// The free blocks by length, ascending: `(len, bases)` for each length
-    /// that has any. Each list is shared until written, so cloning the
-    /// allocator (the first write to a chunk after a snapshot) copies
-    /// reference counts, and a write then copies only the list it takes
-    /// from or adds to. Sparse, so a chunk with few free sizes (a built
-    /// chunk has only its page tails) does not hold a slot for every one of
-    /// the `MAX_BLOCK_LEN` sizes.
-    free: Vec<(u32, Arc<Vec<u32>>)>,
+    /// `free[len - 1]` holds the bases of free blocks of `len` words, or is
+    /// `None` when there are none; lengths past the end have none. Each list
+    /// is shared until written, so cloning the allocator (the first write to
+    /// a chunk after a snapshot) copies reference counts, and a write then
+    /// copies only the list it takes from or adds to. Grown only as far as
+    /// the longest freed length, so a built chunk (whose only free blocks
+    /// are its page tails) does not hold a slot for each of the
+    /// `MAX_BLOCK_LEN` lengths, and a lookup is one index, not a search.
+    free: Vec<Option<Arc<Vec<u32>>>>,
     live_words: usize,
     free_words: usize,
 }
@@ -48,17 +49,14 @@ impl WordBlocks {
     }
 
     /// A free block of exactly `len` words, if there is one; the last freed
-    /// first. A length whose list empties keeps its entry (and the list's
+    /// first. A length whose list empties keeps its list (and the list's
     /// allocation) for the next block of that length.
     fn take_free(&mut self, len: usize) -> Option<u32> {
-        let at = self
-            .free
-            .binary_search_by_key(&(len as u32), |&(l, _)| l)
-            .ok()?;
-        if self.free[at].1.is_empty() {
+        let list = self.free.get_mut(len - 1)?.as_mut()?;
+        if list.is_empty() {
             return None;
         }
-        Arc::make_mut(&mut self.free[at].1).pop()
+        Arc::make_mut(list).pop()
     }
 
     /// Returns a block for reuse. Its page is not written.
@@ -73,10 +71,10 @@ impl WordBlocks {
     }
 
     fn push_free(&mut self, len: usize, base: u32) {
-        match self.free.binary_search_by_key(&(len as u32), |&(l, _)| l) {
-            Ok(at) => Arc::make_mut(&mut self.free[at].1).push(base),
-            Err(at) => self.free.insert(at, (len as u32, Arc::new(vec![base]))),
+        if self.free.len() < len {
+            self.free.resize(len, None);
         }
+        Arc::make_mut(self.free[len - 1].get_or_insert_with(Default::default)).push(base);
     }
 
     /// One past the highest word ever handed out.

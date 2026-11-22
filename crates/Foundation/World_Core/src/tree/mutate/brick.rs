@@ -28,7 +28,8 @@ impl Writer<'_> {
         let block = self.store().block(node.base, node.block_len(1));
         let header = BrickHeader::read(block, node.info);
         let mut records = [Record::AIR; TREE_FANOUT as usize];
-        let mut half = 2 * header.len();
+        // The halves end the block; the stored leaves follow the header.
+        let mut half = 2 * (block.len() - header.half_words());
         let mut at = header.leaves_start();
         for slot in slots(node.mask) {
             let b = bit(slot);
@@ -76,12 +77,12 @@ impl Writer<'_> {
     /// keeps the node canonical without repacking: the slot holds a partial
     /// leaf and `new` is a partial leaf stored the same way. A default
     /// partial leaf (a leaf mask) takes another default partial leaf, a
-    /// two-material leaf another two-material leaf, and a record any other
-    /// partial leaf but one of the default material, which would join the
-    /// default mask. Full single-material leaves decide the default and the
-    /// masks, and only they can make the node collapse, so those always
-    /// repack; a full leaf of several materials is an ordinary record (or a
-    /// pair). Returns whether it wrote.
+    /// mixed leaf (two or more materials, five words) another mixed leaf,
+    /// and a record another partial leaf of one material but the default,
+    /// which would join the default mask. Full single-material leaves decide
+    /// the default and the masks, and only they can make the node collapse,
+    /// so those always repack; a full leaf of several materials is a mixed
+    /// leaf like any other. Returns whether it wrote.
     pub(super) fn patch_record(&mut self, node: Node, slot: u32, new: Record) -> bool {
         if new.mask == 0 || new.uniform().is_some() || node.mask & bit(slot) == 0 {
             return false;
@@ -95,11 +96,11 @@ impl Writer<'_> {
         if default_partial != (new.material() == Some(header.default)) {
             return false;
         }
-        if (header.pairs & b != 0) != new.is_pair() {
+        if (header.pairs & b != 0) != new.is_mixed() {
             return false;
         }
         let at = node.base + header.record_offset(node.mask, slot) as u32;
-        if new.is_pair() {
+        if new.is_mixed() {
             self.store_mut().write_block(at, &new.pair_words());
             return true;
         }
@@ -107,6 +108,145 @@ impl Writer<'_> {
         let len = if default_partial { 2 } else { RECORD_WORDS };
         self.store_mut().write_block(at, &words[..len]);
         true
+    }
+
+    /// Stored level-1 node `node` with the leaves of `changes` (ascending
+    /// slots, each with its new canonical record) replaced, packed straight
+    /// from the stored block: the other leaves' words are copied as they
+    /// are, without decoding the 64 records and packing them again. Only
+    /// when the default material stays what it is and the node stays a
+    /// node; `None` otherwise, and the caller packs from every record.
+    ///
+    /// The default is the most common material among the full leaves, so it
+    /// stays when, after the changes, every full leaf is of the default and
+    /// there is one, or when no full leaf of the default went and none of
+    /// another material came (or there are no full leaves before or after).
+    /// Every unchanged leaf then keeps its kind, so its words stand.
+    pub(super) fn splice(
+        &self,
+        node: Node,
+        changes: &[(u32, Record)],
+    ) -> Option<Packed<MAX_BLOCK_LEN>> {
+        let block = self.store().block(node.base, node.block_len(1));
+        let old = BrickHeader::read(block, node.info);
+        let default = old.default;
+        let (mut mask, mut full, mut pairs) = (node.mask, old.full, old.pairs);
+        let (mut changed, mut default_full, mut other_new, mut partial_new) = (0, 0, 0, 0);
+        for &(slot, r) in changes {
+            let b = bit(slot);
+            changed |= b;
+            mask = if r.mask != 0 { mask | b } else { mask & !b };
+            pairs = if r.is_mixed() { pairs | b } else { pairs & !b };
+            match r.uniform() {
+                Some(m) => {
+                    full |= b;
+                    if m == default {
+                        default_full |= b;
+                    } else {
+                        other_new |= b;
+                    }
+                }
+                None => {
+                    full &= !b;
+                    if r.mask != 0 && r.material() == Some(default) {
+                        partial_new |= b;
+                    }
+                }
+            }
+        }
+        let default_full = (old.default_full() & !changed) | default_full;
+        let other = (old.other_full() & !changed) | other_new;
+        let stays = if full == 0 {
+            old.full == 0
+        } else if other == 0 {
+            default_full != 0
+        } else {
+            other_new == 0 && old.default_full() & !default_full == 0
+        };
+        // Air or one material collapses: the caller's pack says so.
+        if !stays || mask == 0 || (full == u64::MAX && other == 0) {
+            return None;
+        }
+        let partial = if default_full == 0 {
+            0
+        } else {
+            (old.defaults & !old.full & !changed) | partial_new
+        };
+        let header = BrickHeader {
+            defaults: default_full | partial,
+            default,
+            full,
+            pairs,
+        };
+        let mut words = [0; MAX_BLOCK_LEN];
+        let head = header.len();
+        words[..head].copy_from_slice(&header.words()[..head]);
+        // Both loops below visit slots in ascending order, as `changes` is.
+        let new_record = |next: &mut usize, slot: u32| {
+            while changes[*next].0 < slot {
+                *next += 1;
+            }
+            debug_assert_eq!(changes[*next].0, slot, "a changed slot has a record");
+            changes[*next].1
+        };
+        // The stored leaves, old and new, in slot order.
+        let mut at = old.leaves_start();
+        let mut len = header.leaves_start();
+        let mut next = 0;
+        for slot in slots((node.mask & !old.full) | (mask & !full)) {
+            let b = bit(slot);
+            let stored = if node.mask & !old.full & b == 0 {
+                0
+            } else if old.defaults & b != 0 {
+                2
+            } else if old.pairs & b != 0 {
+                PAIR_WORDS
+            } else {
+                RECORD_WORDS
+            };
+            if mask & !full & b != 0 {
+                if changed & b == 0 {
+                    words[len..len + stored].copy_from_slice(&block[at..at + stored]);
+                    len += stored;
+                } else {
+                    let r = new_record(&mut next, slot);
+                    if partial & b != 0 {
+                        words[len] = r.mask as u32;
+                        words[len + 1] = (r.mask >> 32) as u32;
+                        len += 2;
+                    } else if r.is_mixed() {
+                        words[len..len + PAIR_WORDS].copy_from_slice(&r.pair_words());
+                        len += PAIR_WORDS;
+                    } else {
+                        words[len..len + RECORD_WORDS].copy_from_slice(&r.words());
+                        len += RECORD_WORDS;
+                    }
+                }
+            }
+            at += stored;
+        }
+        debug_assert_eq!(
+            at + old.half_words(),
+            block.len(),
+            "the old leaves and halves fill the block"
+        );
+        // The halves of the other full leaves end the block.
+        let mut next = 0;
+        for (k, slot) in slots(other).enumerate() {
+            let m = if changed & bit(slot) != 0 {
+                new_record(&mut next, slot).payload & 0xFFFF
+            } else {
+                u32::from(old.half(block, slot).0)
+            };
+            words[len + k / 2] |= m << (16 * (k % 2));
+        }
+        len += header.half_words();
+        Some(Packed::Node(PackedNode::from_array(
+            mask,
+            header.info(len),
+            words,
+            len,
+        )))
     }
 
     /// The 64 voxels of a stored leaf.
@@ -193,14 +333,13 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
             continue;
         }
         mask |= bit(slot);
-        if r.indices != 0 {
+        if r.indices != 0 || r.payload & UNIFORM_BIT == 0 {
+            // Two or more materials (decision 0035).
             pairs |= bit(slot);
-        } else if r.payload & UNIFORM_BIT != 0 {
-            if r.mask == u64::MAX {
-                full |= bit(slot);
-            } else {
-                singles |= bit(slot);
-            }
+        } else if r.mask == u64::MAX {
+            full |= bit(slot);
+        } else {
+            singles |= bit(slot);
         }
     }
     if mask == 0 {
@@ -240,11 +379,6 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
     let mut words = [0; MAX_BLOCK_LEN];
     let head = header.len();
     words[..head].copy_from_slice(&header.words()[..head]);
-    // Other full leaves: their materials as halves, two a word (decision
-    // 0033).
-    for (k, slot) in slots(header.other_full()).enumerate() {
-        words[head + k / 2] |= (records[slot as usize].payload & 0xFFFF) << (16 * (k % 2));
-    }
     let mut len = header.leaves_start();
     for slot in slots(mask & !full) {
         let r = records[slot as usize];
@@ -261,6 +395,12 @@ pub(super) fn pack(records: &Records) -> Packed<MAX_BLOCK_LEN> {
             len += RECORD_WORDS;
         }
     }
+    // Other full leaves: their materials as halves, two a word, ending the
+    // block (decisions 0033 and 0035).
+    for (k, slot) in slots(header.other_full()).enumerate() {
+        words[len + k / 2] |= (records[slot as usize].payload & 0xFFFF) << (16 * (k % 2));
+    }
+    len += header.half_words();
     Packed::Node(PackedNode::from_array(mask, header.info(len), words, len))
 }
 
@@ -312,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_pack_as_three_word_records_in_slot_order() {
+    fn leaves_pack_as_records_and_wider_palettes_as_mixed_leaves_in_slot_order() {
         let mut records = [Record::AIR; 64];
         records[3] = Record::single(0b1010, MaterialId(9));
         records[40] = Record::filled(MaterialId(5));
@@ -322,10 +462,29 @@ mod tests {
         };
         assert_eq!(p.mask, bit(3) | bit(40) | bit(63));
         // The full leaf of 5 is the default: in the header, with no record.
-        assert_eq!(p.info, 9, "a header and two records");
+        // The leaf with a palette apart is five words: mask, offset, zeros.
+        assert_eq!(
+            p.info,
+            13 | crate::tree::node::BRICK_PAIR_MASK,
+            "a header with a mixed mask, a record and a mixed leaf"
+        );
         assert_eq!(
             p.words(),
-            [0, 1 << 8, 5, 0b1010, 0, UNIFORM_BIT | 9, 0, 1 << 8, 1234,]
+            [
+                0,
+                1 << 8,
+                5,
+                0,
+                1 << 31,
+                0b1010,
+                0,
+                UNIFORM_BIT | 9,
+                0,
+                1 << 8,
+                1234,
+                0,
+                0
+            ]
         );
     }
 

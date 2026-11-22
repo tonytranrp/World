@@ -81,31 +81,40 @@
 //!
 //! The header stores the full mask only when it differs from the default
 //! mask, that is when the brick has a full leaf of another material or a
-//! default partial leaf, and the pair mask only when it is not zero: the
-//! leaves of exactly two materials. Without either the header is three
-//! words and every stored leaf is a record, as before decision 0025.
+//! default partial leaf, and the *mixed mask* `P` (decision 0031 called it
+//! the pair mask) only when it is not zero: the leaves of two or more
+//! materials. Without either the header is three words and every stored
+//! leaf is a record, as before decision 0025.
 //!
-//! After the header come the materials of the full leaves of other
-//! materials, `O = B & !A`, as 16-bit halves in slot order, two a word, low
-//! half first (`ceil(popcount(O) / 2)` words, an odd count leaving the last
-//! high half zero; decision 0033). Then every other non-air leaf, in slot
-//! order, by its mask bits:
+//! After the header comes every non-air leaf outside `B`, in slot order, by
+//! its mask bits:
 //!
 //! | In `A` | In `B` | In `P` | Leaf                     | Words                     |
 //! | ------ | ------ | ------ | ------------------------ | ------------------------- |
 //! | yes    | yes    | no     | full of the default      | none                      |
-//! | no     | yes    | no     | full of another material | none here: a half above   |
+//! | no     | yes    | no     | full of another material | none here: a half below   |
 //! | yes    | no     | no     | default partial          | its leaf mask, lo and hi  |
-//! | no     | no     | yes    | two materials            | [`PAIR_WORDS`]: leaf mask, palette word, indices lo and hi |
-//! | no     | no     | no     | anything else            | a [`RECORD_WORDS`]-word record |
+//! | no     | no     | yes    | two or more materials    | [`PAIR_WORDS`]: leaf mask, then three words below |
+//! | no     | no     | no     | one material and air     | a [`RECORD_WORDS`]-word record |
 //!
-//! So a leaf outside `B` is `2 + [not in A] + 2 * [in P]` words, and stored
-//! leaf `i` starts at `base + header + ceil(popcount(O) / 2) + 2 *
-//! rank(mask & !B, i) + rank(mask & !A & !B, i) + 2 * rank(P, i)`; the
-//! material of a leaf in `O` is half `rank(O, i)`. A two-material leaf's last three
-//! words are its palette block exactly as a block stored apart would start
-//! (the palette word, then the indices, one bit per solid voxel); the
-//! second index word is zero when it has 32 solid voxels or fewer.
+//! Last come the materials of the full leaves of other materials, `O = B &
+//! !A`, as 16-bit halves in slot order, two a word, low half first
+//! (`ceil(popcount(O) / 2)` words ending the block, an odd count leaving the
+//! last high half zero; decisions 0033 and 0035).
+//!
+//! So a leaf outside `B` is `2 + [not in A] + 2 * [in P]` words, stored leaf
+//! `i` starts at `base + header + 2 * rank(mask & !B, i) + rank(mask & !A &
+//! !B, i) + 2 * rank(P, i)`, and the material of a leaf in `O` is half
+//! `rank(O, i)` of the block's last `ceil(popcount(O) / 2)` words.
+//!
+//! The three words after a mixed leaf's mask are, for two materials, its
+//! palette block exactly as a block stored apart would start (the palette
+//! word, then the indices, one bit per solid voxel; the second index word is
+//! zero when it has 32 solid voxels or fewer; decision 0031). For three or
+//! more materials they are the word offset of its palette block, stored
+//! apart, then two zero words (decision 0035): a two-material leaf's indices
+//! are never zero, since both materials are present, so the zero words tell
+//! them apart, and a leaf that gains or loses a material keeps its length.
 //!
 //! A record is:
 //!
@@ -113,16 +122,11 @@
 //! | ---- | ---------------------------------------------------------- |
 //! | 0    | leaf mask, low 32 bits                                     |
 //! | 1    | leaf mask, high 32 bits                                    |
-//! | 2    | payload                                                    |
+//! | 2    | [`UNIFORM_BIT`] and the material in the low 16 bits        |
 //!
 //! Leaf mask bit `j` is set when voxel slot `j` of the leaf is solid; it is
 //! never zero, and never all ones with a single material (such a leaf is
-//! full and has no record). The payload says what the solid voxels are:
-//!
-//! - bit 31 set: all of them are the material in the low 16 bits (bits 16 to
-//!   30 zero).
-//! - bit 31 clear: the word offset of the leaf's palette block; the leaf has
-//!   three or more materials (two-material leaves are stored inline, above).
+//! full and has no record).
 //!
 //! # Palette block
 //!
@@ -152,8 +156,8 @@
 //! voxels are all one material is a uniform child word, a default leaf or an
 //! other-full word, never a node, a record or a palette. A partial leaf of
 //! one material is a record only when that material is not the default. A
-//! leaf of exactly two materials is always inline, in the pair mask. A
-//! palette holds exactly the
+//! leaf of two or more materials is always in the mixed mask, inline when it
+//! has two. A palette holds exactly the
 //! materials present, sorted, at the minimal width. So equal content has equal
 //! masks, records, palettes and child words everywhere; only node indices and
 //! word offsets may differ.
@@ -203,8 +207,9 @@ pub const RECORD_WORDS: usize = 3;
 /// default mask and the default material.
 pub const BRICK_HEADER_WORDS: usize = 3;
 
-/// Words of a two-material leaf stored inline (decision 0031): its leaf
-/// mask, palette word and two index words.
+/// Words of a leaf of two or more materials (decisions 0031 and 0035): its
+/// leaf mask, then a two-material leaf's palette word and two index words,
+/// or a wider palette's block offset and two zero words.
 pub const PAIR_WORDS: usize = 5;
 
 /// Words in the header of a level-1 node's block with both a full mask and
@@ -218,7 +223,9 @@ pub const BRICK_LEN_MASK: u32 = 0x1FF;
 /// called it the other-full flag).
 pub const BRICK_FULL_MASK: u32 = 1 << 9;
 
-/// Level-1 `info` flag: the header has a pair mask (decision 0031).
+/// Level-1 `info` flag: the header has a mixed mask (decision 0031, which
+/// called it the pair mask; 0035 widened it to every leaf of two or more
+/// materials).
 pub const BRICK_PAIR_MASK: u32 = 1 << 10;
 
 /// The header of a level-1 node's block.
@@ -231,7 +238,7 @@ pub(crate) struct BrickHeader {
     /// Leaves full of one material: those in `defaults` have no words, the
     /// others one word. Equal to `defaults` when the header has no full mask.
     pub full: u64,
-    /// Leaves of exactly two materials, stored inline in [`PAIR_WORDS`]
+    /// The mixed mask: leaves of two or more materials, [`PAIR_WORDS`]
     /// words each.
     pub pairs: u64,
 }
@@ -323,32 +330,45 @@ impl BrickHeader {
         self.full & !self.defaults
     }
 
-    /// Words of the other full leaves' halves, right after the header.
+    /// Words of the other full leaves' halves, which end the block.
     pub const fn half_words(self) -> usize {
         (self.other_full().count_ones() as usize).div_ceil(2)
     }
 
     /// The word offset, from the block start, where the leaves outside the
-    /// full mask start: after the header and the halves.
+    /// full mask start: right after the header.
     pub const fn leaves_start(self) -> usize {
-        self.len() + self.half_words()
+        self.len()
     }
 
     /// The material of other full leaf `slot` (set in
-    /// [`other_full`](Self::other_full)), read from `block`.
+    /// [`other_full`](Self::other_full)), read from `block`, the node's
+    /// whole block.
     #[inline]
     pub fn half(self, block: &[u32], slot: u32) -> MaterialId {
         let k = rank(self.other_full(), slot);
-        MaterialId((block[self.len() + k / 2] >> (16 * (k % 2))) as u16)
+        let at = block.len() - self.half_words() + k / 2;
+        MaterialId((block[at] >> (16 * (k % 2))) as u16)
     }
 
     /// The word offset, from the block start, of the stored words of leaf
     /// `slot`, which is outside the full mask, in a node with `mask`: two
     /// words for each earlier such leaf, one more outside the default mask
-    /// and two more for each two-material leaf.
+    /// and two more for each mixed leaf. A brick without a full mask (most)
+    /// has no default partial leaves, so its stored leaves are records and
+    /// mixed leaves: one rank, and one more with a mixed mask, as in
+    /// `step`.
     #[inline]
     pub const fn record_offset(self, mask: u64, slot: u32) -> usize {
-        self.leaves_start()
+        if self.full == self.defaults {
+            let records = RECORD_WORDS * rank(mask & !self.defaults, slot);
+            return if self.pairs == 0 {
+                BRICK_HEADER_WORDS + records
+            } else {
+                BRICK_HEADER_WORDS + 2 + records + 2 * rank(self.pairs, slot)
+            };
+        }
+        self.len()
             + 2 * rank(mask & !self.full, slot)
             + rank(mask & !self.full & !self.defaults, slot)
             + 2 * rank(self.pairs, slot)
@@ -500,6 +520,74 @@ pub(crate) fn path_key(local: [u32; 3], levels: u32) -> u64 {
     })
 }
 
+/// The levels a full path key covers: every coordinate of the world tree.
+const KEY_LEVELS: u32 = crate::consts::TREE_DEPTH;
+
+/// The bit shifts of the four stages that spread a coordinate's two-bit
+/// digits (one per level) to every sixth bit; digit `l` moves by `4 l` bits,
+/// the stage of shift `s` moving the digits whose `l` has bit `s / 4`.
+const SPREAD_SHIFTS: [u32; 4] = [32, 16, 8, 4];
+
+/// Where the digits sit after each spreading stage.
+const SPREAD_MASKS: [u64; 4] = spread_masks();
+
+const fn spread_masks() -> [u64; 4] {
+    let mut masks = [0; 4];
+    let mut stage = 0;
+    while stage < 4 {
+        let mut level = 0;
+        while level < KEY_LEVELS {
+            // The digit's position once the stages up to this one moved it.
+            let mut pos = 2 * level;
+            let mut k = 0;
+            while k <= stage {
+                if level & (8 >> k) != 0 {
+                    pos += SPREAD_SHIFTS[k];
+                }
+                k += 1;
+            }
+            masks[stage] |= 3 << pos;
+            level += 1;
+        }
+        stage += 1;
+    }
+    masks
+}
+
+/// The two-bit digits of `v` (a coordinate below `4^KEY_LEVELS`) moved to
+/// every sixth bit: digit `l` to bit `6 l`.
+#[inline(always)]
+const fn spread(v: u32) -> u64 {
+    let mut x = v as u64 & ((1 << (2 * KEY_LEVELS)) - 1);
+    x = (x | x << SPREAD_SHIFTS[0]) & SPREAD_MASKS[0];
+    x = (x | x << SPREAD_SHIFTS[1]) & SPREAD_MASKS[1];
+    x = (x | x << SPREAD_SHIFTS[2]) & SPREAD_MASKS[2];
+    (x | x << SPREAD_SHIFTS[3]) & SPREAD_MASKS[3]
+}
+
+/// The inverse of [`spread`] for a key whose digits sit at every sixth bit.
+#[inline(always)]
+const fn compact(key: u64) -> u32 {
+    let mut x = key & SPREAD_MASKS[3];
+    x = (x | x >> SPREAD_SHIFTS[3]) & SPREAD_MASKS[2];
+    x = (x | x >> SPREAD_SHIFTS[2]) & SPREAD_MASKS[1];
+    x = (x | x >> SPREAD_SHIFTS[1]) & SPREAD_MASKS[0];
+    ((x | x >> SPREAD_SHIFTS[0]) & ((1 << (2 * KEY_LEVELS)) - 1)) as u32
+}
+
+/// [`path_key`] for the whole world tree (`TREE_DEPTH` levels), by bit
+/// spreading instead of a loop over the levels.
+#[inline(always)]
+pub(crate) const fn world_key(local: [u32; 3]) -> u64 {
+    spread(local[0]) | spread(local[1]) << 2 | spread(local[2]) << 4
+}
+
+/// The world-local coordinate whose [`world_key`] is `key`.
+#[inline(always)]
+pub(crate) const fn world_key_local(key: u64) -> [u32; 3] {
+    [compact(key), compact(key >> 2), compact(key >> 4)]
+}
+
 /// A node's content ready to store: its mask, its `info` and a block of up
 /// to `N` words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -628,26 +716,28 @@ mod tests {
     #[test]
     fn a_full_mask_stores_other_full_leaves_as_halves_and_default_partial_ones_in_two_words() {
         // Slot 2: full of the default; 3: default partial; 5 and 40: full of
-        // other materials; 0 and 9: records.
+        // other materials; 0: a record; 9: three or more materials, mixed.
         let h = BrickHeader {
             defaults: bit(2) | bit(3),
             default: MaterialId(7),
             full: bit(2) | bit(5) | bit(40),
-            pairs: 0,
+            pairs: bit(9),
         };
-        assert_eq!(h.len(), 5);
-        assert_eq!(h.info(14), 14 | BRICK_FULL_MASK);
-        assert_eq!(BrickHeader::read(&h.words(), h.info(14)), h);
-        assert_eq!((h.half_words(), h.leaves_start()), (1, 6));
+        assert_eq!(h.len(), 7);
+        assert_eq!(h.info(18), 18 | BRICK_FULL_MASK | BRICK_PAIR_MASK);
+        assert_eq!(BrickHeader::read(&h.words(), h.info(18)), h);
+        assert_eq!((h.half_words(), h.leaves_start()), (1, 7));
         let mask = bit(0) | bit(2) | bit(3) | bit(5) | bit(9) | bit(40);
-        assert_eq!([0, 3, 9].map(|s| h.record_offset(mask, s)), [6, 9, 11]);
+        assert_eq!([0, 3, 9].map(|s| h.record_offset(mask, s)), [7, 10, 12]);
+        // The halves end the block.
         let block = [
             0,
             0,
             0,
             0,
             0,
-            4 | 9 << 16,
+            0,
+            0,
             1,
             0,
             UNIFORM_BIT | 3,
@@ -656,6 +746,9 @@ mod tests {
             6,
             0,
             1234,
+            0,
+            0,
+            4 | 9 << 16,
         ];
         assert_eq!(h.leaf(&block, mask, 2), Record::filled(MaterialId(7)));
         assert_eq!(
@@ -682,11 +775,11 @@ mod tests {
         assert_eq!(h.info(30), 30 | BRICK_FULL_MASK | BRICK_PAIR_MASK);
         assert_eq!(BrickHeader::read(&h.words(), h.info(30)), h);
         let mask = bit(1) | bit(4) | bit(6) | bit(7) | bit(9);
-        assert_eq!([4, 6, 9].map(|s| h.record_offset(mask, s)), [8, 11, 16]);
+        assert_eq!([4, 6, 9].map(|s| h.record_offset(mask, s)), [7, 10, 15]);
         let mut block = [0u32; 21];
-        block[7] = 5;
+        block[20] = 5;
         let pair = Record::pair(0xFF00, 2 | 3 << 16, 0b1010);
-        block[16..21].copy_from_slice(&pair.pair_words());
+        block[15..20].copy_from_slice(&pair.pair_words());
         assert_eq!(h.leaf(&block, mask, 9), pair);
         assert_eq!(h.leaf(&block, mask, 7), Record::filled(MaterialId(5)));
         // Without the full mask, the pair mask follows the default.
@@ -722,6 +815,30 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), 4096);
         assert_eq!(keys.last(), Some(&4095));
+    }
+
+    #[test]
+    fn world_keys_are_path_keys_and_invert() {
+        let mut state = 0x9E37_79B9u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state & ((1 << 20) - 1)
+        };
+        let edges = [0, 1, 3, 4, 63, 64, (1 << 20) - 1, 1 << 19, 0xAAAAA, 0x55555];
+        let mut cases: Vec<[u32; 3]> = Vec::new();
+        for &a in &edges {
+            for &b in &edges {
+                cases.push([a, b, edges[(a ^ b) as usize % edges.len()]]);
+            }
+        }
+        cases.extend((0..100_000).map(|_| [next(), next(), next()]));
+        for local in cases {
+            let key = world_key(local);
+            assert_eq!(key, path_key(local, KEY_LEVELS), "{local:?}");
+            assert_eq!(world_key_local(key), local);
+        }
     }
 
     #[test]

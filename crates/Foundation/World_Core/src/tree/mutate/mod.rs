@@ -26,7 +26,7 @@ mod voxel;
 
 pub(crate) use build::{Builder, graft};
 pub(crate) use fill::LocalBox;
-pub(crate) use voxel::LocalEdit;
+pub(crate) use voxel::{LocalEdit, tree_order};
 
 use super::ROOT_LEVEL;
 use super::alloc::Store;
@@ -38,15 +38,17 @@ use crate::consts::TREE_DEPTH;
 use crate::material::MaterialId;
 
 /// Sets voxels. `edits` must be sorted by `node::path_key` with at most one
-/// edit per voxel. Calls `changed` with every edit that changed its voxel and
-/// the material the voxel held before. Edits whose path meets a region that
+/// edit per voxel. Calls `changed` with at least one edit of every brick
+/// whose content changed (an edit that changed its voxel, or one of a brick
+/// replaced whole), and with no edit of a brick that did not change; a
+/// brick may be named several times, its edits consecutively. Edits whose path meets a region that
 /// is not resident are skipped; returns whether any was. A single edit that
 /// is skipped changes nothing.
 pub(crate) fn set_voxels(
     forest: &mut Forest,
     root: &mut Child,
     edits: &[LocalEdit],
-    changed: &mut impl FnMut(LocalEdit, MaterialId),
+    changed: &mut impl FnMut(LocalEdit),
 ) -> bool {
     debug_assert!(
         edits.windows(2).all(|w| {
