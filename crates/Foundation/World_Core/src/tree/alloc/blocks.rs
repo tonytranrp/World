@@ -1,5 +1,5 @@
 //! Word block allocation: blocks of 1 to `MAX_BLOCK_LEN` words, recycled by
-//! exact size first, else cut from the shortest longer free block.
+//! exact size first, else cut from a free block at most twice as long.
 
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use super::pages::Pages;
 /// size and the new block starts the next page. Freed blocks go on a list
 /// per size; a request takes a block of exactly its size if there is one
 /// (the lowest of a short list, the last freed of a long one), else the
-/// front of the shortest longer one, whose rest stays free, and only then
-/// cuts from the end. So edits fill holes from the front of the arena
+/// front of the shortest longer one if it is at most twice as long, whose
+/// rest stays free, and only then cuts from the end. So edits fill holes from the front of the arena
 /// instead of growing it, and the small blocks every lookup reads (child
 /// words of the upper levels) do not drift to the last pages (decision
 /// 0035).
@@ -40,7 +40,7 @@ pub(super) struct WordBlocks {
 
 /// Free lists up to this long hand out their lowest block; longer ones the
 /// last freed.
-const LOWEST_FIRST_MAX: usize = 16;
+const LOWEST_FIRST_MAX: usize = 4;
 
 /// Words of the bitmap of lengths with free blocks.
 const FREE_BITS: usize = MAX_BLOCK_LEN.div_ceil(64);
@@ -48,9 +48,9 @@ const FREE_BITS: usize = MAX_BLOCK_LEN.div_ceil(64);
 impl WordBlocks {
     /// The base of a block of `len` words, 1 to `MAX_BLOCK_LEN`, inside one
     /// page: a free block of exactly that length, else the front of the
-    /// shortest longer free block (the rest stays free), else a new block at
-    /// the end. Panics on any other length or when word offsets would
-    /// overflow `u32`.
+    /// shortest longer free block if that is at most twice as long (the rest
+    /// stays free), else a new block at the end. Panics on any other length
+    /// or when word offsets would overflow `u32`.
     pub fn alloc<const N: usize>(&mut self, len: usize, pages: &mut Pages<u32, N>) -> u32 {
         assert!(
             (1..=MAX_BLOCK_LEN).contains(&len),
@@ -62,9 +62,13 @@ impl WordBlocks {
                 base
             }
             None => match self.shortest_free_above(len) {
-                // Splitting a longer block keeps the arena from growing
-                // while holes it could fill wait (decision 0035).
-                Some(longer) => {
+                // Splitting a close fit keeps the arena from growing while
+                // holes it could fill wait (decision 0035). Not a long block
+                // (a page's tail cut into ever new lengths, each a new
+                // list), and not from a list a snapshot still shares (the
+                // first write after it would copy that list and the
+                // remainder's).
+                Some(longer) if longer <= 2 * len && !self.shared(longer) => {
                     let base = self
                         .take_free(longer)
                         .expect("the bitmap names a free block");
@@ -72,11 +76,19 @@ impl WordBlocks {
                     self.free_words -= len;
                     base
                 }
-                None => self.cut(len, pages),
+                _ => self.cut(len, pages),
             },
         };
         self.live_words += len;
         base
+    }
+
+    /// Whether the free list of `len` words is shared with a clone (a
+    /// snapshot's allocator).
+    fn shared(&self, len: usize) -> bool {
+        self.free[len - 1]
+            .as_ref()
+            .is_some_and(|list| Arc::strong_count(list) > 1)
     }
 
     /// The shortest length above `len` with a free block.
@@ -224,11 +236,14 @@ mod tests {
         );
         assert_eq!(blocks.alloc(3, &mut pages), a, "an exact fit");
         blocks.free(b, 5);
-        // No 2-word hole: the front of the 5-word one; its rest stays free.
-        assert_eq!(blocks.alloc(2, &mut pages), b);
-        assert_eq!(blocks.free_words(), 3);
-        assert_eq!(blocks.alloc(3, &mut pages), b + 2);
-        assert_eq!(blocks.live_words(), 12);
+        // A 5-word hole is more than twice 2 words: a new block.
+        let end = blocks.end() as u32;
+        assert_eq!(blocks.alloc(2, &mut pages), end);
+        // No 3-word hole: the front of the 5-word one; its rest stays free.
+        assert_eq!(blocks.alloc(3, &mut pages), b);
+        assert_eq!(blocks.free_words(), 2);
+        assert_eq!(blocks.alloc(2, &mut pages), b + 3);
+        assert_eq!(blocks.live_words(), 14);
         assert_eq!(blocks.free_words(), 0);
     }
 
