@@ -10,8 +10,22 @@
 //! above it, partial tiles on both image edges, coarse footprint hits and
 //! evicted bricks (residency hits and requests).
 //!
-//! Breaking the beam on purpose (its spread set to 0, so it covers only the
-//! tile's centre ray) makes these comparisons fail.
+//! Tiles the prepass proves all sky (decision 0026) skip the trace, so the
+//! scene also has views that leave the tree near its edge: a floor, lone
+//! voxels and a board on the tree's last layer of voxels on +x, a plate on
+//! its top layer seen from just below, and a level view that skims the top
+//! of a ridge with the horizon across the middle of the image (tiles half
+//! sky). The beam also looks one level into occupied cells (decision 0026),
+//! which the lone voxels, the thin plate and the grazing floor exercise at
+//! every footprint bias the config allows (up to 16, where its cap on the
+//! advance binds); and one test has the prepass's dispatch trace the bottom
+//! rows itself, as the game does.
+//!
+//! Breaking the beam on purpose makes these comparisons fail: its spread set
+//! to 0 (it covers only the tile's centre ray), a tile called sky once its
+//! cube only touches the tree's face, only one of the children an occupied
+//! cell's box covers tested, or that box's cells given a level too coarse
+//! for the footprint cap (bias 16).
 
 mod common;
 
@@ -19,6 +33,7 @@ use std::collections::BTreeSet;
 
 use bevy::math::Vec3;
 use common::*;
+use world_core::consts::WORLD_END_VOXEL;
 use world_core::tree::VoxelSource;
 use world_core::{MaterialId, VoxelBox, VoxelPos, VoxelTree};
 use world_render::internals::batch::UploadBatch;
@@ -88,7 +103,27 @@ fn beam_scene() -> VoxelTree {
         let p = VoxelPos::new(next(1200) - 600, 20 + next(300), -(next(900)));
         t.set(p, MaterialId(9)).unwrap();
     }
+    // At the tree's +x face: a floor running up to it, and lone voxels and
+    // a board on its last layer of voxels.
+    let end = WORLD_END_VOXEL;
+    fill(&mut t, [end - 1000, -16, -400], [end, 0, 400], 1);
+    for _ in 0..300 {
+        let p = VoxelPos::new(end - 1, 10 + next(300), next(600) - 300);
+        t.set(p, MaterialId(9)).unwrap();
+    }
+    fill(&mut t, [end - 1, 40, -50], [end, 46, 20], 7);
+    // A plate on the tree's top layer of voxels, and lone voxels beside it.
+    fill(&mut t, [-400, end - 1, -500], [100, end, 60], 8);
+    for _ in 0..300 {
+        let p = VoxelPos::new(next(1200) - 400, end - 1, next(900) - 600);
+        t.set(p, MaterialId(9)).unwrap();
+    }
     t
+}
+
+/// Metres of the voxel coordinate `v`, for cameras near the tree's faces.
+fn metres(v: i32) -> f32 {
+    v as f32 / 64.0
 }
 
 fn views() -> Vec<ViewSetup> {
@@ -123,6 +158,27 @@ fn views() -> Vec<ViewSetup> {
             eye_m: Vec3::new(9.0, 7.5, 4.0),
             forward: Vec3::new(-0.8, -0.5, -0.9),
             vertical_fov_radians: 0.9,
+        },
+        // Level, half a voxel above the ridge's top: its top and the floor
+        // are skimmed, and the horizon crosses the middle of the image.
+        ViewSetup {
+            eye_m: Vec3::new(0.2, 3.5 / 64.0, 6.0),
+            forward: Vec3::new(0.01, 0.0, -1.0),
+            vertical_fov_radians: 0.8,
+        },
+        // Out through the tree's +x face over a floor that runs up to it,
+        // past the voxels on its last layer.
+        ViewSetup {
+            eye_m: Vec3::new(metres(WORLD_END_VOXEL - 400), 1.0, 0.37),
+            forward: Vec3::new(1.0, 0.08, 0.02),
+            vertical_fov_radians: 1.0,
+        },
+        // Up through the tree's top face at the plate on its last layer;
+        // the plate's edges cross the image.
+        ViewSetup {
+            eye_m: Vec3::new(-2.3, metres(WORLD_END_VOXEL - 250), 0.6),
+            forward: Vec3::new(0.3, 1.0, -0.4),
+            vertical_fov_radians: 1.0,
         },
     ]
 }
@@ -185,7 +241,12 @@ fn side_effects(
 }
 
 /// Traces every view without and with the prepass and compares them.
-fn compare_with_and_without_beam(footprint_bias: f32, evict_every: Option<usize>, label: &str) {
+fn compare_with_and_without_beam(
+    footprint_bias: f32,
+    evict_every: Option<usize>,
+    head: u32,
+    label: &str,
+) {
     let Some(gpu) = gpu() else {
         return;
     };
@@ -208,7 +269,8 @@ fn compare_with_and_without_beam(footprint_bias: f32, evict_every: Option<usize>
 
     let (w, h) = SIZE;
     let mut frame = 10;
-    let (mut started, mut tiles) = (0usize, 0usize);
+    let (mut started, mut tiles, mut sky) = (0usize, 0usize, 0usize);
+    let mut sky_views = 0;
     let (mut steps_without, mut steps_with) = (0u64, 0u64);
     let mut requests_seen = 0;
     for (v, view) in views().into_iter().enumerate() {
@@ -218,13 +280,22 @@ fn compare_with_and_without_beam(footprint_bias: f32, evict_every: Option<usize>
             pixel_angle: view.pixel_angle(h),
             footprint_bias,
         };
-        let without = camera_trace(&gpu, &pipelines, &cache, view, SIZE, setup, BEAM_OFF);
+        let without = camera_trace(&gpu, &pipelines, &cache, view, SIZE, setup, BEAM_OFF, 0);
         let effects_without = side_effects(&gpu, &cache, shape, frame);
         let setup = TraceSetup {
             frame: frame + 1,
             ..setup
         };
-        let with = camera_trace(&gpu, &pipelines, &cache, view, SIZE, setup, BEAM_ITERATIONS);
+        let with = camera_trace(
+            &gpu,
+            &pipelines,
+            &cache,
+            view,
+            SIZE,
+            setup,
+            BEAM_ITERATIONS,
+            head,
+        );
         let effects_with = side_effects(&gpu, &cache, shape, frame + 1);
         frame += 2;
 
@@ -261,11 +332,35 @@ fn compare_with_and_without_beam(footprint_bias: f32, evict_every: Option<usize>
         );
         requests_seen += effects_with.0.len();
         tiles += with.beam.len();
-        started += with.beam.iter().filter(|&&t| t > 0.0).count();
+        started += with.beam.iter().filter(|&&t| t != 0.0).count();
+        // A sky tile's pixels all miss.
+        let columns = w.div_ceil(8) as usize;
+        let view_sky = with.beam.iter().filter(|&&t| t < 0.0).count();
+        for (tile, _) in with.beam.iter().enumerate().filter(|(_, t)| **t < 0.0) {
+            let (tx, ty) = ((tile % columns) as u32 * 8, (tile / columns) as u32 * 8);
+            for y in ty..(ty + 8).min(h) {
+                for x in tx..(tx + 8).min(w) {
+                    let r = without.record((y * w + x) as usize);
+                    assert_eq!(
+                        r[3] >> 24 & HIT_FLAG_HIT,
+                        0,
+                        "{label} view {v}: sky tile hit"
+                    );
+                }
+            }
+        }
+        sky += view_sky;
+        sky_views += usize::from(view_sky > 0);
     }
     eprintln!(
-        "{label}: {started} of {tiles} tiles start past the camera; steps {steps_without} \
-         without the beam, {steps_with} with it; {requests_seen} requests"
+        "{label}: {started} of {tiles} tiles start past the camera, {sky} of them all sky; \
+         steps {steps_without} without the beam, {steps_with} with it; {requests_seen} \
+         requests"
+    );
+    // Sky tiles must be found where the views leave the tree.
+    assert!(
+        sky_views >= 3,
+        "{label}: sky tiles in only {sky_views} views"
     );
     // The prepass must do something, or the comparison proves nothing.
     assert!(
@@ -286,20 +381,34 @@ fn compare_with_and_without_beam(footprint_bias: f32, evict_every: Option<usize>
 
 #[test]
 fn gpu_beam_changes_no_hit_at_full_resolution() {
-    compare_with_and_without_beam(0.0, None, "full resolution");
+    compare_with_and_without_beam(0.0, None, 0, "full resolution");
 }
 
 #[test]
 fn gpu_beam_changes_no_hit_with_footprint_detail() {
-    compare_with_and_without_beam(1.0, None, "footprint bias 1");
+    compare_with_and_without_beam(1.0, None, 0, "footprint bias 1");
 }
 
 #[test]
 fn gpu_beam_changes_no_hit_with_coarse_footprints() {
-    compare_with_and_without_beam(6.0, None, "footprint bias 6");
+    compare_with_and_without_beam(6.0, None, 0, "footprint bias 6");
 }
 
 #[test]
 fn gpu_beam_changes_no_hit_or_request_with_evicted_bricks() {
-    compare_with_and_without_beam(1.0, Some(3), "every third brick evicted");
+    compare_with_and_without_beam(1.0, Some(3), 0, "every third brick evicted");
+}
+
+#[test]
+fn gpu_beam_changes_no_hit_with_the_coarsest_footprints() {
+    compare_with_and_without_beam(16.0, None, 0, "footprint bias 16");
+}
+
+/// The game's split: the prepass's dispatch traces the bottom rows from the
+/// camera (decision 0026), the trace the rest from their beams.
+#[test]
+fn gpu_beam_changes_no_hit_when_the_prepass_traces_the_bottom_rows() {
+    let head = world_render::internals::trace::head_rows(SIZE.1, 0.25);
+    assert!(head > 0);
+    compare_with_and_without_beam(1.0, Some(3), head, "bottom rows traced by the prepass");
 }

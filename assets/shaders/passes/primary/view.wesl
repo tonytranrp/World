@@ -18,11 +18,15 @@ struct TraceParams {
     // Request capacity, stamps offset, iteration cap, beam iteration cap
     // (0: no beam prepass).
     limits: vec4<u32>,
+    // Tile rows at the bottom of a camera trace that the prepass's dispatch
+    // traces from the camera (decision 0026); y to w unused.
+    head: vec4<u32>,
 }
 
 @group(0) @binding(8) var<uniform> params: TraceParams;
 // One start distance per BEAM_TILE x BEAM_TILE tile of camera rays, in
-// voxels along each ray, row-major (decision 0023).
+// voxels along each ray, row-major (decision 0023); negative where every
+// ray of the tile leaves the tree without stopping (decision 0026).
 @group(0) @binding(9) var<storage, read_write> beam_starts: array<f32>;
 
 fn camera_dir(pixel: vec2<u32>) -> vec3<f32> {
@@ -38,6 +42,17 @@ fn camera_dir(pixel: vec2<u32>) -> vec3<f32> {
 // Beam tiles across the traced width.
 fn beam_columns() -> u32 {
     return (params.size.x + BEAM_TILE - 1u) / BEAM_TILE;
+}
+
+// Beam tile rows across the traced height.
+fn beam_rows() -> u32 {
+    return (params.size.y + BEAM_TILE - 1u) / BEAM_TILE;
+}
+
+// Tile rows at the bottom traced from the camera by the prepass's dispatch:
+// camera mode only, and never every row.
+fn head_rows() -> u32 {
+    return select(0u, min(params.head.x, beam_rows() - 1u), params.size.w == 0u);
 }
 
 // Whether camera rays start at their tile's beam distance.

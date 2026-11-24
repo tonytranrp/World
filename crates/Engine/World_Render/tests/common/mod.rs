@@ -462,6 +462,8 @@ pub fn gpu_trace(
             trace::DEFAULT_MAX_ITERATIONS,
             BEAM_OFF,
         ],
+        // Ignored for rays read from the hit buffer: every row is traced.
+        head: [2, 0, 0, 0],
         clip_from_world: identity(),
         world_from_clip: identity(),
         eye: [0.0; 4],
@@ -537,7 +539,9 @@ impl CameraTrace {
 }
 
 /// Traces a `width x height` image from `view` in camera mode, with the
-/// beam prepass when `beam_iterations` is not [`BEAM_OFF`].
+/// beam prepass when `beam_iterations` is not [`BEAM_OFF`]. The prepass's
+/// dispatch traces the bottom `head` tile rows from the camera.
+#[allow(clippy::too_many_arguments)]
 pub fn camera_trace(
     gpu: &Gpu,
     pipelines: &Pipelines,
@@ -546,6 +550,7 @@ pub fn camera_trace(
     (width, height): (u32, u32),
     setup: TraceSetup,
     beam_iterations: u32,
+    head: u32,
 ) -> CameraTrace {
     use wgpu::util::DeviceExt;
     let hits = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -571,6 +576,7 @@ pub fn camera_trace(
             trace::DEFAULT_MAX_ITERATIONS,
             beam_iterations,
         ],
+        head: [head, 0, 0, 0],
     };
     let params_buf = gpu
         .device
@@ -593,8 +599,8 @@ pub fn camera_trace(
         &mut encoder,
         &pipelines.beam,
         &bind_group,
-        width,
-        height,
+        (width, height),
+        head,
         None,
     );
     trace::record_trace(

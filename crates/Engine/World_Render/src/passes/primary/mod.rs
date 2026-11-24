@@ -19,8 +19,8 @@ use crate::gbuffer::HIT_WORDS;
 use crate::gpu_timing::{GpuPassTimer, SampledPassTimer, TimedPass};
 use crate::tier::RenderTier;
 use trace::{
-    DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, beam_buffer, record_beam, record_trace,
-    trace_bind_group, trace_layout_entries,
+    DEFAULT_MAX_ITERATIONS, MODE_CAMERA, TraceParams, beam_buffer, head_rows, record_beam,
+    record_trace, trace_bind_group, trace_layout_entries,
 };
 
 /// Asset path of the trace shader.
@@ -92,6 +92,8 @@ pub struct VoxelViewTargets {
     pub size: UVec2,
     /// The viewport the trace is stretched over.
     pub viewport: UVec2,
+    /// Tile rows at the bottom the prepass's dispatch traces (`params.head`).
+    pub head: u32,
     pub bind_group: wgpu::BindGroup,
     /// Changes whenever `hits` is replaced, so dependents rebuild.
     pub generation: u64,
@@ -134,6 +136,7 @@ pub fn prepare_view_targets(
         let eye = view.world_from_view.translation() * VOXELS_PER_METER;
         let o = world_core::consts::WORLD_MIN_VOXEL;
         let layout = &state.pools.layout;
+        let head = head_rows(size.y, config.0.lod.beam_head_share);
         let params = TraceParams {
             clip_from_world: clip_from_world.to_cols_array_2d(),
             world_from_clip: Mat4::inverse(&clip_from_world).to_cols_array_2d(),
@@ -152,10 +155,14 @@ pub fn prepare_view_targets(
                 DEFAULT_MAX_ITERATIONS,
                 config.0.lod.beam_iterations,
             ],
+            head: [head, 0, 0, 0],
         };
         match targets {
             Some(mut t) if t.size == size => {
                 queue.write_buffer(&t.params, 0, bytemuck::bytes_of(&params));
+                if t.head != head {
+                    t.head = head;
+                }
                 if t.viewport != viewport {
                     t.viewport = viewport;
                 }
@@ -186,6 +193,7 @@ pub fn prepare_view_targets(
                     params: params_buf,
                     size,
                     viewport,
+                    head,
                     bind_group,
                     generation: *generation,
                 });
@@ -197,7 +205,9 @@ pub fn prepare_view_targets(
 /// Runs the beam prepass and traces the view (Core3d, after the opaque
 /// pass). The first view of a frame is timed (see `gpu_timing`). The
 /// prepass runs whatever `beam_iterations` says (with 0 each tile writes 0
-/// at once), so a config change needs no other state.
+/// at once), so a config change needs no other state. Its dispatch also
+/// traces the bottom `beam_head_share` of the tile rows from the camera
+/// (decision 0026), which the trace then skips.
 pub fn voxel_trace(
     view: ViewQuery<&VoxelViewTargets>,
     pipeline: Option<Res<TracePipeline>>,
@@ -220,6 +230,7 @@ pub fn voxel_trace(
         return;
     };
     let (width, height) = (targets.size.x, targets.size.y);
+    let (size, head) = ((width, height), targets.head);
     let bind_group = &targets.bind_group;
     match sampled {
         Some(mut sampled) if sampled.wants(TimedPass::Trace) => {
@@ -229,7 +240,7 @@ pub fn voxel_trace(
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
             };
             let mut encoder = encoder_for("primary.beam");
-            record_beam(&mut encoder, beam, bind_group, width, height, None);
+            record_beam(&mut encoder, beam, bind_group, size, head, None);
             sampled.time_alone(TimedPass::Beam, device, &queue, || flush.flush(), encoder);
             let mut encoder = encoder_for("primary.trace");
             record_trace(&mut encoder, trace, bind_group, width, height, None);
@@ -241,14 +252,7 @@ pub fn voxel_trace(
             let writes = timer
                 .as_deref_mut()
                 .and_then(|t| t.compute_writes(TimedPass::Beam));
-            record_beam(
-                ctx.command_encoder(),
-                beam,
-                bind_group,
-                width,
-                height,
-                writes,
-            );
+            record_beam(ctx.command_encoder(), beam, bind_group, size, head, writes);
             let writes = timer
                 .as_deref_mut()
                 .and_then(|t| t.compute_writes(TimedPass::Trace));
