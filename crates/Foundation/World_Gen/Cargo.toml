@@ -27,5 +27,10 @@ criterion.workspace = true
 name = "terrain"
 harness = false
 
+# Point reads, cursor rays, brick walks and edits on generated chunks.
+[[bench]]
+name = "chunk_reads"
+harness = false
+
 [lints]
 workspace = true

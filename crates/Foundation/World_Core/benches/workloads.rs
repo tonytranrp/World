@@ -141,6 +141,17 @@ fn coherent_reads(c: &mut Criterion) {
     read("terrain_line_512", &ground, &line);
     read("terrain_surface_brick_16", &ground, &surface_brick);
     read("dense_brick_16", &dense, &dense_brick);
+    // The same terrain as the builder lays it out (World_Gen's chunks).
+    let bottom_up = terrain.build_bottom_up();
+    read("bottom_up_line_512", &bottom_up, &line);
+    read("bottom_up_surface_brick_16", &bottom_up, &surface_brick);
+    // Scattered point reads within a few voxels of the surface.
+    let mut rng = Lcg(41);
+    let scattered: Vec<VoxelPos> = (0..10_000)
+        .map(|_| terrain.near_surface(&mut rng))
+        .collect();
+    read("terrain_scattered_10k", &ground, &scattered);
+    read("bottom_up_scattered_10k", &bottom_up, &scattered);
     group.finish();
 }
 
